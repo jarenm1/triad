@@ -1,6 +1,5 @@
 [workspace]
 members = [
-"triad-gpu",
-"triad-window",
+"triad-gpu"
 ]
-resolve = "3"
+resolver = "3"
