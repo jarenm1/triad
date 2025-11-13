@@ -7,7 +7,4 @@ edition = "2024"
 wgpu = "27.0.1"
 thiserror = "2.0.17"
 bytemuck = "1.24.0"
-tracing = "0.1.41"
-puffin = "0.19.1"
-tracing-subscriber = "0.3.20"
-triad-window = { path = "../triad-window" }
+pollster = "0.3"
