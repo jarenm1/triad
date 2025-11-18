@@ -2,8 +2,8 @@ use crate::camera::{Camera, CameraController, Projection};
 use glam::{Mat4, Vec3};
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{error, info};
 use triad_gpu::{
     CameraUniforms, GaussianPoint, Handle, RenderPipelineBuilder, Renderer, ResourceRegistry,
@@ -58,7 +58,7 @@ impl App {
 }
 
 impl ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop ) {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.state.is_some() || self.error.is_some() {
             return;
         }
@@ -137,7 +137,10 @@ struct ViewerState {
 }
 
 impl ViewerState {
-    fn new(event_loop: &winit::event_loop::ActiveEventLoop, ply_path: &Path) -> Result<Self, Box<dyn Error>> {
+    fn new(
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        ply_path: &Path,
+    ) -> Result<Self, Box<dyn Error>> {
         let window_attributes = Window::default_attributes()
             .with_title("Triad Gaussian Viewer")
             .with_inner_size(PhysicalSize::new(1280, 720));
@@ -192,7 +195,11 @@ impl ViewerState {
         })
     }
 
-    fn handle_window_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: &WindowEvent) -> bool {
+    fn handle_window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        event: &WindowEvent,
+    ) -> bool {
         if let WindowEvent::KeyboardInput {
             event:
                 KeyEvent {

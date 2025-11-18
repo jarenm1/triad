@@ -9,6 +9,7 @@ struct VertexOutput {
     @location(3) pixel_ndc: vec2<f32>,  // Interpolated NDC position of this fragment
     @location(4) cov2d_a: vec2<f32>,
     @location(5) cov2d_b: vec2<f32>,
+    @location(6) falloff_scale: f32,
 }
 
 struct FragmentOutput {
@@ -55,17 +56,21 @@ fn fs_main(input: VertexOutput) -> FragmentOutput {
     //          delta.y * (inv_cov_01 * delta.x + inv_cov_11 * delta.y)
     let power = delta.x * (inv_cov_00 * delta.x + inv_cov_01 * delta.y) +
                 delta.y * (inv_cov_01 * delta.x + inv_cov_11 * delta.y);
+    let adjusted_power = power * input.falloff_scale;
     
     // Clamp power to avoid overflow
-    if (power > 10.0) {
+    if (adjusted_power > 50.0) {
         return FragmentOutput(vec4<f32>(input.color, 0.0));
     }
     
-    // Compute Gaussian: exp(-0.5 * power)
-    let gaussian_weight = exp(-0.5 * power);
+    // Compute Gaussian weights with soft halo option
+    let gaussian_weight = exp(-0.5 * adjusted_power);
+    let halo_weight = exp(-0.15 * adjusted_power); // much softer falloff
+    let softness = max(1.0 - input.opacity, 0.12);
+    let blended_weight = mix(gaussian_weight, halo_weight, softness);
     
     // Apply opacity
-    let alpha = input.opacity * gaussian_weight;
+    let alpha = input.opacity * blended_weight;
     
     // Clamp to valid range
     let final_alpha = clamp(alpha, 0.0, 1.0);

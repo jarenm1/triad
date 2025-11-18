@@ -1,8 +1,8 @@
 use glam::{Mat4, Vec3};
 use tracing::{Level, debug, error, info, instrument, span, trace, warn};
 use triad_gpu::{
-    ply_loader, CameraUniforms, FrameGraph, GaussianPoint, Handle, Pass, PassBuilder, PassContext,
-    RenderPipelineBuilder, Renderer, ResourceRegistry, ShaderManager,
+    CameraUniforms, FrameGraph, GaussianPoint, Handle, Pass, PassBuilder, PassContext,
+    RenderPipelineBuilder, Renderer, ResourceRegistry, ShaderManager, ply_loader,
 };
 use wgpu::util::DeviceExt;
 

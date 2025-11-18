@@ -9,6 +9,10 @@ pub struct GaussianPoint {
     pub position_radius: [f32; 4],
     /// rgb color (linear 0-1) and opacity in w.
     pub color_opacity: [f32; 4],
+    /// Quaternion (x, y, z, w) describing orientation.
+    pub rotation: [f32; 4],
+    /// Per-axis scale; w reserved for padding/extra scalar.
+    pub scale: [f32; 4],
 }
 
 impl GaussianPoint {
@@ -18,6 +22,14 @@ impl GaussianPoint {
 
     pub fn radius(&self) -> f32 {
         self.position_radius[3]
+    }
+
+    pub fn rotation(&self) -> [f32; 4] {
+        self.rotation
+    }
+
+    pub fn scale(&self) -> [f32; 4] {
+        self.scale
     }
 }
 

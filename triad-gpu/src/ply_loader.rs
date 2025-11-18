@@ -156,6 +156,32 @@ pub fn load_gaussians_from_ply(
         };
         let radius = scale_vec.max_element().max(default_scale * 0.25);
 
+        // Parse rotation quaternion.
+        let rotation = if let (Some(r0), Some(r1), Some(r2), Some(r3)) = (
+            get_f32(vertex.get("rot_0")),
+            get_f32(vertex.get("rot_1")),
+            get_f32(vertex.get("rot_2")),
+            get_f32(vertex.get("rot_3")),
+        ) {
+            [r0, r1, r2, r3]
+        } else if let (Some(rx), Some(ry), Some(rz), Some(rw)) = (
+            get_f32(vertex.get("rot_x")),
+            get_f32(vertex.get("rot_y")),
+            get_f32(vertex.get("rot_z")),
+            get_f32(vertex.get("rot_w")),
+        ) {
+            [rx, ry, rz, rw]
+        } else if let (Some(qx), Some(qy), Some(qz), Some(qw)) = (
+            get_f32(vertex.get("qx")),
+            get_f32(vertex.get("qy")),
+            get_f32(vertex.get("qz")),
+            get_f32(vertex.get("qw")),
+        ) {
+            [qx, qy, qz, qw]
+        } else {
+            [0.0, 0.0, 0.0, 1.0]
+        };
+
         // Parse color - PLY files may use uchar (0-255) for colors
         // Handle multiple color field name variations and missing colors
         let color = if let (Some(r), Some(g), Some(b)) = (
@@ -196,6 +222,8 @@ pub fn load_gaussians_from_ply(
         gaussians.push(GaussianPoint {
             position_radius: [position.x, position.y, position.z, radius],
             color_opacity: [color.x, color.y, color.z, opacity],
+            rotation,
+            scale: [scale_vec.x, scale_vec.y, scale_vec.z, 0.0],
         });
 
         // Debug: verify color is RGB not BGR

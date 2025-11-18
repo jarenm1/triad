@@ -1,7 +1,7 @@
 use wgpu::{Instance, SurfaceConfiguration};
 mod frame_graph;
-pub mod ply_loader;
 mod pipeline;
+pub mod ply_loader;
 mod resource_registry;
 mod shader;
 mod surface;
