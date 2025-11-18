@@ -1,30 +1,10 @@
 use glam::{Mat4, Vec3};
 use tracing::{Level, debug, error, info, instrument, span, trace, warn};
 use triad_gpu::{
-    FrameGraph, Handle, Pass, PassBuilder, PassContext, RenderPipelineBuilder, Renderer,
-    ResourceRegistry, ShaderManager,
+    ply_loader, CameraUniforms, FrameGraph, GaussianPoint, Handle, Pass, PassBuilder, PassContext,
+    RenderPipelineBuilder, Renderer, ResourceRegistry, ShaderManager,
 };
 use wgpu::util::DeviceExt;
-
-mod ply_loader;
-
-// Gaussian point structure matching shader (std430 friendly)
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GaussianPoint {
-    pub position_radius: [f32; 4], // xyz + radius
-    pub color_opacity: [f32; 4],   // rgb + opacity
-}
-
-// Camera uniforms matching shader
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct CameraUniforms {
-    view_matrix: [[f32; 4]; 4],
-    proj_matrix: [[f32; 4]; 4],
-    view_pos: [f32; 3],
-    _padding: f32,
-}
 
 // Gaussian splatting render pass
 struct GaussianRenderPass {

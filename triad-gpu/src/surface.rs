@@ -22,6 +22,10 @@ impl SurfaceWrapper {
         self.config.height
     }
 
+    pub fn config(&self) -> &SurfaceConfiguration {
+        &self.config
+    }
+
     pub fn reconfigure(&mut self, device: &wgpu::Device, config: SurfaceConfiguration) {
         self.config = config;
         self.surface.configure(device, &self.config);

@@ -1,15 +1,19 @@
 use wgpu::{Instance, SurfaceConfiguration};
 mod frame_graph;
+pub mod ply_loader;
 mod pipeline;
 mod resource_registry;
 mod shader;
 mod surface;
+mod types;
 
 pub use frame_graph::{FrameGraph, Handle, Pass, PassBuilder, PassContext, ResourceType};
 pub use pipeline::{PipelineBuildError, RenderPipelineBuilder};
 pub use resource_registry::ResourceRegistry;
 pub use shader::ShaderManager;
 pub use surface::SurfaceWrapper;
+pub use types::{CameraUniforms, GaussianPoint};
+pub use wgpu;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RendererError {

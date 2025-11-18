@@ -1,0 +1,13 @@
+[package]
+name = "triad-window"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+triad-gpu = { path = "../triad-gpu" }
+winit = { version = "0.30", features = ["rwh_05"] }
+glam = "0.30"
+pollster = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+bytemuck = { version = "1.24", features = ["derive"] }
