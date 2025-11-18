@@ -1,12 +1,9 @@
 // Gaussian Splatting Vertex Shader
-// Processes Gaussian points with position, scale, rotation, color, and opacity
+// Processes simplified Gaussian points with position, radius, color, and opacity.
 
 struct GaussianPoint {
-    position: vec3<f32>,
-    scale: vec3<f32>,
-    rotation: vec4<f32>, // quaternion
-    color: vec3<f32>,
-    opacity: f32,
+    position_radius: vec4<f32>, // xyz + radius
+    color_opacity: vec4<f32>,   // rgb + opacity
 }
 
 struct CameraUniforms {
@@ -47,108 +44,52 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     }
     let tri_vertex = vertex_index % 3u;
     
-    let gaussian = gaussians[gaussian_idx];    
-    // Convert quaternion to rotation matrix
-    let q = gaussian.rotation;
+    let gaussian = gaussians[gaussian_idx];
+    let position = gaussian.position_radius.xyz;
+    let radius = max(gaussian.position_radius.w, 1e-4);
+    let rgb = gaussian.color_opacity.xyz;
+    let opacity = gaussian.color_opacity.w;
     
-    // Normalize quaternion to avoid introducing scale/shear
-    // If quaternion has zero length, use identity quaternion (0, 0, 0, 1) instead
-    let q_len = sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
-    let qn = select(
-        vec4<f32>(q.x / q_len, q.y / q_len, q.z / q_len, q.w / q_len),
-        vec4<f32>(0.0, 0.0, 0.0, 1.0), // identity quaternion (no rotation)
-        q_len == 0.0
-    );
-    
-    let rot_matrix = mat3x3<f32>(
-        vec3<f32>(1.0 - 2.0 * (qn.y * qn.y + qn.z * qn.z), 2.0 * (qn.x * qn.y - qn.w * qn.z), 2.0 * (qn.x * qn.z + qn.w * qn.y)),
-        vec3<f32>(2.0 * (qn.x * qn.y + qn.w * qn.z), 1.0 - 2.0 * (qn.x * qn.x + qn.z * qn.z), 2.0 * (qn.y * qn.z - qn.w * qn.x)),
-        vec3<f32>(2.0 * (qn.x * qn.z - qn.w * qn.y), 2.0 * (qn.y * qn.z + qn.w * qn.x), 1.0 - 2.0 * (qn.x * qn.x + qn.y * qn.y))
-    );
-    
-    // Triangle vertices in local space - form an equilateral triangle
-    // Centered at origin, rotated by the quaternion
+    // Triangle vertices in normalized device space.
+    // These offsets get scaled per-Gaussian so the rasterized triangle always covers
+    // enough of the Gaussian footprint for the fragment shader to evaluate.
     let tri_offsets = array<vec2<f32>, 3>(
         vec2<f32>(0.0, 1.1547),      // Top vertex (2/√3 * scale)
         vec2<f32>(-1.0, -0.57735),  // Bottom left
         vec2<f32>(1.0, -0.57735)    // Bottom right
     );
-    
-    let offset = tri_offsets[tri_vertex];
-    
-    // Transform triangle vertex by rotation only (no scaling)
-    let local_pos = rot_matrix * vec3<f32>(offset.x, offset.y, 0.0);
-    let world_pos = gaussian.position + local_pos;
-    
-    // Transform to clip space
-    let view_pos = camera.view_matrix * vec4<f32>(world_pos, 1.0);
-    let clip_pos = camera.proj_matrix * view_pos;
-    
-    // Compute NDC position for this vertex (for fragment shader interpolation)
-    let ndc_pos = clip_pos.xy / clip_pos.w;
-    
-    // Compute 2D covariance using Jacobian-based projection
-    // Step 1: Construct 3D covariance Σ_w from rot_matrix and scale
-    // Σ_w = R * diag(s²) * R^T
-    // More efficient construction: Σ_w[i][j] = sum_k(R[i][k] * s[k]² * R[j][k])
-    let scale_sq = vec3<f32>(gaussian.scale.x * gaussian.scale.x, gaussian.scale.y * gaussian.scale.y, gaussian.scale.z * gaussian.scale.z);
-    let sigma_w_00 = rot_matrix[0].x * scale_sq.x * rot_matrix[0].x + rot_matrix[0].y * scale_sq.y * rot_matrix[0].y + rot_matrix[0].z * scale_sq.z * rot_matrix[0].z;
-    let sigma_w_01 = rot_matrix[0].x * scale_sq.x * rot_matrix[1].x + rot_matrix[0].y * scale_sq.y * rot_matrix[1].y + rot_matrix[0].z * scale_sq.z * rot_matrix[1].z;
-    let sigma_w_02 = rot_matrix[0].x * scale_sq.x * rot_matrix[2].x + rot_matrix[0].y * scale_sq.y * rot_matrix[2].y + rot_matrix[0].z * scale_sq.z * rot_matrix[2].z;
-    let sigma_w_11 = rot_matrix[1].x * scale_sq.x * rot_matrix[1].x + rot_matrix[1].y * scale_sq.y * rot_matrix[1].y + rot_matrix[1].z * scale_sq.z * rot_matrix[1].z;
-    let sigma_w_12 = rot_matrix[1].x * scale_sq.x * rot_matrix[2].x + rot_matrix[1].y * scale_sq.y * rot_matrix[2].y + rot_matrix[1].z * scale_sq.z * rot_matrix[2].z;
-    let sigma_w_22 = rot_matrix[2].x * scale_sq.x * rot_matrix[2].x + rot_matrix[2].y * scale_sq.y * rot_matrix[2].y + rot_matrix[2].z * scale_sq.z * rot_matrix[2].z;
-    
-    // Step 2: Transform to camera space: Σ_c = R_view * Σ_w * R_view^T
-    // Extract rotation part from view matrix (upper-left 3x3)
-    let view_rot = mat3x3<f32>(
-        camera.view_matrix[0].xyz,
-        camera.view_matrix[1].xyz,
-        camera.view_matrix[2].xyz
-    );
-    // Compute Σ_c = R_view * Σ_w * R_view^T
-    let sigma_w_mat = mat3x3<f32>(
-        vec3<f32>(sigma_w_00, sigma_w_01, sigma_w_02),
-        vec3<f32>(sigma_w_01, sigma_w_11, sigma_w_12),
-        vec3<f32>(sigma_w_02, sigma_w_12, sigma_w_22)
-    );
-    let sigma_w_rotated = view_rot * sigma_w_mat;
-    let sigma_c = sigma_w_rotated * transpose(view_rot);
-    
-    // Step 3: Compute projection Jacobian and project to screen space
+    // Compute projection Jacobian and project the isotropic 3D Gaussian into screen space.
     // For perspective projection: p_ndc = (x/w, y/w) where (x,y,z,w) = proj_matrix * p_cam
     // The Jacobian J accounts for perspective division
-    let p_cam = view_pos.xyz;
-    let w = clip_pos.w;
+    // IMPORTANT: Use the center position, not the vertex position, for covariance calculation
+    let center_view = camera.view_matrix * vec4<f32>(position, 1.0);
+    let center_clip = camera.proj_matrix * center_view;
+    let w_mask = abs(center_clip.w) < 1e-6;
+    let safe_w = select(center_clip.w, 1.0, w_mask);
     
     // Extract projection matrix elements (assuming standard perspective projection)
     // For p_clip = P * p_cam, we need ∂(p_clip.xy / p_clip.w) / ∂p_cam
     // J = (1/w) * [P[0][0] - x*P[3][0], P[0][1] - x*P[3][1], P[0][2] - x*P[3][2]]
     //            [P[1][0] - y*P[3][0], P[1][1] - y*P[3][1], P[1][2] - y*P[3][2]]
     let proj = camera.proj_matrix;
-    let x_clip = clip_pos.x;
-    let y_clip = clip_pos.y;
+    let x_clip = center_clip.x;
+    let y_clip = center_clip.y;
     
     // Build 2x3 Jacobian matrix
-    let j00 = (proj[0][0] - x_clip * proj[3][0]) / w;
-    let j01 = (proj[0][1] - x_clip * proj[3][1]) / w;
-    let j02 = (proj[0][2] - x_clip * proj[3][2]) / w;
-    let j10 = (proj[1][0] - y_clip * proj[3][0]) / w;
-    let j11 = (proj[1][1] - y_clip * proj[3][1]) / w;
-    let j12 = (proj[1][2] - y_clip * proj[3][2]) / w;
+    let j00 = (proj[0][0] - x_clip * proj[3][0]) / safe_w;
+    let j01 = (proj[0][1] - x_clip * proj[3][1]) / safe_w;
+    let j02 = (proj[0][2] - x_clip * proj[3][2]) / safe_w;
+    let j10 = (proj[1][0] - y_clip * proj[3][0]) / safe_w;
+    let j11 = (proj[1][1] - y_clip * proj[3][1]) / safe_w;
+    let j12 = (proj[1][2] - y_clip * proj[3][2]) / safe_w;
     
-    // Step 4: Project covariance: Σ_screen = J * Σ_c * J^T
-    // J is 2x3, Σ_c is 3x3, result is 2x2
-    // Σ_screen[0][0] = J[0] * Σ_c * J[0]^T
-    // Σ_screen[0][1] = J[0] * Σ_c * J[1]^T
-    // Σ_screen[1][1] = J[1] * Σ_c * J[1]^T
+    // Project isotropic covariance: Σ_screen = radius^2 * (J * J^T)
     let j0 = vec3<f32>(j00, j01, j02);
     let j1 = vec3<f32>(j10, j11, j12);
-    let sigma_c_j0 = sigma_c * j0;
-    let sigma_c_j1 = sigma_c * j1;
-    let cov2d_00 = dot(j0, sigma_c_j0);
-    let cov2d_01 = dot(j0, sigma_c_j1);
-    let cov2d_11 = dot(j1, sigma_c_j1);
+    let radius_sq = radius * radius;
+    let cov2d_00 = radius_sq * dot(j0, j0);
+    let cov2d_01 = radius_sq * dot(j0, j1);
+    let cov2d_11 = radius_sq * dot(j1, j1);
     
     // Pack 2x2 symmetric covariance matrix into two vec2s
     // cov2d_a = (cov2d_00, cov2d_01)
@@ -158,16 +99,40 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
     
     // Compute center position in NDC space for fragment shader
     // The center is the Gaussian's world position (not the quad vertex position)
-    let center_view = camera.view_matrix * vec4<f32>(gaussian.position, 1.0);
-    let center_clip = camera.proj_matrix * center_view;
-    let center_ndc = center_clip.xy / center_clip.w;
+    // Reuse center_view and center_clip computed earlier for covariance calculation
+    let center_ndc = select(
+        center_clip.xy / safe_w,
+        vec2<f32>(0.0, 0.0),
+        w_mask
+    );
+    
+    // Use the projected covariance to determine how large the Gaussian is on screen.
+    let trace = cov2d_00 + cov2d_11;
+    let det = cov2d_00 * cov2d_11 - cov2d_01 * cov2d_01;
+    let discriminant = max(trace * trace - 4.0 * det, 0.0);
+    let lambda_max = 0.5 * (trace + sqrt(discriminant));
+    let sigma_max = sqrt(max(lambda_max, 1e-6));
+    let coverage_sigma = 3.0; // Cover ~99% of distribution
+    let radius_ndc = coverage_sigma * sigma_max;
+    
+    // Build a triangle in clip space centered on the Gaussian. This keeps the primitive
+    // axis-aligned in screen space, which is fine because the fragment shader applies the
+    // anisotropic falloff using the full covariance.
+    let offset_ndc = tri_offsets[tri_vertex] * radius_ndc;
+    let pixel_ndc = center_ndc + offset_ndc;
+    let clip_pos = vec4<f32>(
+        pixel_ndc.x * safe_w,
+        pixel_ndc.y * safe_w,
+        center_clip.z,
+        safe_w
+    );
     
     return VertexOutput(
         clip_pos,
-        gaussian.color,
-        gaussian.opacity,
+        rgb,
+        opacity,
         center_ndc,        // Center in NDC space
-        ndc_pos,          // This vertex's NDC position (will be interpolated)
+        pixel_ndc,        // This vertex's NDC position (will be interpolated)
         cov2d_a,
         cov2d_b
     );

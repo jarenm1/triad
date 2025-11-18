@@ -5,3 +5,4 @@ Cargo.lock
 goat.ply
 .gitignore
 output.png
+run.log

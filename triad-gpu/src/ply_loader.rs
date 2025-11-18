@@ -1,16 +1,8 @@
+use crate::GaussianPoint;
 use glam::Vec3;
 use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
-
-// GaussianPoint structure matching main.rs
-pub struct GaussianPoint {
-    pub position: [f32; 3],
-    pub scale: [f32; 3],
-    pub rotation: [f32; 4], // quaternion
-    pub color: [f32; 3],
-    pub opacity: f32,
-}
 
 // Face structure for PLY files (we ignore this data for Gaussian splatting)
 // Note: serde_ply handles list properties automatically
@@ -141,49 +133,28 @@ pub fn load_gaussians_from_ply(
             .ok_or_else(|| format!("Missing 'z' coordinate in PLY file at vertex {}", i))?;
         let position = Vec3::new(x, y, z);
 
-        // Parse scale (prefer scale_0/1/2, fallback to scale_x/y/z)
-        let scale = if let (Some(s0), Some(s1), Some(s2)) = (
+        // Parse optional per-axis scale to derive a simple isotropic radius.
+        // 3D Gaussian splatting datasets often store log-scales; regular point
+        // clouds typically omit them, in which case we fall back to the adaptive
+        // default computed from the scene bounds.
+        let scale_vec = if let (Some(s0), Some(s1), Some(s2)) = (
             get_f32(vertex.get("scale_0")),
             get_f32(vertex.get("scale_1")),
             get_f32(vertex.get("scale_2")),
         ) {
-            Vec3::new(s0, s1, s2)
+            Vec3::new(s0.exp(), s1.exp(), s2.exp())
         } else if let (Some(sx), Some(sy), Some(sz)) = (
             get_f32(vertex.get("scale_x")),
             get_f32(vertex.get("scale_y")),
             get_f32(vertex.get("scale_z")),
         ) {
             Vec3::new(sx, sy, sz)
+        } else if let Some(uniform_scale) = get_f32(vertex.get("scale")) {
+            Vec3::splat(uniform_scale)
         } else {
-            // Use adaptive scale computed from bounding box
-            Vec3::new(default_scale, default_scale, default_scale)
+            Vec3::splat(default_scale)
         };
-
-        // Parse rotation (prefer rot_0/1/2/3, fallback to rot_x/y/z/w, then qx/y/z/w)
-        let rotation = if let (Some(r0), Some(r1), Some(r2), Some(r3)) = (
-            get_f32(vertex.get("rot_0")),
-            get_f32(vertex.get("rot_1")),
-            get_f32(vertex.get("rot_2")),
-            get_f32(vertex.get("rot_3")),
-        ) {
-            [r0, r1, r2, r3]
-        } else if let (Some(rx), Some(ry), Some(rz), Some(rw)) = (
-            get_f32(vertex.get("rot_x")),
-            get_f32(vertex.get("rot_y")),
-            get_f32(vertex.get("rot_z")),
-            get_f32(vertex.get("rot_w")),
-        ) {
-            [rx, ry, rz, rw]
-        } else if let (Some(qx), Some(qy), Some(qz), Some(qw)) = (
-            get_f32(vertex.get("qx")),
-            get_f32(vertex.get("qy")),
-            get_f32(vertex.get("qz")),
-            get_f32(vertex.get("qw")),
-        ) {
-            [qx, qy, qz, qw]
-        } else {
-            [0.0, 0.0, 0.0, 1.0] // Identity quaternion
-        };
+        let radius = scale_vec.max_element().max(default_scale * 0.25);
 
         // Parse color - PLY files may use uchar (0-255) for colors
         // Handle multiple color field name variations and missing colors
@@ -212,18 +183,19 @@ pub fn load_gaussians_from_ply(
             Vec3::new(0.8, 0.8, 0.8) // Light gray default
         };
 
-        // Parse opacity
-        let opacity = get_f32(vertex.get("opacity"))
+        // Parse opacity. Treat values outside [0, 1] as logits (common for 3D GS).
+        let raw_opacity = get_f32(vertex.get("opacity"))
             .or_else(|| get_f32(vertex.get("alpha")))
-            .unwrap_or(1.0)
-            .clamp(0.0, 1.0);
+            .unwrap_or(1.0);
+        let opacity = if (0.0..=1.0).contains(&raw_opacity) {
+            raw_opacity
+        } else {
+            (1.0 / (1.0 + (-raw_opacity).exp())).clamp(0.0, 1.0)
+        };
 
         gaussians.push(GaussianPoint {
-            position: [position.x, position.y, position.z],
-            scale: [scale.x, scale.y, scale.z],
-            rotation,
-            color: [color.x, color.y, color.z], // RGB order
-            opacity,
+            position_radius: [position.x, position.y, position.z, radius],
+            color_opacity: [color.x, color.y, color.z, opacity],
         });
 
         // Debug: verify color is RGB not BGR
@@ -252,11 +224,12 @@ pub fn load_gaussians_from_ply(
                 "default".to_string()
             };
             info!(
-                "Vertex {}: pos=({:.3}, {:.3}, {:.3}), raw_color=({}), normalized_color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
+                "Vertex {}: pos=({:.3}, {:.3}, {:.3}), radius={:.4}, raw_color=({}), normalized_color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
                 i,
                 position.x,
                 position.y,
                 position.z,
+                radius,
                 raw_color_str,
                 color.x,
                 color.y,

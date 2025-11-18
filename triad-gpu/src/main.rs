@@ -8,15 +8,12 @@ use wgpu::util::DeviceExt;
 
 mod ply_loader;
 
-// Gaussian point structure matching shader
+// Gaussian point structure matching shader (std430 friendly)
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GaussianPoint {
-    pub position: [f32; 3],
-    pub scale: [f32; 3],
-    pub rotation: [f32; 4], // quaternion
-    pub color: [f32; 3],
-    pub opacity: f32,
+    pub position_radius: [f32; 4], // xyz + radius
+    pub color_opacity: [f32; 4],   // rgb + opacity
 }
 
 // Camera uniforms matching shader
@@ -218,17 +215,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("Please provide a PLY file path as argument")?;
     info!("Loading Gaussians from PLY file: {}", ply_path);
-    // Convert ply_loader::GaussianPoint to our GaussianPoint
-    let gaussians: Vec<GaussianPoint> = ply_loader::load_gaussians_from_ply(&ply_path)?
-        .into_iter()
-        .map(|p| GaussianPoint {
-            position: p.position,
-            scale: p.scale,
-            rotation: p.rotation,
-            color: p.color,
-            opacity: p.opacity,
-        })
-        .collect();
+    let gaussians: Vec<GaussianPoint> = ply_loader::load_gaussians_from_ply(&ply_path)?;
     let gaussian_count = gaussians.len() as u32;
     info!("Loaded {} Gaussians", gaussian_count);
 
@@ -239,8 +226,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for (i, g) in gaussians.iter().take(5).enumerate() {
         info!(
-            "Gaussian {}: pos={:?}, color={:?} (RGB), opacity={:.3}, scale={:?}",
-            i, g.position, g.color, g.opacity, g.scale
+            "Gaussian {}: pos=({:.3}, {:.3}, {:.3}), radius={:.4}, color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
+            i,
+            g.position_radius[0],
+            g.position_radius[1],
+            g.position_radius[2],
+            g.position_radius[3],
+            g.color_opacity[0],
+            g.color_opacity[1],
+            g.color_opacity[2],
+            g.color_opacity[3]
         );
     }
 
@@ -307,15 +302,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sample_idx = (gaussian_count / 2).min(100); // Sample middle or first 100
         let sample = &gaussians[sample_idx as usize];
         info!(
-            "Sample Gaussian [{}]: pos=({:.3}, {:.3}, {:.3}), color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
+            "Sample Gaussian [{}]: pos=({:.3}, {:.3}, {:.3}), radius={:.4}, color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
             sample_idx,
-            sample.position[0],
-            sample.position[1],
-            sample.position[2],
-            sample.color[0],
-            sample.color[1],
-            sample.color[2],
-            sample.opacity
+            sample.position_radius[0],
+            sample.position_radius[1],
+            sample.position_radius[2],
+            sample.position_radius[3],
+            sample.color_opacity[0],
+            sample.color_opacity[1],
+            sample.color_opacity[2],
+            sample.color_opacity[3]
         );
     }
 
@@ -651,7 +647,11 @@ fn calculate_bounding_box(gaussians: &[GaussianPoint]) -> (Vec3, Vec3, Vec3, Vec
     let mut max = Vec3::new(f32::MIN, f32::MIN, f32::MIN);
 
     for g in gaussians {
-        let pos = Vec3::new(g.position[0], g.position[1], g.position[2]);
+        let pos = Vec3::new(
+            g.position_radius[0],
+            g.position_radius[1],
+            g.position_radius[2],
+        );
         min = min.min(pos);
         max = max.max(pos);
     }

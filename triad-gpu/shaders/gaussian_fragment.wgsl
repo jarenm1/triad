@@ -38,7 +38,7 @@ fn fs_main(input: VertexOutput) -> FragmentOutput {
     if (abs(det) < 0.0001) {
         // Fallback to circular Gaussian
         let dist_sq = dot(delta, delta);
-        let gaussian_weight = exp(-dist_sq * 2.0);
+        let gaussian_weight = exp(-0.5 * dist_sq);
         let alpha = input.opacity * gaussian_weight;
         return FragmentOutput(vec4<f32>(input.color, clamp(alpha, 0.0, 1.0)));
     }
