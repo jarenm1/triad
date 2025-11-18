@@ -92,10 +92,15 @@ impl<'a> RenderPipelineBuilder<'a> {
             .get_shader(vertex_handle)
             .ok_or(PipelineBuildError::ShaderNotFound)?;
 
-        let fragment_shader = self
-            .fragment_shader
-            .and_then(|h| self.shader_manager.get_shader(h));
-
+        let fragment_shader = if let Some(h) = self.fragment_shader {
+            Some(
+                self.shader_manager
+                    .get_shader(h)
+                    .ok_or(PipelineBuildError::ShaderNotFound)?,
+            )
+        } else {
+            None
+        };
         let pipeline_layout = self.layout.unwrap_or_else(|| {
             self.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -142,7 +147,8 @@ impl<'a> RenderPipelineBuilder<'a> {
             });
 
         let handle = Handle::new(next_handle_id());
-        // Clone handle since register takes ownership but we need to return it
+        // Handle implements Copy, but we clone explicitly to avoid move issues
+        // For Copy types, clone() is just a copy operation (cheap)
         registry.register_render_pipeline(handle.clone(), pipeline);
         Ok(handle)
     }

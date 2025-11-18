@@ -2,3 +2,6 @@
 flake.lock
 Cargo.lock
 /target
+goat.ply
+.gitignore
+output.png

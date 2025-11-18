@@ -25,7 +25,8 @@ impl ShaderManager {
             label,
             source: wgpu::ShaderSource::Wgsl(source.into()),
         });
-        // Clone handle since register takes ownership but we need to return it
+        // Handle implements Copy, but we clone explicitly to avoid move issues
+        // For Copy types, clone() is just a copy operation (cheap)
         self.registry
             .register_shader_module(handle.clone(), shader_module);
         handle

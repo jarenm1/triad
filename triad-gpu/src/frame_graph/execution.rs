@@ -9,11 +9,13 @@ pub fn topological_sort(passes: &[PassNode]) -> Result<Vec<usize>, FrameGraphErr
     let mut graph: Vec<Vec<usize>> = vec![Vec::new(); n];
 
     // Build dependency graph
+    // When passes[i].dependencies(&passes[j]) is true, it means i depends on j,
+    // so j must execute before i. We add edge j→i (j before i).
     for i in 0..n {
         for j in 0..n {
             if i != j && passes[i].dependencies(&passes[j]) {
-                graph[i].push(j);
-                in_degree[j] += 1;
+                graph[j].push(i);
+                in_degree[i] += 1;
             }
         }
     }

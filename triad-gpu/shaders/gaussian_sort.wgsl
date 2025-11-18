@@ -31,10 +31,9 @@ struct CameraUniforms {
 fn cs_main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let idx = global_id.x;
     
-    if (idx >= arrayLength(&gaussians)) {
+    if (idx >= arrayLength(&gaussians) || idx >= arrayLength(&sort_data)) {
         return;
-    }
-    
+    }    
     let gaussian = gaussians[idx];
     
     // Transform position to view space and compute depth

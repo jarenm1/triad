@@ -5,9 +5,10 @@ struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec3<f32>,
     @location(1) opacity: f32,
-    @location(2) center: vec3<f32>,
-    @location(3) cov2d_a: vec2<f32>,
-    @location(4) cov2d_b: vec2<f32>,
+    @location(2) center_ndc: vec2<f32>, // Center in NDC space
+    @location(3) pixel_ndc: vec2<f32>,  // Interpolated NDC position of this fragment
+    @location(4) cov2d_a: vec2<f32>,
+    @location(5) cov2d_b: vec2<f32>,
 }
 
 struct FragmentOutput {
@@ -16,28 +17,59 @@ struct FragmentOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> FragmentOutput {
-    // Compute pixel position relative to Gaussian center
-    let pixel_pos = input.position.xy;
-    let center_pos = input.center.xy;
-    let delta = pixel_pos - center_pos;
+    // Both center and pixel are now in NDC space (-1 to 1)
+    // No coordinate conversion needed!
+    let delta = input.pixel_ndc - input.center_ndc;
     
-    // Compute 2D Gaussian falloff
-    // Using simplified covariance computation
-    let cov_a = input.cov2d_a;
-    let cov_b = input.cov2d_b;
+    // Compute 2D Gaussian falloff using the covariance matrix
+    // The covariance matrix is stored as:
+    // cov2d_a = (cov_00, cov_01)
+    // cov2d_b = (cov_01, cov_11)
+    // This represents the 2x2 symmetric matrix: [[cov_00, cov_01], [cov_01, cov_11]]
     
-    // Simplified Gaussian: exp(-0.5 * (delta^T * cov^-1 * delta))
-    // For performance, we use a simpler approximation
-    let dist_sq = dot(delta, delta);
-    let scale_factor = length(cov_a) + length(cov_b);
-    let gaussian_weight = exp(-0.5 * dist_sq / (scale_factor * scale_factor + 0.0001));
+    let cov_00 = input.cov2d_a.x;
+    let cov_01 = input.cov2d_a.y; // Same as cov2d_b.x
+    let cov_11 = input.cov2d_b.y;
     
-    // Apply opacity and Gaussian falloff
+    // Compute determinant of covariance matrix
+    let det = cov_00 * cov_11 - cov_01 * cov_01;
+    
+    // Avoid division by zero - if determinant is too small, use simple distance falloff
+    if (abs(det) < 0.0001) {
+        // Fallback to circular Gaussian
+        let dist_sq = dot(delta, delta);
+        let gaussian_weight = exp(-dist_sq * 2.0);
+        let alpha = input.opacity * gaussian_weight;
+        return FragmentOutput(vec4<f32>(input.color, clamp(alpha, 0.0, 1.0)));
+    }
+    
+    // Compute inverse covariance matrix
+    // For 2x2 matrix [[a, b], [b, c]], inverse is (1/det) * [[c, -b], [-b, a]]
+    let inv_det = 1.0 / det;
+    let inv_cov_00 = inv_det * cov_11;
+    let inv_cov_01 = -inv_det * cov_01;
+    let inv_cov_11 = inv_det * cov_00;
+    
+    // Compute delta^T * inv_cov * delta
+    // This is: delta.x * (inv_cov_00 * delta.x + inv_cov_01 * delta.y) +
+    //          delta.y * (inv_cov_01 * delta.x + inv_cov_11 * delta.y)
+    let power = delta.x * (inv_cov_00 * delta.x + inv_cov_01 * delta.y) +
+                delta.y * (inv_cov_01 * delta.x + inv_cov_11 * delta.y);
+    
+    // Clamp power to avoid overflow
+    if (power > 10.0) {
+        return FragmentOutput(vec4<f32>(input.color, 0.0));
+    }
+    
+    // Compute Gaussian: exp(-0.5 * power)
+    let gaussian_weight = exp(-0.5 * power);
+    
+    // Apply opacity
     let alpha = input.opacity * gaussian_weight;
     
-    // Alpha blending
-    let final_color = vec4<f32>(input.color, alpha);
+    // Clamp to valid range
+    let final_alpha = clamp(alpha, 0.0, 1.0);
     
-    return FragmentOutput(final_color);
+    return FragmentOutput(vec4<f32>(input.color, final_alpha));
 }
 

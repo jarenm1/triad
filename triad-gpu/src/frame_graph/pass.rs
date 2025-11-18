@@ -99,6 +99,10 @@ impl PassBuilder {
     }
 
     pub fn read_write<T: ResourceType>(&mut self, handle: Handle<T>) -> &mut Self {
+        self.reads.push(ResourceAccess {
+            handle_id: handle.id(),
+            state: ResourceState::Read,
+        });
         self.writes.push(ResourceAccess {
             handle_id: handle.id(),
             state: ResourceState::ReadWrite,
@@ -123,13 +127,29 @@ impl PassBuilder {
 
 /// Internal pass node representation
 pub struct PassNode {
-    pub name: String,
-    pub reads: HashSet<u64>,
-    pub writes: HashSet<u64>,
-    pub pass: Box<dyn Pass>,
+    name: String,
+    reads: HashSet<u64>,
+    writes: HashSet<u64>,
+    pass: Box<dyn Pass>,
 }
 
 impl PassNode {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn reads(&self) -> &HashSet<u64> {
+        &self.reads
+    }
+
+    pub fn writes(&self) -> &HashSet<u64> {
+        &self.writes
+    }
+
+    pub fn pass(&self) -> &dyn Pass {
+        self.pass.as_ref()
+    }
+
     pub fn dependencies(&self, other: &PassNode) -> bool {
         !self.writes.is_disjoint(&other.reads)
             || !self.writes.is_disjoint(&other.writes)
