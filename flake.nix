@@ -1,74 +1,43 @@
 {
-  description = "A Nix-flake-based Rust development environment";
-
   inputs = {
-    nixpkgs.url = "https://flakehub.com/f/NixOS/nixpkgs/0.1"; # unstable Nixpkgs
-    fenix = {
-      url = "https://flakehub.com/f/nix-community/fenix/0.1";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+    fenix.url = "github:nix-community/fenix";
+    fenix.inputs.nixpkgs.follows = "nixpkgs";
   };
 
-  outputs =
-    { self, ... }@inputs:
+  outputs = { nixpkgs, flake-utils, fenix, ... }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
 
-    let
-      supportedSystems = [
-        "x86_64-linux"
-        "aarch64-linux"
-        "x86_64-darwin"
-        "aarch64-darwin"
-      ];
-      forEachSupportedSystem =
-        f:
-        inputs.nixpkgs.lib.genAttrs supportedSystems (
-          system:
-          f {
-            pkgs = import inputs.nixpkgs {
-              inherit system;
-              overlays = [
-                inputs.self.overlays.default
-              ];
-            };
-          }
-        );
-    in
-    {
-      overlays.default = final: prev: {
-        rustToolchain =
-          with inputs.fenix.packages.${prev.stdenv.hostPlatform.system};
-          combine (
-            with stable;
-            [
-              clippy
-              rustc
-              cargo
-              rustfmt
-              rust-src
-            ]
-          );
-      };
+        # Pick whatever channel/version you want
+        rustToolchain = fenix.packages.${system}.complete;           # stable + rust-src + clippy + rustfmt + llvm-tools + rust-analyzer
+        # rustToolchain = fenix.packages.${system}.stable;            # smaller, also works
+        # rustToolchain = fenix.packages.${system}.fromToolchainFile {
+        #   file = ./rust-toolchain.toml;
+        #   sha256 = "...";
+        # };
 
-      devShells = forEachSupportedSystem (
-        { pkgs }:
-        {
-          default = pkgs.mkShellNoCC {
-            packages = with pkgs; [
-              rustToolchain
-              openssl
-              pkg-config
-              cargo-deny
-              cargo-edit
-              cargo-watch
-              rust-analyzer
-            ];
+      in {
+        devShells.default = pkgs.mkShell {
+          packages = [
+            rustToolchain.toolchain
+            pkgs.pkg-config
+            pkgs.openssl
+            pkgs.wayland
+            pkgs.wayland-protocols
+            pkgs.libxkbcommon
+            pkgs.libdecor
+            pkgs.vulkan-loader
+          ];
 
-            env = {
-              # Required by rust-analyzer
-              RUST_SRC_PATH = "${pkgs.rustToolchain}/lib/rustlib/src/rust/library";
-            };
-          };
-        }
-      );
-    };
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+            pkgs.wayland
+            pkgs.libdecor
+            pkgs.libxkbcommon
+            pkgs.vulkan-loader
+          ];
+        };
+      });
 }

@@ -1,10 +1,12 @@
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub type HandleId = u64;
+
 /// Type-safe resource handle
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Handle<T> {
-    id: u64,
+    id: HandleId,
     _phantom: PhantomData<T>,
 }
 impl<T> Handle<T> {
@@ -24,7 +26,7 @@ impl<T> Handle<T> {
         }
     }
 
-    pub fn id(&self) -> u64 {
+    pub fn id(&self) -> HandleId {
         self.id
     }
 }
@@ -119,6 +121,6 @@ impl ResourceInfo {
 /// Handle ID generator
 static HANDLE_ID: AtomicU64 = AtomicU64::new(1);
 
-pub fn next_handle_id() -> u64 {
+pub fn next_handle_id() -> HandleId {
     HANDLE_ID.fetch_add(1, Ordering::Relaxed)
 }

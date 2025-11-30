@@ -489,11 +489,7 @@ impl SceneBounds {
         let mut min = Vec3::splat(f32::MAX);
         let mut max = Vec3::splat(f32::MIN);
         for g in gaussians {
-            let pos = Vec3::new(
-                g.position_radius[0],
-                g.position_radius[1],
-                g.position_radius[2],
-            );
+            let pos = Vec3::new(g.position[0], g.position[1], g.position[2]);
             min = min.min(pos);
             max = max.max(pos);
         }

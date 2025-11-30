@@ -141,7 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     info!("Initializing renderer...");
-    let renderer = pollster::block_on(Renderer::new())?;
+    let renderer = pollster::block_on(Renderer::new())?; // wait for render
 
     let device = renderer.device();
     let queue = renderer.queue();
@@ -208,10 +208,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(
             "Gaussian {}: pos=({:.3}, {:.3}, {:.3}), radius={:.4}, color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
             i,
-            g.position_radius[0],
-            g.position_radius[1],
-            g.position_radius[2],
-            g.position_radius[3],
+            g.position[0],
+            g.position[1],
+            g.position[2],
+            g.position[3],
             g.color_opacity[0],
             g.color_opacity[1],
             g.color_opacity[2],
@@ -284,10 +284,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!(
             "Sample Gaussian [{}]: pos=({:.3}, {:.3}, {:.3}), radius={:.4}, color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
             sample_idx,
-            sample.position_radius[0],
-            sample.position_radius[1],
-            sample.position_radius[2],
-            sample.position_radius[3],
+            sample.position[0],
+            sample.position[1],
+            sample.position[2],
+            sample.position[3],
             sample.color_opacity[0],
             sample.color_opacity[1],
             sample.color_opacity[2],
@@ -627,11 +627,7 @@ fn calculate_bounding_box(gaussians: &[GaussianPoint]) -> (Vec3, Vec3, Vec3, Vec
     let mut max = Vec3::new(f32::MIN, f32::MIN, f32::MIN);
 
     for g in gaussians {
-        let pos = Vec3::new(
-            g.position_radius[0],
-            g.position_radius[1],
-            g.position_radius[2],
-        );
+        let pos = Vec3::new(g.position[0], g.position[1], g.position[2]);
         min = min.min(pos);
         max = max.max(pos);
     }

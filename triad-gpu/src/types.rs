@@ -6,29 +6,25 @@ use glam::{Mat4, Vec3};
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Debug)]
 pub struct GaussianPoint {
     /// xyz center and isotropic radius packed into w.
-    pub position_radius: [f32; 4],
+    pub position: [f32; 3],
     /// rgb color (linear 0-1) and opacity in w.
     pub color_opacity: [f32; 4],
     /// Quaternion (x, y, z, w) describing orientation.
     pub rotation: [f32; 4],
     /// Per-axis scale; w reserved for padding/extra scalar.
-    pub scale: [f32; 4],
+    pub scale: [f32; 3],
 }
 
 impl GaussianPoint {
     pub fn position(&self) -> Vec3 {
-        Vec3::from_slice(&self.position_radius[..3])
-    }
-
-    pub fn radius(&self) -> f32 {
-        self.position_radius[3]
+        Vec3::from_slice(&self.position[..3])
     }
 
     pub fn rotation(&self) -> [f32; 4] {
         self.rotation
     }
 
-    pub fn scale(&self) -> [f32; 4] {
+    pub fn scale(&self) -> [f32; 3] {
         self.scale
     }
 }
@@ -53,4 +49,3 @@ impl CameraUniforms {
         }
     }
 }
-

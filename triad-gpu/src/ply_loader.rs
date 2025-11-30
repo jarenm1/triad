@@ -154,7 +154,6 @@ pub fn load_gaussians_from_ply(
         } else {
             Vec3::splat(default_scale)
         };
-        let radius = scale_vec.max_element().max(default_scale * 0.25);
 
         // Parse rotation quaternion.
         let rotation = if let (Some(r0), Some(r1), Some(r2), Some(r3)) = (
@@ -220,10 +219,10 @@ pub fn load_gaussians_from_ply(
         };
 
         gaussians.push(GaussianPoint {
-            position_radius: [position.x, position.y, position.z, radius],
+            position: [position.x, position.y, position.z],
             color_opacity: [color.x, color.y, color.z, opacity],
             rotation,
-            scale: [scale_vec.x, scale_vec.y, scale_vec.z, 0.0],
+            scale: [scale_vec.x, scale_vec.y, scale_vec.z],
         });
 
         // Debug: verify color is RGB not BGR
@@ -252,12 +251,11 @@ pub fn load_gaussians_from_ply(
                 "default".to_string()
             };
             info!(
-                "Vertex {}: pos=({:.3}, {:.3}, {:.3}), radius={:.4}, raw_color=({}), normalized_color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
+                "Vertex {}: pos=({:.3}, {:.3}, {:.3}), raw_color=({}), normalized_color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
                 i,
                 position.x,
                 position.y,
                 position.z,
-                radius,
                 raw_color_str,
                 color.x,
                 color.y,
