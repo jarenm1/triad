@@ -133,7 +133,7 @@ pub fn load_gaussians_from_ply(
             .ok_or_else(|| format!("Missing 'z' coordinate in PLY file at vertex {}", i))?;
         let position = Vec3::new(x, y, z);
 
-        // Parse optional per-axis scale to derive a simple isotropic radius.
+        // Parse optional per-axis scale for anisotropic Gaussians.
         // 3D Gaussian splatting datasets often store log-scales; regular point
         // clouds typically omit them, in which case we fall back to the adaptive
         // default computed from the scene bounds.
@@ -220,9 +220,10 @@ pub fn load_gaussians_from_ply(
 
         gaussians.push(GaussianPoint {
             position: [position.x, position.y, position.z],
+            _pad0: 0.0,
             color_opacity: [color.x, color.y, color.z, opacity],
             rotation,
-            scale: [scale_vec.x, scale_vec.y, scale_vec.z],
+            scale: [scale_vec.x, scale_vec.y, scale_vec.z, 0.0],
         });
 
         // Debug: verify color is RGB not BGR

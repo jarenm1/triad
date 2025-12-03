@@ -8,7 +8,7 @@ use crate::resource_registry::ResourceRegistry;
 use std::collections::HashMap;
 
 pub use pass::{Pass, PassBuilder, PassContext};
-pub use resource::{Handle, HandleId, ResourceType, next_handle_id};
+pub use resource::{Handle, HandleId, ResourceType};
 
 pub type SurfaceId = u64;
 
@@ -87,7 +87,6 @@ impl FrameGraph {
         Ok(ExecutableFrameGraph {
             passes: self.passes,
             execution_order,
-            resource_info: self.resource_info,
             surface_handles: self.surface_handles,
         })
     }
@@ -97,7 +96,6 @@ impl FrameGraph {
 pub struct ExecutableFrameGraph {
     passes: Vec<PassNode>,
     execution_order: Vec<usize>,
-    resource_info: HashMap<u64, ResourceInfo>,
     surface_handles: Vec<u64>, // Surface handle IDs (surfaces tracked separately)
 }
 

@@ -7,7 +7,7 @@ use std::time::Instant;
 use tracing::{error, info};
 use triad_gpu::{
     CameraUniforms, GaussianPoint, Handle, RenderPipelineBuilder, Renderer, ResourceRegistry,
-    ShaderManager, SurfaceWrapper, ply_loader,
+    SurfaceWrapper, ply_loader,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -128,7 +128,6 @@ struct ViewerState {
     renderer: Renderer,
     surface: SurfaceWrapper,
     registry: ResourceRegistry,
-    shader_manager: ShaderManager,
     resources: GaussianResources,
     camera: Camera,
     controller: CameraController,
@@ -152,8 +151,7 @@ impl ViewerState {
         let surface = unsafe { renderer.instance().create_surface(window.clone()) }?;
         let surface = renderer.create_surface(surface, size.width.max(1), size.height.max(1))?;
 
-        let mut registry = ResourceRegistry::new();
-        let mut shader_manager = ShaderManager::new();
+        let mut registry = ResourceRegistry::default();
 
         let ply_path_str = ply_path
             .to_str()
@@ -176,7 +174,6 @@ impl ViewerState {
         let resources = GaussianResources::new(
             &renderer,
             &mut registry,
-            &mut shader_manager,
             surface.format(),
             &gaussians,
         )?;
@@ -186,7 +183,6 @@ impl ViewerState {
             renderer,
             surface,
             registry,
-            shader_manager,
             resources,
             camera,
             controller: CameraController::new(),
@@ -239,7 +235,7 @@ impl ViewerState {
         let queue = self.renderer.queue();
         let camera_buffer = self
             .registry
-            .get_buffer(self.resources.camera_buffer_handle.clone())
+            .get(self.resources.camera_buffer_handle)
             .expect("camera buffer");
         queue.write_buffer(camera_buffer, 0, bytemuck::bytes_of(&uniforms));
 
@@ -257,15 +253,15 @@ impl ViewerState {
         {
             let pipeline = self
                 .registry
-                .get_render_pipeline(self.resources.pipeline_handle.clone())
+                .get(self.resources.pipeline_handle)
                 .expect("pipeline");
             let bind_group = self
                 .registry
-                .get_bind_group(self.resources.bind_group_handle.clone())
+                .get(self.resources.bind_group_handle)
                 .expect("bind group");
             let index_buffer = self
                 .registry
-                .get_buffer(self.resources.index_buffer_handle.clone())
+                .get(self.resources.index_buffer_handle)
                 .expect("index buffer");
 
             let mut render_pass =
@@ -317,14 +313,12 @@ impl GaussianResources {
     fn new(
         renderer: &Renderer,
         registry: &mut ResourceRegistry,
-        shader_manager: &mut ShaderManager,
         color_format: triad_gpu::wgpu::TextureFormat,
         gaussians: &[GaussianPoint],
     ) -> Result<Self, Box<dyn Error>> {
         use triad_gpu::wgpu::util::DeviceExt;
         let device = renderer.device();
 
-        let gaussian_buffer_handle = Handle::next();
         let gaussian_data = bytemuck::cast_slice(gaussians);
         let gaussian_buffer =
             device.create_buffer_init(&triad_gpu::wgpu::util::BufferInitDescriptor {
@@ -332,9 +326,8 @@ impl GaussianResources {
                 contents: gaussian_data,
                 usage: triad_gpu::wgpu::BufferUsages::STORAGE,
             });
-        registry.register_buffer(gaussian_buffer_handle.clone(), gaussian_buffer);
+        let gaussian_buffer_handle = registry.insert(gaussian_buffer);
 
-        let camera_buffer_handle = Handle::next();
         let camera_buffer =
             device.create_buffer_init(&triad_gpu::wgpu::util::BufferInitDescriptor {
                 label: Some("Camera Buffer"),
@@ -347,7 +340,7 @@ impl GaussianResources {
                 usage: triad_gpu::wgpu::BufferUsages::UNIFORM
                     | triad_gpu::wgpu::BufferUsages::COPY_DST,
             });
-        registry.register_buffer(camera_buffer_handle.clone(), camera_buffer);
+        let camera_buffer_handle = registry.insert(camera_buffer);
 
         let mut indices = Vec::with_capacity(gaussians.len() * 3);
         for i in 0..gaussians.len() as u32 {
@@ -356,14 +349,13 @@ impl GaussianResources {
             indices.push(base + 1);
             indices.push(base + 2);
         }
-        let index_buffer_handle = Handle::next();
         let index_buffer =
             device.create_buffer_init(&triad_gpu::wgpu::util::BufferInitDescriptor {
                 label: Some("Index Buffer"),
                 contents: bytemuck::cast_slice(&indices),
                 usage: triad_gpu::wgpu::BufferUsages::INDEX,
             });
-        registry.register_buffer(index_buffer_handle.clone(), index_buffer);
+        let index_buffer_handle = registry.insert(index_buffer);
 
         let bind_group_layout =
             device.create_bind_group_layout(&triad_gpu::wgpu::BindGroupLayoutDescriptor {
@@ -397,7 +389,6 @@ impl GaussianResources {
                 ],
             });
 
-        let bind_group_handle = Handle::next();
         let bind_group = device.create_bind_group(&triad_gpu::wgpu::BindGroupDescriptor {
             label: Some("Gaussian Bind Group"),
             layout: &bind_group_layout,
@@ -405,27 +396,31 @@ impl GaussianResources {
                 triad_gpu::wgpu::BindGroupEntry {
                     binding: 0,
                     resource: registry
-                        .get_buffer(gaussian_buffer_handle.clone())
+                        .get(gaussian_buffer_handle)
                         .unwrap()
                         .as_entire_binding(),
                 },
                 triad_gpu::wgpu::BindGroupEntry {
                     binding: 1,
                     resource: registry
-                        .get_buffer(camera_buffer_handle.clone())
+                        .get(camera_buffer_handle)
                         .unwrap()
                         .as_entire_binding(),
                 },
             ],
         });
-        registry.register_bind_group(bind_group_handle.clone(), bind_group);
+        let bind_group_handle = registry.insert(bind_group);
 
         let vertex_shader_source = include_str!("../../triad-gpu/shaders/gaussian_vertex.wgsl");
         let fragment_shader_source = include_str!("../../triad-gpu/shaders/gaussian_fragment.wgsl");
-        let vertex_shader =
-            shader_manager.create_shader(device, Some("gaussian_vs"), vertex_shader_source);
-        let fragment_shader =
-            shader_manager.create_shader(device, Some("gaussian_fs"), fragment_shader_source);
+        let vertex_shader = device.create_shader_module(triad_gpu::wgpu::ShaderModuleDescriptor {
+            label: Some("gaussian_vs"),
+            source: triad_gpu::wgpu::ShaderSource::Wgsl(vertex_shader_source.into()),
+        });
+        let fragment_shader = device.create_shader_module(triad_gpu::wgpu::ShaderModuleDescriptor {
+            label: Some("gaussian_fs"),
+            source: triad_gpu::wgpu::ShaderSource::Wgsl(fragment_shader_source.into()),
+        });
 
         let pipeline_layout =
             device.create_pipeline_layout(&triad_gpu::wgpu::PipelineLayoutDescriptor {
@@ -434,10 +429,10 @@ impl GaussianResources {
                 push_constant_ranges: &[],
             });
 
-        let pipeline_handle = RenderPipelineBuilder::new(device, shader_manager)
+        let pipeline_handle = RenderPipelineBuilder::new(device)
             .with_label("Gaussian Pipeline")
-            .with_vertex_shader(vertex_shader)
-            .with_fragment_shader(fragment_shader)
+            .with_vertex_shader(registry.insert(vertex_shader))
+            .with_fragment_shader(registry.insert(fragment_shader))
             .with_layout(pipeline_layout)
             .with_primitive(triad_gpu::wgpu::PrimitiveState {
                 topology: triad_gpu::wgpu::PrimitiveTopology::TriangleList,

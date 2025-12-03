@@ -5,27 +5,41 @@ use glam::{Mat4, Vec3};
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Debug)]
 pub struct GaussianPoint {
-    /// xyz center and isotropic radius packed into w.
+    /// xyz center position.
     pub position: [f32; 3],
+    /// Padding to align color_opacity to 16 bytes.
+    pub _pad0: f32,
     /// rgb color (linear 0-1) and opacity in w.
     pub color_opacity: [f32; 4],
     /// Quaternion (x, y, z, w) describing orientation.
     pub rotation: [f32; 4],
-    /// Per-axis scale; w reserved for padding/extra scalar.
-    pub scale: [f32; 3],
+    /// Per-axis scale (x, y, z) + padding.
+    pub scale: [f32; 4],
 }
 
 impl GaussianPoint {
     pub fn position(&self) -> Vec3 {
-        Vec3::from_slice(&self.position[..3])
+        Vec3::from_slice(&self.position)
+    }
+
+    pub fn color(&self) -> Vec3 {
+        Vec3::new(
+            self.color_opacity[0],
+            self.color_opacity[1],
+            self.color_opacity[2],
+        )
+    }
+
+    pub fn opacity(&self) -> f32 {
+        self.color_opacity[3]
     }
 
     pub fn rotation(&self) -> [f32; 4] {
         self.rotation
     }
 
-    pub fn scale(&self) -> [f32; 3] {
-        self.scale
+    pub fn scale(&self) -> Vec3 {
+        Vec3::new(self.scale[0], self.scale[1], self.scale[2])
     }
 }
 

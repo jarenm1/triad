@@ -18,12 +18,12 @@ impl<'a> PassContext<'a> {
 
     /// Get a buffer resource by handle
     pub fn get_buffer(&self, handle: Handle<wgpu::Buffer>) -> Option<&wgpu::Buffer> {
-        self.resources.get_buffer(handle)
+        self.resources.get(handle)
     }
 
     /// Get a texture resource by handle
     pub fn get_texture(&self, handle: Handle<wgpu::Texture>) -> Option<&wgpu::Texture> {
-        self.resources.get_texture(handle)
+        self.resources.get(handle)
     }
 
     /// Get a render pipeline by handle
@@ -31,7 +31,7 @@ impl<'a> PassContext<'a> {
         &self,
         handle: Handle<wgpu::RenderPipeline>,
     ) -> Option<&wgpu::RenderPipeline> {
-        self.resources.get_render_pipeline(handle)
+        self.resources.get(handle)
     }
 
     /// Get a compute pipeline by handle
@@ -39,12 +39,12 @@ impl<'a> PassContext<'a> {
         &self,
         handle: Handle<wgpu::ComputePipeline>,
     ) -> Option<&wgpu::ComputePipeline> {
-        self.resources.get_compute_pipeline(handle)
+        self.resources.get(handle)
     }
 
     /// Get a bind group by handle
     pub fn get_bind_group(&self, handle: Handle<wgpu::BindGroup>) -> Option<&wgpu::BindGroup> {
-        self.resources.get_bind_group(handle)
+        self.resources.get(handle)
     }
 }
 

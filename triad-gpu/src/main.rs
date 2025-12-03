@@ -2,7 +2,7 @@ use glam::{Mat4, Vec3};
 use tracing::{Level, debug, error, info, instrument, span, trace, warn};
 use triad_gpu::{
     CameraUniforms, FrameGraph, GaussianPoint, Handle, Pass, PassBuilder, PassContext,
-    RenderPipelineBuilder, Renderer, ResourceRegistry, ShaderManager, ply_loader,
+    RenderPipelineBuilder, Renderer, ResourceRegistry, ply_loader,
 };
 use wgpu::util::DeviceExt;
 
@@ -28,17 +28,17 @@ impl Pass for GaussianRenderPass {
 
         // Get resources
         let pipeline = ctx
-            .get_render_pipeline(self.pipeline_handle.clone())
+            .get_render_pipeline(self.pipeline_handle)
             .expect("Pipeline not found");
         trace!("Pipeline retrieved");
 
         let bind_group = ctx
-            .get_bind_group(self.bind_group_handle.clone())
+            .get_bind_group(self.bind_group_handle)
             .expect("Bind group not found");
         trace!("Bind group retrieved");
 
         let output_texture = ctx
-            .get_texture(self.output_texture_handle.clone())
+            .get_texture(self.output_texture_handle)
             .expect("Output texture not found");
         debug!(
             "Output texture: {}x{}",
@@ -72,7 +72,7 @@ impl Pass for GaussianRenderPass {
 
         // Render Gaussians
         let index_buffer = ctx
-            .get_buffer(self.index_buffer_handle.clone())
+            .get_buffer(self.index_buffer_handle)
             .expect("Index buffer not found");
         trace!("Index buffer retrieved");
 
@@ -187,8 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Create resource registry
-    let mut registry = ResourceRegistry::new();
-    let mut shader_manager = ShaderManager::new();
+    let mut registry = ResourceRegistry::default();
 
     // Load Gaussian data
     let ply_path = std::env::args()
@@ -205,22 +204,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Center: {:?}, Size: {:?}", bbox_center, bbox_size);
 
     for (i, g) in gaussians.iter().take(5).enumerate() {
+        let pos = g.position();
+        let scale = g.scale();
+        let rot = g.rotation();
+        let color = g.color();
         info!(
-            "Gaussian {}: pos=({:.3}, {:.3}, {:.3}), radius={:.4}, color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
+            "Gaussian {}: pos=({:.3}, {:.3}, {:.3}), scale=({:.4}, {:.4}, {:.4}), rot=({:.3}, {:.3}, {:.3}, {:.3}), color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
             i,
-            g.position[0],
-            g.position[1],
-            g.position[2],
-            g.position[3],
-            g.color_opacity[0],
-            g.color_opacity[1],
-            g.color_opacity[2],
-            g.color_opacity[3]
+            pos.x,
+            pos.y,
+            pos.z,
+            scale.x,
+            scale.y,
+            scale.z,
+            rot[0],
+            rot[1],
+            rot[2],
+            rot[3],
+            color.x,
+            color.y,
+            color.z,
+            g.opacity(),
         );
     }
 
     // Create Gaussian buffer
-    let gaussian_buffer_handle = Handle::next();
     let gaussian_data = bytemuck::cast_slice(&gaussians);
     let gaussian_buffer_size = gaussian_data.len() as u64;
 
@@ -281,17 +289,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if gaussian_count > 0 {
         let sample_idx = (gaussian_count / 2).min(100); // Sample middle or first 100
         let sample = &gaussians[sample_idx as usize];
+        let pos = sample.position();
+        let scale = sample.scale();
+        let color = sample.color();
         info!(
-            "Sample Gaussian [{}]: pos=({:.3}, {:.3}, {:.3}), radius={:.4}, color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
+            "Sample Gaussian [{}]: pos=({:.3}, {:.3}, {:.3}), scale=({:.4}, {:.4}, {:.4}), color=({:.3}, {:.3}, {:.3}), opacity={:.3}",
             sample_idx,
-            sample.position[0],
-            sample.position[1],
-            sample.position[2],
-            sample.position[3],
-            sample.color_opacity[0],
-            sample.color_opacity[1],
-            sample.color_opacity[2],
-            sample.color_opacity[3]
+            pos.x,
+            pos.y,
+            pos.z,
+            scale.x,
+            scale.y,
+            scale.z,
+            color.x,
+            color.y,
+            color.z,
+            sample.opacity()
         );
     }
 
@@ -315,7 +328,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    registry.register_buffer(gaussian_buffer_handle.clone(), gaussian_buffer);
+    let gaussian_buffer_handle = registry.insert(gaussian_buffer);
 
     info!("Gaussian buffer registered successfully");
 
@@ -331,7 +344,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         indices.push(base + 2);
     }
 
-    let index_buffer_handle = Handle::next();
     let index_data = bytemuck::cast_slice(&indices);
     let index_buffer_size = index_data.len() as u64;
 
@@ -356,13 +368,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         contents: index_data,
         usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
     });
-    registry.register_buffer(index_buffer_handle.clone(), index_buffer);
+    let index_buffer_handle = registry.insert(index_buffer);
 
     // Verify actual buffer size matches expected
-    let actual_index_buffer_size = registry
-        .get_buffer(index_buffer_handle.clone())
-        .unwrap()
-        .size();
+    let actual_index_buffer_size = registry.get(index_buffer_handle).unwrap().size();
     info!(
         "Created index buffer: {} bytes (expected {} bytes)",
         actual_index_buffer_size, index_buffer_size
@@ -378,19 +387,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create camera uniforms
     info!("Setting up camera...");
     let camera_uniforms = create_camera_uniforms_from_bbox(bbox_center, bbox_size);
-    let camera_buffer_handle = Handle::next();
     let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Camera Buffer"),
         contents: bytemuck::cast_slice(&[camera_uniforms]),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
-    registry.register_buffer(camera_buffer_handle.clone(), camera_buffer);
+    let camera_buffer_handle = registry.insert(camera_buffer);
 
     // Create output texture (headless rendering)
     println!("Creating output texture...");
     let width = 1920u32;
     let height = 1080u32;
-    let output_texture_handle = Handle::next();
     let output_texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Output Texture"),
         size: wgpu::Extent3d {
@@ -405,7 +412,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    registry.register_texture(output_texture_handle.clone(), output_texture);
+    let output_texture_handle = registry.insert(output_texture);
 
     // Load shaders
     let shader_span = span!(Level::INFO, "shader_loading");
@@ -421,16 +428,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fragment_shader_source.len()
     );
 
-    let vertex_shader =
-        shader_manager.create_shader(device, Some("gaussian_vs"), vertex_shader_source);
-    trace!("Vertex shader created: handle id {}", vertex_shader.id());
+    // Create shaders directly and store in registry
+    let vertex_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("gaussian_vs"),
+        source: wgpu::ShaderSource::Wgsl(vertex_shader_source.into()),
+    });
+    let vertex_shader = registry.insert(vertex_shader_module);
+    trace!("Vertex shader created: handle id {:?}", vertex_shader);
 
-    let fragment_shader =
-        shader_manager.create_shader(device, Some("gaussian_fs"), fragment_shader_source);
-    trace!(
-        "Fragment shader created: handle id {}",
-        fragment_shader.id()
-    );
+    let fragment_shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("gaussian_fs"),
+        source: wgpu::ShaderSource::Wgsl(fragment_shader_source.into()),
+    });
+    let fragment_shader = registry.insert(fragment_shader_module);
+    trace!("Fragment shader created: handle id {:?}", fragment_shader);
 
     // Create bind group layout
     let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -465,7 +476,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Create bind group
-    let bind_group_handle = Handle::next();
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("Gaussian Bind Group"),
         layout: &bind_group_layout,
@@ -473,20 +483,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             wgpu::BindGroupEntry {
                 binding: 0,
                 resource: registry
-                    .get_buffer(gaussian_buffer_handle.clone())
+                    .get(gaussian_buffer_handle)
                     .unwrap()
                     .as_entire_binding(),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: registry
-                    .get_buffer(camera_buffer_handle.clone())
+                    .get(camera_buffer_handle)
                     .unwrap()
                     .as_entire_binding(),
             },
         ],
     });
-    registry.register_bind_group(bind_group_handle.clone(), bind_group);
+    let bind_group_handle = registry.insert(bind_group);
 
     // Create pipeline layout
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -499,7 +509,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pipeline_span = span!(Level::INFO, "pipeline_creation");
     let _pipeline_guard = pipeline_span.enter();
     info!("Creating render pipeline...");
-    let pipeline_handle = RenderPipelineBuilder::new(device, &shader_manager)
+    let pipeline_handle = RenderPipelineBuilder::new(device)
         .with_label("Gaussian Splatting Pipeline")
         .with_vertex_shader(vertex_shader)
         .with_fragment_shader(fragment_shader)
@@ -532,39 +542,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             write_mask: wgpu::ColorWrites::ALL,
         }))
         .build(&mut registry)?;
-    debug!(
-        "Render pipeline created: handle id {}",
-        pipeline_handle.id()
-    );
+    debug!("Render pipeline created: handle {:?}", pipeline_handle);
 
     // Create frame graph
     info!("Building frame graph...");
     let mut frame_graph = FrameGraph::default();
 
     // Register resources
-    frame_graph.register_resource(gaussian_buffer_handle.clone());
-    frame_graph.register_resource(camera_buffer_handle.clone());
-    frame_graph.register_resource(output_texture_handle.clone());
-    frame_graph.register_resource(pipeline_handle.clone());
-    frame_graph.register_resource(bind_group_handle.clone());
-    frame_graph.register_resource(index_buffer_handle.clone());
+    frame_graph.register_resource(gaussian_buffer_handle);
+    frame_graph.register_resource(camera_buffer_handle);
+    frame_graph.register_resource(output_texture_handle);
+    frame_graph.register_resource(pipeline_handle);
+    frame_graph.register_resource(bind_group_handle);
+    frame_graph.register_resource(index_buffer_handle);
 
     // Add render pass
     let mut pass_builder = PassBuilder::new("gaussian_splatting");
     pass_builder
-        .read(gaussian_buffer_handle.clone())
-        .read(camera_buffer_handle.clone())
-        .read(pipeline_handle.clone())
-        .read(bind_group_handle.clone())
-        .read(index_buffer_handle.clone())
-        .write(output_texture_handle.clone());
+        .read(gaussian_buffer_handle)
+        .read(camera_buffer_handle)
+        .read(pipeline_handle)
+        .read(bind_group_handle)
+        .read(index_buffer_handle)
+        .write(output_texture_handle);
 
     let render_pass = GaussianRenderPass {
-        pipeline_handle: pipeline_handle.clone(),
-        bind_group_handle: bind_group_handle.clone(),
-        index_buffer_handle: index_buffer_handle.clone(),
+        pipeline_handle,
+        bind_group_handle,
+        index_buffer_handle,
         gaussian_count,
-        output_texture_handle: output_texture_handle.clone(),
+        output_texture_handle,
     };
 
     frame_graph.add_pass(pass_builder.with_pass(Box::new(render_pass)));
@@ -608,7 +615,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device,
         queue,
         &registry,
-        output_texture_handle.clone(),
+        output_texture_handle,
         width,
         height,
     )?;
@@ -709,7 +716,7 @@ fn save_texture_to_png(
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let texture = registry.get_texture(texture_handle).unwrap();
+    let texture = registry.get(texture_handle).unwrap();
 
     // Create a buffer to read the texture into
     let buffer_size = (width * height * 4) as u64; // RGBA

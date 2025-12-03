@@ -1,15 +1,114 @@
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type HandleId = u64;
 
+/// Resource state for tracking access patterns
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResourceState {
+    #[default]
+    Undefined,
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl ResourceState {
+    /// Merge two resource states
+    pub fn merge_with(self, other: ResourceState) -> ResourceState {
+        match (self, other) {
+            (ResourceState::Undefined, other) => other,
+            (current, ResourceState::Undefined) => current,
+            (ResourceState::Read, ResourceState::Read) => ResourceState::Read,
+            (ResourceState::Write, ResourceState::Write) => ResourceState::Write,
+            _ => ResourceState::ReadWrite,
+        }
+    }
+}
+
+/// Resource tracking information for frame graph lifetime management
+#[derive(Debug, Clone)]
+pub struct ResourceInfo {
+    state: ResourceState,
+    first_used_pass: usize,
+    last_used_pass: usize,
+}
+
+impl ResourceInfo {
+    pub fn new() -> Self {
+        Self {
+            state: ResourceState::Undefined,
+            first_used_pass: usize::MAX,
+            last_used_pass: 0,
+        }
+    }
+
+    pub fn state(&self) -> ResourceState {
+        self.state
+    }
+
+    pub fn set_state(&mut self, state: ResourceState) {
+        self.state = state;
+    }
+
+    pub fn first_used_pass(&self) -> usize {
+        self.first_used_pass
+    }
+
+    pub fn set_first_used_pass(&mut self, pass: usize) {
+        self.first_used_pass = pass;
+    }
+
+    pub fn last_used_pass(&self) -> usize {
+        self.last_used_pass
+    }
+
+    pub fn set_last_used_pass(&mut self, pass: usize) {
+        self.last_used_pass = pass;
+    }
+}
+
+impl Default for ResourceInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Type-safe resource handle
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// We manually implement Hash, Eq, PartialEq, Clone, Copy to avoid adding bounds on T.
+/// The derive macros would add `T: Hash`, `T: Eq`, `T: Clone`, `T: Copy` etc. even though
+/// we only hash/compare/copy the `id` field.
+#[derive(Debug)]
 pub struct Handle<T> {
     id: HandleId,
-    _phantom: PhantomData<T>,
+    _phantom: PhantomData<fn(T) -> T>,
 }
-impl<T> Handle<T> {
+
+// Manual implementations without bounds on T
+impl<T> Hash for Handle<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl<T> PartialEq for Handle<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl<T> Eq for Handle<T> {}
+
+impl<T> Clone for Handle<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Handle<T> {}
+impl<T: ResourceType> Handle<T> {
     pub(crate) fn new(id: u64) -> Self {
         Self {
             id,
@@ -26,9 +125,17 @@ impl<T> Handle<T> {
         }
     }
 
+    /// Get the handle's unique ID
     pub fn id(&self) -> HandleId {
         self.id
     }
+}
+
+/// Handle ID generator
+static HANDLE_ID: AtomicU64 = AtomicU64::new(1);
+
+pub fn next_handle_id() -> HandleId {
+    HANDLE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Resource type marker traits
@@ -41,86 +148,3 @@ impl ResourceType for wgpu::BindGroup {}
 impl ResourceType for wgpu::RenderPipeline {}
 impl ResourceType for wgpu::ComputePipeline {}
 impl ResourceType for wgpu::ShaderModule {}
-
-/// Resource state tracking
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResourceState {
-    Undefined,
-    Read,
-    Write,
-    ReadWrite,
-}
-
-impl ResourceState {
-    /// Merge this state with a new access pattern.
-    /// Accumulates access types rather than overwriting:
-    /// - Read + Write → ReadWrite
-    /// - Write + Read → ReadWrite
-    /// - ReadWrite + anything → ReadWrite
-    pub fn merge_with(self, new_access: ResourceState) -> ResourceState {
-        match (self, new_access) {
-            // If either is ReadWrite, result is ReadWrite
-            (ResourceState::ReadWrite, _) | (_, ResourceState::ReadWrite) => {
-                ResourceState::ReadWrite
-            }
-            // Read + Write or Write + Read → ReadWrite
-            (ResourceState::Read, ResourceState::Write)
-            | (ResourceState::Write, ResourceState::Read) => ResourceState::ReadWrite,
-            // Same access type → keep it
-            (a, b) if a == b => a,
-            // Undefined + anything → the new access
-            (ResourceState::Undefined, new) => new,
-            (old, ResourceState::Undefined) => old,
-            // This shouldn't happen, but handle gracefully
-            _ => ResourceState::ReadWrite,
-        }
-    }
-}
-
-/// Resource metadata
-pub struct ResourceInfo {
-    state: ResourceState,
-    last_used_pass: usize,
-    first_used_pass: usize,
-}
-
-impl ResourceInfo {
-    pub fn new() -> Self {
-        Self {
-            state: ResourceState::Undefined,
-            last_used_pass: 0,
-            first_used_pass: usize::MAX,
-        }
-    }
-
-    pub fn state(&self) -> ResourceState {
-        self.state
-    }
-
-    pub fn set_state(&mut self, state: ResourceState) {
-        self.state = state;
-    }
-
-    pub fn last_used_pass(&self) -> usize {
-        self.last_used_pass
-    }
-
-    pub fn set_last_used_pass(&mut self, pass: usize) {
-        self.last_used_pass = pass;
-    }
-
-    pub fn first_used_pass(&self) -> usize {
-        self.first_used_pass
-    }
-
-    pub fn set_first_used_pass(&mut self, pass: usize) {
-        self.first_used_pass = pass;
-    }
-}
-
-/// Handle ID generator
-static HANDLE_ID: AtomicU64 = AtomicU64::new(1);
-
-pub fn next_handle_id() -> HandleId {
-    HANDLE_ID.fetch_add(1, Ordering::Relaxed)
-}

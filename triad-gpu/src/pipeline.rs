@@ -1,11 +1,9 @@
-use crate::frame_graph::resource::{Handle, ResourceType, next_handle_id};
+use crate::frame_graph::resource::Handle;
 use crate::resource_registry::ResourceRegistry;
-use crate::shader::ShaderManager;
 
 /// Builder for creating render pipelines
 pub struct RenderPipelineBuilder<'a> {
     device: &'a wgpu::Device,
-    shader_manager: &'a ShaderManager,
     vertex_shader: Option<Handle<wgpu::ShaderModule>>,
     fragment_shader: Option<Handle<wgpu::ShaderModule>>,
     label: Option<String>,
@@ -18,10 +16,9 @@ pub struct RenderPipelineBuilder<'a> {
 }
 
 impl<'a> RenderPipelineBuilder<'a> {
-    pub fn new(device: &'a wgpu::Device, shader_manager: &'a ShaderManager) -> Self {
+    pub fn new(device: &'a wgpu::Device) -> Self {
         Self {
             device,
-            shader_manager,
             vertex_shader: None,
             fragment_shader: None,
             label: None,
@@ -87,20 +84,20 @@ impl<'a> RenderPipelineBuilder<'a> {
         let vertex_handle = self
             .vertex_shader
             .ok_or(PipelineBuildError::MissingVertexShader)?;
-        let vertex_shader = self
-            .shader_manager
-            .get_shader(vertex_handle)
+        let vertex_shader = registry
+            .get(vertex_handle)
             .ok_or(PipelineBuildError::ShaderNotFound)?;
 
         let fragment_shader = if let Some(h) = self.fragment_shader {
             Some(
-                self.shader_manager
-                    .get_shader(h)
+                registry
+                    .get(h)
                     .ok_or(PipelineBuildError::ShaderNotFound)?,
             )
         } else {
             None
         };
+
         let pipeline_layout = self.layout.unwrap_or_else(|| {
             self.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -146,10 +143,7 @@ impl<'a> RenderPipelineBuilder<'a> {
                 cache: None,
             });
 
-        let handle = Handle::new(next_handle_id());
-        // Handle implements Copy, but we clone explicitly to avoid move issues
-        // For Copy types, clone() is just a copy operation (cheap)
-        registry.register_render_pipeline(handle.clone(), pipeline);
+        let handle = registry.insert(pipeline);
         Ok(handle)
     }
 }

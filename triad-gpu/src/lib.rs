@@ -3,17 +3,17 @@ mod frame_graph;
 mod pipeline;
 pub mod ply_loader;
 mod resource_registry;
-mod shader;
 mod surface;
+mod type_map;
 mod types;
 
 pub use frame_graph::{FrameGraph, Handle, Pass, PassBuilder, PassContext, ResourceType};
 pub use pipeline::{PipelineBuildError, RenderPipelineBuilder};
 pub use resource_registry::ResourceRegistry;
-pub use shader::ShaderManager;
 pub use surface::SurfaceWrapper;
 pub use types::{CameraUniforms, GaussianPoint};
 pub use wgpu;
+
 
 #[derive(Debug, thiserror::Error)]
 pub enum RendererError {
