@@ -4,3 +4,26 @@ members = [
 "triad-window",
 ]
 resolver = "3"
+
+[[example]]
+name = "triangle_splatting"
+path = "examples/triangle_splatting.rs"
+
+[workspace.dependencies]
+triad-gpu = { path = "triad-gpu" }
+triad-window = { path = "triad-window" }
+glam = "0.30"
+tracing = "0.1"
+bytemuck = { version = "1.24", features = ["derive"] }
+
+[dependencies]
+triad-gpu = { workspace = true }
+triad-window = { workspace = true }
+glam = { workspace = true }
+tracing = { workspace = true }
+bytemuck = { workspace = true }
+
+[package]
+name = "triad"
+version = "0.1.0"
+edition = "2024"

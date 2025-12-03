@@ -1,12 +1,21 @@
-use crate::GaussianPoint;
+use crate::{GaussianPoint, TrianglePrimitive};
 use glam::Vec3;
 use serde::Deserialize;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
-// Face structure for PLY files (we ignore this data for Gaussian splatting)
+/// Intermediate vertex data extracted from PLY for triangle building.
+#[derive(Debug, Clone)]
+pub struct PlyVertex {
+    pub position: Vec3,
+    pub color: Vec3,
+    pub opacity: f32,
+}
+
+// Face structure for PLY files
 // Note: serde_ply handles list properties automatically
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)] // Fields accessed via pattern matching after serde deserialization
 struct PlyFace {
     vertex_indices: Vec<i32>,
 }
@@ -268,4 +277,229 @@ pub fn load_gaussians_from_ply(
 
     debug!("Loaded {} Gaussians from PLY file", gaussians.len());
     Ok(gaussians)
+}
+
+/// Load vertices from a PLY file without converting to Gaussian format.
+/// Returns raw vertex data that can be used for triangulation.
+pub fn load_vertices_from_ply(path: &str) -> Result<Vec<PlyVertex>, Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    debug!("Loading PLY vertices from: {}", path);
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let ply_data: PlyFile = serde_ply::from_reader(reader).map_err(|e| {
+        warn!("Failed to parse PLY file: {}", e);
+        format!("PLY parsing error: {}", e)
+    })?;
+
+    info!(
+        "PLY file parsed: {} vertices, {} faces",
+        ply_data.vertex.len(),
+        ply_data.face.len()
+    );
+
+    fn get_f32(prop: Option<&JsonValue>) -> Option<f32> {
+        prop.and_then(|v| match v {
+            JsonValue::Number(n) => n.as_f64().map(|f| f as f32),
+            _ => None,
+        })
+    }
+
+    fn get_u8(prop: Option<&JsonValue>) -> Option<u8> {
+        prop.and_then(|v| match v {
+            JsonValue::Number(n) => n.as_u64().map(|u| u as u8).or_else(|| n.as_i64().map(|i| i as u8)),
+            _ => None,
+        })
+    }
+
+    let mut vertices = Vec::with_capacity(ply_data.vertex.len());
+
+    for (i, vertex) in ply_data.vertex.iter().enumerate() {
+        let x = get_f32(vertex.get("x"))
+            .ok_or_else(|| format!("Missing 'x' at vertex {}", i))?;
+        let y = get_f32(vertex.get("y"))
+            .ok_or_else(|| format!("Missing 'y' at vertex {}", i))?;
+        let z = get_f32(vertex.get("z"))
+            .ok_or_else(|| format!("Missing 'z' at vertex {}", i))?;
+
+        let color = if let (Some(r), Some(g), Some(b)) = (
+            get_u8(vertex.get("red")),
+            get_u8(vertex.get("green")),
+            get_u8(vertex.get("blue")),
+        ) {
+            Vec3::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+        } else if let (Some(r), Some(g), Some(b)) = (
+            get_u8(vertex.get("r")),
+            get_u8(vertex.get("g")),
+            get_u8(vertex.get("b")),
+        ) {
+            Vec3::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+        } else {
+            Vec3::new(0.8, 0.8, 0.8)
+        };
+
+        let raw_opacity = get_f32(vertex.get("opacity"))
+            .or_else(|| get_f32(vertex.get("alpha")))
+            .unwrap_or(1.0);
+        let opacity = if (0.0..=1.0).contains(&raw_opacity) {
+            raw_opacity
+        } else {
+            (1.0 / (1.0 + (-raw_opacity).exp())).clamp(0.0, 1.0)
+        };
+
+        vertices.push(PlyVertex {
+            position: Vec3::new(x, y, z),
+            color,
+            opacity,
+        });
+    }
+
+    debug!("Loaded {} vertices from PLY file", vertices.len());
+    Ok(vertices)
+}
+
+/// Load triangles from a PLY file that contains face data.
+/// Returns triangles built from vertex positions with averaged vertex colors.
+/// Returns an error if the PLY file has no face data.
+pub fn load_triangles_from_ply(
+    path: &str,
+) -> Result<Vec<TrianglePrimitive>, Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    debug!("Loading PLY triangles from: {}", path);
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let ply_data: PlyFile = serde_ply::from_reader(reader).map_err(|e| {
+        warn!("Failed to parse PLY file: {}", e);
+        format!("PLY parsing error: {}", e)
+    })?;
+
+    info!(
+        "PLY file parsed: {} vertices, {} faces",
+        ply_data.vertex.len(),
+        ply_data.face.len()
+    );
+
+    if ply_data.face.is_empty() {
+        return Err("PLY file contains no face data. Use triangulation for point clouds.".into());
+    }
+
+    // Parse vertices first
+    fn get_f32(prop: Option<&JsonValue>) -> Option<f32> {
+        prop.and_then(|v| match v {
+            JsonValue::Number(n) => n.as_f64().map(|f| f as f32),
+            _ => None,
+        })
+    }
+
+    fn get_u8(prop: Option<&JsonValue>) -> Option<u8> {
+        prop.and_then(|v| match v {
+            JsonValue::Number(n) => n.as_u64().map(|u| u as u8).or_else(|| n.as_i64().map(|i| i as u8)),
+            _ => None,
+        })
+    }
+
+    let mut vertices = Vec::with_capacity(ply_data.vertex.len());
+
+    for (i, vertex) in ply_data.vertex.iter().enumerate() {
+        let x = get_f32(vertex.get("x"))
+            .ok_or_else(|| format!("Missing 'x' at vertex {}", i))?;
+        let y = get_f32(vertex.get("y"))
+            .ok_or_else(|| format!("Missing 'y' at vertex {}", i))?;
+        let z = get_f32(vertex.get("z"))
+            .ok_or_else(|| format!("Missing 'z' at vertex {}", i))?;
+
+        let color = if let (Some(r), Some(g), Some(b)) = (
+            get_u8(vertex.get("red")),
+            get_u8(vertex.get("green")),
+            get_u8(vertex.get("blue")),
+        ) {
+            Vec3::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+        } else if let (Some(r), Some(g), Some(b)) = (
+            get_u8(vertex.get("r")),
+            get_u8(vertex.get("g")),
+            get_u8(vertex.get("b")),
+        ) {
+            Vec3::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
+        } else {
+            Vec3::new(0.8, 0.8, 0.8)
+        };
+
+        let raw_opacity = get_f32(vertex.get("opacity"))
+            .or_else(|| get_f32(vertex.get("alpha")))
+            .unwrap_or(1.0);
+        let opacity = if (0.0..=1.0).contains(&raw_opacity) {
+            raw_opacity
+        } else {
+            (1.0 / (1.0 + (-raw_opacity).exp())).clamp(0.0, 1.0)
+        };
+
+        vertices.push(PlyVertex {
+            position: Vec3::new(x, y, z),
+            color,
+            opacity,
+        });
+    }
+
+    // Build triangles from faces
+    let mut triangles = Vec::new();
+
+    for (face_idx, face) in ply_data.face.iter().enumerate() {
+        let indices = &face.vertex_indices;
+
+        if indices.len() < 3 {
+            warn!("Face {} has fewer than 3 vertices, skipping", face_idx);
+            continue;
+        }
+
+        // Triangulate the face (fan triangulation for polygons with >3 vertices)
+        for i in 1..indices.len() - 1 {
+            let i0 = indices[0] as usize;
+            let i1 = indices[i] as usize;
+            let i2 = indices[i + 1] as usize;
+
+            if i0 >= vertices.len() || i1 >= vertices.len() || i2 >= vertices.len() {
+                warn!(
+                    "Face {} has out-of-bounds vertex indices ({}, {}, {}), skipping",
+                    face_idx, i0, i1, i2
+                );
+                continue;
+            }
+
+            let v0 = &vertices[i0];
+            let v1 = &vertices[i1];
+            let v2 = &vertices[i2];
+
+            // Average vertex colors for the triangle
+            let avg_color = (v0.color + v1.color + v2.color) / 3.0;
+            let avg_opacity = (v0.opacity + v1.opacity + v2.opacity) / 3.0;
+
+            triangles.push(TrianglePrimitive::new(
+                v0.position,
+                v1.position,
+                v2.position,
+                avg_color,
+                avg_opacity,
+            ));
+        }
+    }
+
+    info!("Built {} triangles from PLY faces", triangles.len());
+    Ok(triangles)
+}
+
+/// Check if a PLY file contains face data without fully parsing it.
+pub fn ply_has_faces(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    use std::fs::File;
+    use std::io::BufReader;
+
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+
+    let ply_data: PlyFile = serde_ply::from_reader(reader)?;
+    Ok(!ply_data.face.is_empty())
 }

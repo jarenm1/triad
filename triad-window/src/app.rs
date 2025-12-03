@@ -1,14 +1,10 @@
 use crate::camera::{Camera, CameraController, Projection};
-use glam::{Mat4, Vec3};
+use glam::Vec3;
 use std::error::Error;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{error, info};
-use triad_gpu::{
-    CameraUniforms, GaussianPoint, Handle, RenderPipelineBuilder, Renderer, ResourceRegistry,
-    SurfaceWrapper, ply_loader,
-};
+use triad_gpu::{CameraUniforms, Renderer, ResourceRegistry, SurfaceWrapper};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -16,7 +12,99 @@ use winit::event_loop::EventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-pub fn run(ply_path: &Path) -> Result<(), Box<dyn Error>> {
+/// Scene bounds computed from primitive positions.
+#[derive(Debug, Clone)]
+pub struct SceneBounds {
+    pub min: Vec3,
+    pub max: Vec3,
+    pub center: Vec3,
+    pub radius: f32,
+}
+
+impl SceneBounds {
+    pub fn from_positions<'a>(positions: impl Iterator<Item = Vec3>) -> Self {
+        let mut min = Vec3::splat(f32::MAX);
+        let mut max = Vec3::splat(f32::MIN);
+        let mut count = 0;
+
+        for pos in positions {
+            min = min.min(pos);
+            max = max.max(pos);
+            count += 1;
+        }
+
+        if count == 0 {
+            return Self {
+                min: Vec3::ZERO,
+                max: Vec3::ZERO,
+                center: Vec3::ZERO,
+                radius: 1.0,
+            };
+        }
+
+        let center = (min + max) * 0.5;
+        let radius = (max - min).length().max(1.0);
+        Self {
+            min,
+            max,
+            center,
+            radius,
+        }
+    }
+}
+
+/// Context passed to the render delegate for rendering.
+pub struct RenderContext<'a> {
+    pub color_view: &'a triad_gpu::wgpu::TextureView,
+    pub depth_view: Option<&'a triad_gpu::wgpu::TextureView>,
+}
+
+/// Trait for shader-agnostic rendering. Implement this to render different primitive types.
+pub trait RenderDelegate: Sized {
+    /// Data needed to construct the delegate (e.g., loaded primitives, file path).
+    type InitData;
+
+    /// Create GPU resources for rendering.
+    fn create(
+        renderer: &Renderer,
+        registry: &mut ResourceRegistry,
+        surface_format: triad_gpu::wgpu::TextureFormat,
+        init_data: Self::InitData,
+    ) -> Result<Self, Box<dyn Error>>;
+
+    /// Get the scene bounds for camera positioning.
+    fn bounds(&self) -> &SceneBounds;
+
+    /// Return depth format if depth testing is needed. Default is None (no depth).
+    fn depth_format(&self) -> Option<triad_gpu::wgpu::TextureFormat> {
+        None
+    }
+
+    /// Update GPU resources (e.g., camera uniforms).
+    fn update(
+        &mut self,
+        queue: &triad_gpu::wgpu::Queue,
+        registry: &ResourceRegistry,
+        camera: &CameraUniforms,
+    );
+
+    /// Record render commands.
+    fn render(
+        &self,
+        encoder: &mut triad_gpu::wgpu::CommandEncoder,
+        ctx: RenderContext,
+        registry: &ResourceRegistry,
+    );
+}
+
+/// Run the viewer with a custom render delegate.
+pub fn run_with_delegate<D: RenderDelegate + 'static>(
+    title: &str,
+    init_data: D::InitData,
+) -> Result<(), Box<dyn Error>>
+where
+    D::InitData: 'static,
+{
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -26,23 +114,25 @@ pub fn run(ply_path: &Path) -> Result<(), Box<dyn Error>> {
         .init();
 
     let event_loop = EventLoop::new().map_err(|e| format!("Failed to create event loop: {e}"))?;
-    let mut app = App::new(ply_path.to_path_buf());
+    let mut app = App::<D>::new(title.to_string(), init_data);
     let run_result = event_loop.run_app(&mut app);
     let app_result = app.finish();
     run_result?;
     app_result
 }
 
-struct App {
-    ply_path: PathBuf,
-    state: Option<ViewerState>,
+struct App<D: RenderDelegate> {
+    title: String,
+    init_data: Option<D::InitData>,
+    state: Option<ViewerState<D>>,
     error: Option<String>,
 }
 
-impl App {
-    fn new(ply_path: PathBuf) -> Self {
+impl<D: RenderDelegate> App<D> {
+    fn new(title: String, init_data: D::InitData) -> Self {
         Self {
-            ply_path,
+            title,
+            init_data: Some(init_data),
             state: None,
             error: None,
         }
@@ -57,13 +147,15 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl<D: RenderDelegate + 'static> ApplicationHandler for App<D> {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.state.is_some() || self.error.is_some() {
             return;
         }
 
-        match ViewerState::new(event_loop, &self.ply_path) {
+        let init_data = self.init_data.take().expect("init_data already consumed");
+
+        match ViewerState::<D>::new(event_loop, &self.title, init_data) {
             Ok(state) => self.state = Some(state),
             Err(err) => {
                 error!("Failed to initialize viewer: {err}");
@@ -123,44 +215,47 @@ impl ApplicationHandler for App {
     }
 }
 
-struct ViewerState {
+struct ViewerState<D: RenderDelegate> {
     window: Arc<Window>,
     renderer: Renderer,
     surface: SurfaceWrapper,
     registry: ResourceRegistry,
-    resources: GaussianResources,
+    delegate: D,
     camera: Camera,
     controller: CameraController,
     projection: Projection,
     last_frame: Instant,
+    depth_texture: Option<triad_gpu::wgpu::Texture>,
+    depth_view: Option<triad_gpu::wgpu::TextureView>,
 }
 
-impl ViewerState {
+impl<D: RenderDelegate> ViewerState<D> {
     fn new(
         event_loop: &winit::event_loop::ActiveEventLoop,
-        ply_path: &Path,
+        title: &str,
+        init_data: D::InitData,
     ) -> Result<Self, Box<dyn Error>> {
         let window_attributes = Window::default_attributes()
-            .with_title("Triad Gaussian Viewer")
+            .with_title(title)
             .with_inner_size(PhysicalSize::new(1280, 720));
         let window = Arc::new(event_loop.create_window(window_attributes)?);
 
         let renderer = pollster::block_on(Renderer::new())?;
         let size = window.inner_size();
 
-        let surface = unsafe { renderer.instance().create_surface(window.clone()) }?;
+        let surface = renderer.instance().create_surface(window.clone())?;
         let surface = renderer.create_surface(surface, size.width.max(1), size.height.max(1))?;
 
         let mut registry = ResourceRegistry::default();
 
-        let ply_path_str = ply_path
-            .to_str()
-            .ok_or_else(|| format!("PLY path {:?} is not valid UTF-8", ply_path))?;
-        info!("Loading gaussians from {}", ply_path_str);
-        let gaussians = ply_loader::load_gaussians_from_ply(ply_path_str)?;
-        info!("Loaded {} gaussians", gaussians.len());
+        let delegate = D::create(&renderer, &mut registry, surface.format(), init_data)?;
 
-        let bounds = SceneBounds::from_gaussians(&gaussians);
+        let bounds = delegate.bounds();
+        info!(
+            "Scene bounds: center={:?}, radius={}",
+            bounds.center, bounds.radius
+        );
+
         let camera_pos = bounds.center + Vec3::new(0.0, 0.0, bounds.radius * 2.5);
         let camera = Camera::new(camera_pos, bounds.center);
         let projection = Projection::new(
@@ -171,24 +266,57 @@ impl ViewerState {
             bounds.radius * 10.0,
         );
 
-        let resources = GaussianResources::new(
-            &renderer,
-            &mut registry,
-            surface.format(),
-            &gaussians,
-        )?;
+        // Create depth texture if delegate needs one
+        let (depth_texture, depth_view) = if let Some(depth_format) = delegate.depth_format() {
+            let (tex, view) = Self::create_depth_texture(
+                renderer.device(),
+                size.width.max(1),
+                size.height.max(1),
+                depth_format,
+            );
+            (Some(tex), Some(view))
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             window,
             renderer,
             surface,
             registry,
-            resources,
+            delegate,
             camera,
             controller: CameraController::new(),
             projection,
             last_frame: Instant::now(),
+            depth_texture,
+            depth_view,
         })
+    }
+
+    fn create_depth_texture(
+        device: &triad_gpu::wgpu::Device,
+        width: u32,
+        height: u32,
+        format: triad_gpu::wgpu::TextureFormat,
+    ) -> (triad_gpu::wgpu::Texture, triad_gpu::wgpu::TextureView) {
+        let texture = device.create_texture(&triad_gpu::wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: triad_gpu::wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: triad_gpu::wgpu::TextureDimension::D2,
+            format,
+            usage: triad_gpu::wgpu::TextureUsages::RENDER_ATTACHMENT
+                | triad_gpu::wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&triad_gpu::wgpu::TextureViewDescriptor::default());
+        (texture, view)
     }
 
     fn handle_window_event(
@@ -222,6 +350,18 @@ impl ViewerState {
         config.height = new_size.height;
         self.surface.reconfigure(self.renderer.device(), config);
         self.projection.update_size(new_size.width, new_size.height);
+
+        // Recreate depth texture if needed
+        if let Some(depth_format) = self.delegate.depth_format() {
+            let (tex, view) = Self::create_depth_texture(
+                self.renderer.device(),
+                new_size.width,
+                new_size.height,
+                depth_format,
+            );
+            self.depth_texture = Some(tex);
+            self.depth_view = Some(view);
+        }
     }
 
     fn update_frame_time(&mut self, now: Instant) {
@@ -232,12 +372,9 @@ impl ViewerState {
         let view = self.camera.view_matrix();
         let proj = self.projection.matrix();
         let uniforms = CameraUniforms::from_matrices(view, proj, self.camera.position());
-        let queue = self.renderer.queue();
-        let camera_buffer = self
-            .registry
-            .get(self.resources.camera_buffer_handle)
-            .expect("camera buffer");
-        queue.write_buffer(camera_buffer, 0, bytemuck::bytes_of(&uniforms));
+
+        self.delegate
+            .update(self.renderer.queue(), &self.registry, &uniforms);
 
         let surface_texture = self.surface.get_current_texture()?;
         let surface_view = surface_texture
@@ -247,254 +384,18 @@ impl ViewerState {
         let device = self.renderer.device();
         let mut encoder =
             device.create_command_encoder(&triad_gpu::wgpu::CommandEncoderDescriptor {
-                label: Some("Gaussian Frame Encoder"),
+                label: Some("Frame Encoder"),
             });
 
-        {
-            let pipeline = self
-                .registry
-                .get(self.resources.pipeline_handle)
-                .expect("pipeline");
-            let bind_group = self
-                .registry
-                .get(self.resources.bind_group_handle)
-                .expect("bind group");
-            let index_buffer = self
-                .registry
-                .get(self.resources.index_buffer_handle)
-                .expect("index buffer");
+        let ctx = RenderContext {
+            color_view: &surface_view,
+            depth_view: self.depth_view.as_ref(),
+        };
 
-            let mut render_pass =
-                encoder.begin_render_pass(&triad_gpu::wgpu::RenderPassDescriptor {
-                    label: Some("Gaussian Pass"),
-                    color_attachments: &[Some(triad_gpu::wgpu::RenderPassColorAttachment {
-                        view: &surface_view,
-                        resolve_target: None,
-                        ops: triad_gpu::wgpu::Operations {
-                            load: triad_gpu::wgpu::LoadOp::Clear(triad_gpu::wgpu::Color {
-                                r: 0.02,
-                                g: 0.02,
-                                b: 0.025,
-                                a: 1.0,
-                            }),
-                            store: triad_gpu::wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    occlusion_query_set: None,
-                    timestamp_writes: None,
-                });
+        self.delegate.render(&mut encoder, ctx, &self.registry);
 
-            render_pass.set_pipeline(pipeline);
-            render_pass.set_bind_group(0, bind_group, &[]);
-            render_pass
-                .set_index_buffer(index_buffer.slice(..), triad_gpu::wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..self.resources.index_count, 0, 0..1);
-        }
-
-        queue.submit(Some(encoder.finish()));
+        self.renderer.queue().submit(Some(encoder.finish()));
         surface_texture.present();
         Ok(())
-    }
-}
-
-struct GaussianResources {
-    gaussian_count: u32,
-    index_count: u32,
-    gaussian_buffer_handle: Handle<triad_gpu::wgpu::Buffer>,
-    camera_buffer_handle: Handle<triad_gpu::wgpu::Buffer>,
-    index_buffer_handle: Handle<triad_gpu::wgpu::Buffer>,
-    bind_group_handle: Handle<triad_gpu::wgpu::BindGroup>,
-    pipeline_handle: Handle<triad_gpu::wgpu::RenderPipeline>,
-}
-
-impl GaussianResources {
-    fn new(
-        renderer: &Renderer,
-        registry: &mut ResourceRegistry,
-        color_format: triad_gpu::wgpu::TextureFormat,
-        gaussians: &[GaussianPoint],
-    ) -> Result<Self, Box<dyn Error>> {
-        use triad_gpu::wgpu::util::DeviceExt;
-        let device = renderer.device();
-
-        let gaussian_data = bytemuck::cast_slice(gaussians);
-        let gaussian_buffer =
-            device.create_buffer_init(&triad_gpu::wgpu::util::BufferInitDescriptor {
-                label: Some("Gaussian Buffer"),
-                contents: gaussian_data,
-                usage: triad_gpu::wgpu::BufferUsages::STORAGE,
-            });
-        let gaussian_buffer_handle = registry.insert(gaussian_buffer);
-
-        let camera_buffer =
-            device.create_buffer_init(&triad_gpu::wgpu::util::BufferInitDescriptor {
-                label: Some("Camera Buffer"),
-                contents: bytemuck::cast_slice(&[CameraUniforms {
-                    view_matrix: Mat4::IDENTITY.to_cols_array_2d(),
-                    proj_matrix: Mat4::IDENTITY.to_cols_array_2d(),
-                    view_pos: [0.0, 0.0, 0.0],
-                    _padding: 0.0,
-                }]),
-                usage: triad_gpu::wgpu::BufferUsages::UNIFORM
-                    | triad_gpu::wgpu::BufferUsages::COPY_DST,
-            });
-        let camera_buffer_handle = registry.insert(camera_buffer);
-
-        let mut indices = Vec::with_capacity(gaussians.len() * 3);
-        for i in 0..gaussians.len() as u32 {
-            let base = i * 3;
-            indices.push(base);
-            indices.push(base + 1);
-            indices.push(base + 2);
-        }
-        let index_buffer =
-            device.create_buffer_init(&triad_gpu::wgpu::util::BufferInitDescriptor {
-                label: Some("Index Buffer"),
-                contents: bytemuck::cast_slice(&indices),
-                usage: triad_gpu::wgpu::BufferUsages::INDEX,
-            });
-        let index_buffer_handle = registry.insert(index_buffer);
-
-        let bind_group_layout =
-            device.create_bind_group_layout(&triad_gpu::wgpu::BindGroupLayoutDescriptor {
-                label: Some("Gaussian Bind Group Layout"),
-                entries: &[
-                    triad_gpu::wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: triad_gpu::wgpu::ShaderStages::VERTEX,
-                        ty: triad_gpu::wgpu::BindingType::Buffer {
-                            ty: triad_gpu::wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                    triad_gpu::wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: triad_gpu::wgpu::ShaderStages::VERTEX,
-                        ty: triad_gpu::wgpu::BindingType::Buffer {
-                            ty: triad_gpu::wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: Some(
-                                std::num::NonZeroU64::new(
-                                    std::mem::size_of::<CameraUniforms>() as u64
-                                )
-                                .unwrap(),
-                            ),
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        let bind_group = device.create_bind_group(&triad_gpu::wgpu::BindGroupDescriptor {
-            label: Some("Gaussian Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                triad_gpu::wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: registry
-                        .get(gaussian_buffer_handle)
-                        .unwrap()
-                        .as_entire_binding(),
-                },
-                triad_gpu::wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: registry
-                        .get(camera_buffer_handle)
-                        .unwrap()
-                        .as_entire_binding(),
-                },
-            ],
-        });
-        let bind_group_handle = registry.insert(bind_group);
-
-        let vertex_shader_source = include_str!("../../triad-gpu/shaders/gaussian_vertex.wgsl");
-        let fragment_shader_source = include_str!("../../triad-gpu/shaders/gaussian_fragment.wgsl");
-        let vertex_shader = device.create_shader_module(triad_gpu::wgpu::ShaderModuleDescriptor {
-            label: Some("gaussian_vs"),
-            source: triad_gpu::wgpu::ShaderSource::Wgsl(vertex_shader_source.into()),
-        });
-        let fragment_shader = device.create_shader_module(triad_gpu::wgpu::ShaderModuleDescriptor {
-            label: Some("gaussian_fs"),
-            source: triad_gpu::wgpu::ShaderSource::Wgsl(fragment_shader_source.into()),
-        });
-
-        let pipeline_layout =
-            device.create_pipeline_layout(&triad_gpu::wgpu::PipelineLayoutDescriptor {
-                label: Some("Gaussian Pipeline Layout"),
-                bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[],
-            });
-
-        let pipeline_handle = RenderPipelineBuilder::new(device)
-            .with_label("Gaussian Pipeline")
-            .with_vertex_shader(registry.insert(vertex_shader))
-            .with_fragment_shader(registry.insert(fragment_shader))
-            .with_layout(pipeline_layout)
-            .with_primitive(triad_gpu::wgpu::PrimitiveState {
-                topology: triad_gpu::wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: triad_gpu::wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                unclipped_depth: false,
-                polygon_mode: triad_gpu::wgpu::PolygonMode::Fill,
-                conservative: false,
-            })
-            .with_fragment_target(Some(triad_gpu::wgpu::ColorTargetState {
-                format: color_format,
-                blend: Some(triad_gpu::wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: triad_gpu::wgpu::ColorWrites::ALL,
-            }))
-            .build(registry)?;
-
-        Ok(Self {
-            gaussian_count: gaussians.len() as u32,
-            index_count: (gaussians.len() as u32) * 3,
-            gaussian_buffer_handle,
-            camera_buffer_handle,
-            index_buffer_handle,
-            bind_group_handle,
-            pipeline_handle,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct SceneBounds {
-    min: Vec3,
-    max: Vec3,
-    center: Vec3,
-    radius: f32,
-}
-
-impl SceneBounds {
-    fn from_gaussians(gaussians: &[GaussianPoint]) -> Self {
-        if gaussians.is_empty() {
-            return Self {
-                min: Vec3::ZERO,
-                max: Vec3::ZERO,
-                center: Vec3::ZERO,
-                radius: 1.0,
-            };
-        }
-
-        let mut min = Vec3::splat(f32::MAX);
-        let mut max = Vec3::splat(f32::MIN);
-        for g in gaussians {
-            let pos = Vec3::new(g.position[0], g.position[1], g.position[2]);
-            min = min.min(pos);
-            max = max.max(pos);
-        }
-        let center = (min + max) * 0.5;
-        let radius = (max - min).length().max(1.0);
-        Self {
-            min,
-            max,
-            center,
-            radius,
-        }
     }
 }

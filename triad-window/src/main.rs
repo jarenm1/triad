@@ -7,7 +7,7 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("goat.ply"));
 
-    if let Err(err) = triad_window::run(&ply_path) {
+    if let Err(err) = triad_window::gaussian::run(&ply_path) {
         eprintln!("triad-window failed: {err}");
     }
 }

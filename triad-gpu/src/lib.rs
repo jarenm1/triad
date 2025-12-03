@@ -4,6 +4,7 @@ mod pipeline;
 pub mod ply_loader;
 mod resource_registry;
 mod surface;
+pub mod triangulation;
 mod type_map;
 mod types;
 
@@ -11,7 +12,7 @@ pub use frame_graph::{FrameGraph, Handle, Pass, PassBuilder, PassContext, Resour
 pub use pipeline::{PipelineBuildError, RenderPipelineBuilder};
 pub use resource_registry::ResourceRegistry;
 pub use surface::SurfaceWrapper;
-pub use types::{CameraUniforms, GaussianPoint};
+pub use types::{CameraUniforms, GaussianPoint, TrianglePrimitive};
 pub use wgpu;
 
 
