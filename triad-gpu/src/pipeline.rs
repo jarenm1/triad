@@ -89,11 +89,7 @@ impl<'a> RenderPipelineBuilder<'a> {
             .ok_or(PipelineBuildError::ShaderNotFound)?;
 
         let fragment_shader = if let Some(h) = self.fragment_shader {
-            Some(
-                registry
-                    .get(h)
-                    .ok_or(PipelineBuildError::ShaderNotFound)?,
-            )
+            Some(registry.get(h).ok_or(PipelineBuildError::ShaderNotFound)?)
         } else {
             None
         };

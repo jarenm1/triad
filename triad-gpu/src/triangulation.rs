@@ -3,9 +3,9 @@
 //! This module provides functions to generate triangles from unstructured
 //! point clouds using Delaunay triangulation.
 
-use crate::ply_loader::PlyVertex;
 use crate::TrianglePrimitive;
-use delaunator::{triangulate, Point};
+use crate::ply_loader::PlyVertex;
+use delaunator::{Point, triangulate};
 use glam::Vec3;
 use tracing::{debug, info, warn};
 
@@ -213,7 +213,10 @@ pub fn build_triangles_from_vertices(vertices: &[PlyVertex]) -> Vec<TrianglePrim
         ));
     }
 
-    info!("Built {} triangle primitives from vertices", triangles.len());
+    info!(
+        "Built {} triangle primitives from vertices",
+        triangles.len()
+    );
     triangles
 }
 
@@ -269,4 +272,3 @@ mod tests {
         assert!(triangles.is_empty());
     }
 }
-

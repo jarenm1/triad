@@ -15,7 +15,6 @@ pub use surface::SurfaceWrapper;
 pub use types::{CameraUniforms, GaussianPoint, TrianglePrimitive};
 pub use wgpu;
 
-
 #[derive(Debug, thiserror::Error)]
 pub enum RendererError {
     #[error("Request Adapter Error: {0}")]
