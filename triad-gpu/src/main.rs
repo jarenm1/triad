@@ -129,16 +129,35 @@ impl Pass for GaussianRenderPass {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing subscriber
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
-        )
-        .with_target(false)
-        .with_thread_ids(true)
-        .with_thread_names(true)
-        .init();
+    // Initialize tracing subscriber with optional Tracy layer
+    #[cfg(feature = "tracy")]
+    {
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        tracing_subscriber::registry()
+            .with(tracing_tracy::TracyLayer::default())
+            .with(
+                tracing_subscriber::fmt::layer().with_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "debug".into()),
+                ),
+            )
+            .init();
+    }
+
+    #[cfg(not(feature = "tracy"))]
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+            )
+            .with_target(false)
+            .with_thread_ids(true)
+            .with_thread_names(true)
+            .init();
+    }
 
     info!("Initializing renderer...");
     let renderer = pollster::block_on(Renderer::new())?; // wait for render

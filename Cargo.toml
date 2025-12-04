@@ -17,8 +17,8 @@ tracing = "0.1"
 bytemuck = { version = "1.24", features = ["derive"] }
 
 [dependencies]
-triad-gpu = { workspace = true }
-triad-window = { workspace = true }
+triad-gpu = { workspace = true, features = ["tracy"] }
+triad-window = { workspace = true, features = ["tracy"] }
 glam = { workspace = true }
 tracing = { workspace = true }
 bytemuck = { workspace = true }

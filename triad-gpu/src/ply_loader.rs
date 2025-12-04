@@ -37,6 +37,7 @@ struct PlyFile {
 /// Supports ASCII and binary PLY formats via serde_ply
 /// For Gaussian splatting, expects: x, y, z, scale_0/1/2, rot_0/1/2/3, red/green/blue, opacity
 /// For regular point clouds, only requires: x, y, z, red/green/blue
+#[tracing::instrument(skip_all, fields(path = %path))]
 pub fn load_gaussians_from_ply(
     path: &str,
 ) -> Result<Vec<GaussianPoint>, Box<dyn std::error::Error>> {
@@ -281,6 +282,7 @@ pub fn load_gaussians_from_ply(
 
 /// Load vertices from a PLY file without converting to Gaussian format.
 /// Returns raw vertex data that can be used for triangulation.
+#[tracing::instrument(skip_all, fields(path = %path))]
 pub fn load_vertices_from_ply(path: &str) -> Result<Vec<PlyVertex>, Box<dyn std::error::Error>> {
     use std::fs::File;
     use std::io::BufReader;
@@ -309,7 +311,10 @@ pub fn load_vertices_from_ply(path: &str) -> Result<Vec<PlyVertex>, Box<dyn std:
 
     fn get_u8(prop: Option<&JsonValue>) -> Option<u8> {
         prop.and_then(|v| match v {
-            JsonValue::Number(n) => n.as_u64().map(|u| u as u8).or_else(|| n.as_i64().map(|i| i as u8)),
+            JsonValue::Number(n) => n
+                .as_u64()
+                .map(|u| u as u8)
+                .or_else(|| n.as_i64().map(|i| i as u8)),
             _ => None,
         })
     }
@@ -317,12 +322,9 @@ pub fn load_vertices_from_ply(path: &str) -> Result<Vec<PlyVertex>, Box<dyn std:
     let mut vertices = Vec::with_capacity(ply_data.vertex.len());
 
     for (i, vertex) in ply_data.vertex.iter().enumerate() {
-        let x = get_f32(vertex.get("x"))
-            .ok_or_else(|| format!("Missing 'x' at vertex {}", i))?;
-        let y = get_f32(vertex.get("y"))
-            .ok_or_else(|| format!("Missing 'y' at vertex {}", i))?;
-        let z = get_f32(vertex.get("z"))
-            .ok_or_else(|| format!("Missing 'z' at vertex {}", i))?;
+        let x = get_f32(vertex.get("x")).ok_or_else(|| format!("Missing 'x' at vertex {}", i))?;
+        let y = get_f32(vertex.get("y")).ok_or_else(|| format!("Missing 'y' at vertex {}", i))?;
+        let z = get_f32(vertex.get("z")).ok_or_else(|| format!("Missing 'z' at vertex {}", i))?;
 
         let color = if let (Some(r), Some(g), Some(b)) = (
             get_u8(vertex.get("red")),
@@ -363,6 +365,7 @@ pub fn load_vertices_from_ply(path: &str) -> Result<Vec<PlyVertex>, Box<dyn std:
 /// Load triangles from a PLY file that contains face data.
 /// Returns triangles built from vertex positions with averaged vertex colors.
 /// Returns an error if the PLY file has no face data.
+#[tracing::instrument(skip_all, fields(path = %path))]
 pub fn load_triangles_from_ply(
     path: &str,
 ) -> Result<Vec<TrianglePrimitive>, Box<dyn std::error::Error>> {
@@ -398,7 +401,10 @@ pub fn load_triangles_from_ply(
 
     fn get_u8(prop: Option<&JsonValue>) -> Option<u8> {
         prop.and_then(|v| match v {
-            JsonValue::Number(n) => n.as_u64().map(|u| u as u8).or_else(|| n.as_i64().map(|i| i as u8)),
+            JsonValue::Number(n) => n
+                .as_u64()
+                .map(|u| u as u8)
+                .or_else(|| n.as_i64().map(|i| i as u8)),
             _ => None,
         })
     }
@@ -406,12 +412,9 @@ pub fn load_triangles_from_ply(
     let mut vertices = Vec::with_capacity(ply_data.vertex.len());
 
     for (i, vertex) in ply_data.vertex.iter().enumerate() {
-        let x = get_f32(vertex.get("x"))
-            .ok_or_else(|| format!("Missing 'x' at vertex {}", i))?;
-        let y = get_f32(vertex.get("y"))
-            .ok_or_else(|| format!("Missing 'y' at vertex {}", i))?;
-        let z = get_f32(vertex.get("z"))
-            .ok_or_else(|| format!("Missing 'z' at vertex {}", i))?;
+        let x = get_f32(vertex.get("x")).ok_or_else(|| format!("Missing 'x' at vertex {}", i))?;
+        let y = get_f32(vertex.get("y")).ok_or_else(|| format!("Missing 'y' at vertex {}", i))?;
+        let z = get_f32(vertex.get("z")).ok_or_else(|| format!("Missing 'z' at vertex {}", i))?;
 
         let color = if let (Some(r), Some(g), Some(b)) = (
             get_u8(vertex.get("red")),

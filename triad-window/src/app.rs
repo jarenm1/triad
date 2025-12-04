@@ -105,13 +105,32 @@ pub fn run_with_delegate<D: RenderDelegate + 'static>(
 where
     D::InitData: 'static,
 {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_target(false)
-        .init();
+    #[cfg(feature = "tracy")]
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer;
+        tracing_subscriber::registry()
+            .with(tracing_tracy::TracyLayer::default())
+            .with(
+                tracing_subscriber::fmt::layer().with_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| "info".into()),
+                )
+            )
+            .init();
+    }
+
+    #[cfg(not(feature = "tracy"))]
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .with_target(false)
+            .init();
+    }
 
     let event_loop = EventLoop::new().map_err(|e| format!("Failed to create event loop: {e}"))?;
     let mut app = App::<D>::new(title.to_string(), init_data);
@@ -186,6 +205,7 @@ impl<D: RenderDelegate + 'static> ApplicationHandler for App<D> {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size),
             WindowEvent::RedrawRequested => {
+                let _frame_span = tracing::info_span!("frame").entered();
                 let now = Instant::now();
                 state.update_frame_time(now);
                 match state.render() {
