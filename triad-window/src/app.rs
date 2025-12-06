@@ -1,4 +1,5 @@
-use crate::camera::{Camera, CameraController, Projection};
+use crate::camera::{Camera, Projection};
+use crate::controls::Controls;
 use glam::Vec3;
 use std::error::Error;
 use std::sync::Arc;
@@ -105,18 +106,31 @@ pub fn run_with_delegate<D: RenderDelegate + 'static>(
 where
     D::InitData: 'static,
 {
+    run_with_delegate_config::<D, _>(title, init_data, |_| {})
+}
+
+/// Run the viewer with a custom render delegate and control configuration.
+pub fn run_with_delegate_config<D: RenderDelegate + 'static, F>(
+    title: &str,
+    init_data: D::InitData,
+    configure_controls: F,
+) -> Result<(), Box<dyn Error>>
+where
+    D::InitData: 'static,
+    F: FnOnce(&mut Controls),
+{
     #[cfg(feature = "tracy")]
     {
+        use tracing_subscriber::Layer;
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
-        use tracing_subscriber::Layer;
         tracing_subscriber::registry()
             .with(tracing_tracy::TracyLayer::default())
             .with(
                 tracing_subscriber::fmt::layer().with_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| "info".into()),
-                )
+                ),
             )
             .init();
     }
@@ -133,7 +147,10 @@ where
     }
 
     let event_loop = EventLoop::new().map_err(|e| format!("Failed to create event loop: {e}"))?;
-    let mut app = App::<D>::new(title.to_string(), init_data);
+    let mut controls = Controls::default();
+    configure_controls(&mut controls);
+
+    let mut app = App::<D>::new(title.to_string(), init_data, controls);
     let run_result = event_loop.run_app(&mut app);
     let app_result = app.finish();
     run_result?;
@@ -143,15 +160,17 @@ where
 struct App<D: RenderDelegate> {
     title: String,
     init_data: Option<D::InitData>,
+    controls: Option<Controls>,
     state: Option<ViewerState<D>>,
     error: Option<String>,
 }
 
 impl<D: RenderDelegate> App<D> {
-    fn new(title: String, init_data: D::InitData) -> Self {
+    fn new(title: String, init_data: D::InitData, controls: Controls) -> Self {
         Self {
             title,
             init_data: Some(init_data),
+            controls: Some(controls),
             state: None,
             error: None,
         }
@@ -173,8 +192,9 @@ impl<D: RenderDelegate + 'static> ApplicationHandler for App<D> {
         }
 
         let init_data = self.init_data.take().expect("init_data already consumed");
+        let controls = self.controls.take().expect("controls already consumed");
 
-        match ViewerState::<D>::new(event_loop, &self.title, init_data) {
+        match ViewerState::<D>::new(event_loop, &self.title, init_data, controls) {
             Ok(state) => self.state = Some(state),
             Err(err) => {
                 error!("Failed to initialize viewer: {err}");
@@ -206,8 +226,6 @@ impl<D: RenderDelegate + 'static> ApplicationHandler for App<D> {
             WindowEvent::Resized(size) => state.resize(size),
             WindowEvent::RedrawRequested => {
                 let _frame_span = tracing::info_span!("frame").entered();
-                let now = Instant::now();
-                state.update_frame_time(now);
                 match state.render() {
                     Ok(()) => {}
                     Err(
@@ -242,7 +260,7 @@ struct ViewerState<D: RenderDelegate> {
     registry: ResourceRegistry,
     delegate: D,
     camera: Camera,
-    controller: CameraController,
+    controls: Controls,
     projection: Projection,
     last_frame: Instant,
     depth_texture: Option<triad_gpu::wgpu::Texture>,
@@ -254,6 +272,7 @@ impl<D: RenderDelegate> ViewerState<D> {
         event_loop: &winit::event_loop::ActiveEventLoop,
         title: &str,
         init_data: D::InitData,
+        controls: Controls,
     ) -> Result<Self, Box<dyn Error>> {
         let window_attributes = Window::default_attributes()
             .with_title(title)
@@ -306,7 +325,7 @@ impl<D: RenderDelegate> ViewerState<D> {
             registry,
             delegate,
             camera,
-            controller: CameraController::new(),
+            controls,
             projection,
             last_frame: Instant::now(),
             depth_texture,
@@ -358,7 +377,7 @@ impl<D: RenderDelegate> ViewerState<D> {
             return true;
         }
 
-        self.controller.process_event(event, &mut self.camera)
+        self.controls.handle_event(event)
     }
 
     fn resize(&mut self, new_size: PhysicalSize<u32>) {
@@ -384,11 +403,13 @@ impl<D: RenderDelegate> ViewerState<D> {
         }
     }
 
-    fn update_frame_time(&mut self, now: Instant) {
-        self.last_frame = now;
-    }
-
     fn render(&mut self) -> Result<(), triad_gpu::wgpu::SurfaceError> {
+        let now = Instant::now();
+        let dt = (now - self.last_frame).as_secs_f32();
+        self.last_frame = now;
+
+        self.controls.update(dt, &mut self.camera);
+
         let view = self.camera.view_matrix();
         let proj = self.projection.matrix();
         let uniforms = CameraUniforms::from_matrices(view, proj, self.camera.position());
