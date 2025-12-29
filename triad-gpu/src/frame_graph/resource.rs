@@ -143,8 +143,10 @@ pub trait ResourceType: 'static {}
 
 impl ResourceType for wgpu::Buffer {}
 impl ResourceType for wgpu::Texture {}
+impl ResourceType for wgpu::TextureView {}
 impl ResourceType for wgpu::Sampler {}
 impl ResourceType for wgpu::BindGroup {}
+impl ResourceType for wgpu::BindGroupLayout {}
 impl ResourceType for wgpu::RenderPipeline {}
 impl ResourceType for wgpu::ComputePipeline {}
 impl ResourceType for wgpu::ShaderModule {}

@@ -151,3 +151,225 @@ pub enum PipelineBuildError {
     #[error("Shader module not found in registry")]
     ShaderNotFound,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pollster::FutureExt;
+
+    async fn create_test_device() -> (wgpu::Device, wgpu::Queue) {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .expect("Failed to get adapter");
+        adapter
+            .request_device(&wgpu::DeviceDescriptor::default())
+            .await
+            .expect("Failed to get device")
+    }
+
+    fn create_test_shader_module(device: &wgpu::Device) -> wgpu::ShaderModule {
+        device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("test_shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+                @vertex
+                fn vs_main(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {
+                    return vec4<f32>(pos, 1.0);
+                }
+
+                @fragment
+                fn fs_main() -> @location(0) vec4<f32> {
+                    return vec4<f32>(1.0, 0.0, 0.0, 1.0);
+                }
+                "#
+                .into(),
+            ),
+        })
+    }
+
+    #[test]
+    fn test_render_pipeline_builder_missing_vertex_shader() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let result = RenderPipelineBuilder::new(&device)
+            .build(&mut registry);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PipelineBuildError::MissingVertexShader => {}
+            _ => panic!("Expected MissingVertexShader error"),
+        }
+    }
+
+    #[test]
+    fn test_render_pipeline_builder_with_shaders() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        // Create shader modules
+        let vertex_shader = create_test_shader_module(&device);
+        let vertex_handle = registry.insert(vertex_shader);
+
+        let fragment_shader = create_test_shader_module(&device);
+        let fragment_handle = registry.insert(fragment_shader);
+
+        // Build pipeline
+        let pipeline_handle = RenderPipelineBuilder::new(&device)
+            .with_label("test_pipeline")
+            .with_vertex_shader(vertex_handle)
+            .with_fragment_shader(fragment_handle)
+            .with_vertex_buffer(wgpu::VertexBufferLayout {
+                array_stride: 12,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                }],
+            })
+            .with_fragment_target(Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            }))
+            .build(&mut registry)
+            .expect("Failed to build pipeline");
+
+        // Verify pipeline exists
+        assert!(registry.get(pipeline_handle).is_some());
+    }
+
+    #[test]
+    fn test_render_pipeline_builder_shader_not_found() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        // Create a fake handle that doesn't exist
+        let fake_handle = Handle::<wgpu::ShaderModule>::next();
+
+        let result = RenderPipelineBuilder::new(&device)
+            .with_vertex_shader(fake_handle)
+            .build(&mut registry);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PipelineBuildError::ShaderNotFound => {}
+            _ => panic!("Expected ShaderNotFound error"),
+        }
+    }
+
+    #[test]
+    fn test_render_pipeline_builder_with_custom_layout() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let vertex_shader = create_test_shader_module(&device);
+        let vertex_handle = registry.insert(vertex_shader);
+
+        let fragment_shader = create_test_shader_module(&device);
+        let fragment_handle = registry.insert(fragment_shader);
+
+        // Create a custom pipeline layout
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("custom_layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+
+        // Note: WGPU requires at least one color attachment or depth-stencil attachment
+        let pipeline_handle = RenderPipelineBuilder::new(&device)
+            .with_vertex_shader(vertex_handle)
+            .with_fragment_shader(fragment_handle)
+            .with_layout(layout)
+            .with_vertex_buffer(wgpu::VertexBufferLayout {
+                array_stride: 12,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                }],
+            })
+            .with_fragment_target(Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            }))
+            .build(&mut registry)
+            .expect("Failed to build pipeline");
+
+        assert!(registry.get(pipeline_handle).is_some());
+    }
+
+    #[test]
+    fn test_render_pipeline_builder_with_depth_stencil() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let vertex_shader = create_test_shader_module(&device);
+        let vertex_handle = registry.insert(vertex_shader);
+
+        let pipeline_handle = RenderPipelineBuilder::new(&device)
+            .with_vertex_shader(vertex_handle)
+            .with_depth_stencil(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            })
+            .with_vertex_buffer(wgpu::VertexBufferLayout {
+                array_stride: 12,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                }],
+            })
+            .build(&mut registry)
+            .expect("Failed to build pipeline");
+
+        assert!(registry.get(pipeline_handle).is_some());
+    }
+
+    #[test]
+    fn test_render_pipeline_builder_defaults() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let vertex_shader = create_test_shader_module(&device);
+        let vertex_handle = registry.insert(vertex_shader);
+
+        let fragment_shader = create_test_shader_module(&device);
+        let fragment_handle = registry.insert(fragment_shader);
+
+        // Build with minimal configuration (should use defaults)
+        // Note: WGPU requires at least one color attachment or depth-stencil attachment
+        let pipeline_handle = RenderPipelineBuilder::new(&device)
+            .with_vertex_shader(vertex_handle)
+            .with_fragment_shader(fragment_handle)
+            .with_vertex_buffer(wgpu::VertexBufferLayout {
+                array_stride: 12,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x3,
+                }],
+            })
+            .with_fragment_target(Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            }))
+            .build(&mut registry)
+            .expect("Failed to build pipeline");
+
+        // Should use default primitive state, multisample, etc.
+        assert!(registry.get(pipeline_handle).is_some());
+    }
+}

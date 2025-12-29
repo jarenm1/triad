@@ -2,6 +2,8 @@
 members = [
 "triad-gpu",
 "triad-window",
+"triad-train",
+"triad-data",
 ]
 resolver = "3"
 
@@ -9,18 +11,28 @@ resolver = "3"
 name = "triangle_splatting"
 path = "examples/triangle_splatting.rs"
 
+[[example]]
+name = "realtime_reconstruction"
+path = "examples/realtime_reconstruction.rs"
+
 [workspace.dependencies]
 triad-gpu = { path = "triad-gpu" }
 triad-window = { path = "triad-window" }
+triad-train = { path = "triad-train" }
+triad-data = { path = "triad-data" }
 glam = "0.30"
 tracing = "0.1"
+tracing-subscriber = "0.3"
 bytemuck = { version = "1.24", features = ["derive"] }
 
 [dependencies]
 triad-gpu = { workspace = true, features = ["tracy"] }
 triad-window = { workspace = true, features = ["tracy"] }
+triad-train = { workspace = true }
+triad-data = { workspace = true }
 glam = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 bytemuck = { workspace = true }
 
 [package]

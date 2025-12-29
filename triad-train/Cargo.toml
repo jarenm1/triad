@@ -1,0 +1,18 @@
+[package]
+name = "triad-train"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+triad-gpu = { path = "../triad-gpu" }
+triad-data = { path = "../triad-data" }
+glam = "0.30"
+bytemuck = { version = "1.24", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+tracing = "0.1"
+thiserror = "2.0"
+image = "0.25"
+ordered-float = "4.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

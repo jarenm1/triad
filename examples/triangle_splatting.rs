@@ -14,9 +14,10 @@ use glam::{Mat4, Vec3};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use tracing::info;
+use triad_data::triangulation;
 use triad_gpu::{
     CameraUniforms, Handle, RenderPipelineBuilder, Renderer, ResourceRegistry, TrianglePrimitive,
-    ply_loader, triangulation,
+    ply_loader,
 };
 use triad_window::{
     CameraControl, CameraIntent, CameraPose, FrameUpdate, InputState, IntentMode, KeyCode,
@@ -75,7 +76,37 @@ impl RenderDelegate for TriangleDelegate {
             } else {
                 info!("PLY file has no faces, using Delaunay triangulation");
                 let vertices = ply_loader::load_vertices_from_ply(ply_path_str)?;
-                triangulation::build_triangles_from_vertices(&vertices)
+
+                // Extract positions for triangulation
+                let positions: Vec<Vec3> = vertices.iter().map(|v| v.position).collect();
+
+                // Triangulate using triad-data
+                let triangle_indices = triangulation::triangulate_points(&positions);
+
+                // Build triangle primitives
+                let mut triangles = Vec::with_capacity(triangle_indices.len());
+                for [i0, i1, i2] in triangle_indices {
+                    let v0 = &vertices[i0];
+                    let v1 = &vertices[i1];
+                    let v2 = &vertices[i2];
+
+                    // Average vertex colors and opacities
+                    let avg_color = (v0.color + v1.color + v2.color) / 3.0;
+                    let avg_opacity = (v0.opacity + v1.opacity + v2.opacity) / 3.0;
+
+                    triangles.push(TrianglePrimitive::new(
+                        v0.position,
+                        v1.position,
+                        v2.position,
+                        avg_color,
+                        avg_opacity,
+                    ));
+                }
+                info!(
+                    "Built {} triangle primitives from vertices",
+                    triangles.len()
+                );
+                triangles
             };
 
         info!("Loaded {} triangles", triangles.len());
@@ -422,7 +453,33 @@ fn compute_scene_center(ply_path: &Path) -> Result<Vec3, Box<dyn Error>> {
             ply_loader::load_triangles_from_ply(ply_path_str)?
         } else {
             let vertices = ply_loader::load_vertices_from_ply(ply_path_str)?;
-            triangulation::build_triangles_from_vertices(&vertices)
+
+            // Extract positions for triangulation
+            let positions: Vec<Vec3> = vertices.iter().map(|v| v.position).collect();
+
+            // Triangulate using triad-data
+            let triangle_indices = triangulation::triangulate_points(&positions);
+
+            // Build triangle primitives
+            let mut triangles = Vec::with_capacity(triangle_indices.len());
+            for [i0, i1, i2] in triangle_indices {
+                let v0 = &vertices[i0];
+                let v1 = &vertices[i1];
+                let v2 = &vertices[i2];
+
+                // Average vertex colors and opacities
+                let avg_color = (v0.color + v1.color + v2.color) / 3.0;
+                let avg_opacity = (v0.opacity + v1.opacity + v2.opacity) / 3.0;
+
+                triangles.push(TrianglePrimitive::new(
+                    v0.position,
+                    v1.position,
+                    v2.position,
+                    avg_color,
+                    avg_opacity,
+                ));
+            }
+            triangles
         };
 
     if triangles.is_empty() {
@@ -441,7 +498,7 @@ fn main() {
     let ply_path = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("goat.ply"));
+        .expect("failed to find ply file, or not provided.");
 
     let scene_center = compute_scene_center(&ply_path).unwrap_or(Vec3::ZERO);
 
