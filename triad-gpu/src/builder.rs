@@ -3,8 +3,8 @@
 //! These builders provide a simpler, more ergonomic API compared to
 //! directly using wgpu descriptors.
 
-use crate::resource_registry::ResourceRegistry;
 use crate::frame_graph::resource::Handle;
+use crate::resource_registry::ResourceRegistry;
 use bytemuck;
 
 /// Buffer usage flags
@@ -96,11 +96,12 @@ impl<'a> BufferBuilder<'a> {
 
         let buffer = if let Some(data) = self.data {
             // Initialize buffer with data
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: self.label.as_deref(),
-                contents: data,
-                usage: self.usage.to_wgpu(),
-            })
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: self.label.as_deref(),
+                    contents: data,
+                    usage: self.usage.to_wgpu(),
+                })
         } else if let Some(size) = self.size {
             // Create empty buffer
             self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -191,7 +192,9 @@ impl ShaderStage {
             ShaderStage::Vertex => wgpu::ShaderStages::VERTEX,
             ShaderStage::Fragment => wgpu::ShaderStages::FRAGMENT,
             ShaderStage::Compute => wgpu::ShaderStages::COMPUTE,
-            ShaderStage::VertexFragment => wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ShaderStage::VertexFragment => {
+                wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT
+            }
             ShaderStage::All => wgpu::ShaderStages::all(),
         }
     }
@@ -248,7 +251,8 @@ impl<'a> BindGroupBuilder<'a> {
             binding_type,
         });
 
-        self.buffer_bindings.push((binding, buffer_handle, binding_type));
+        self.buffer_bindings
+            .push((binding, buffer_handle, binding_type));
         self
     }
 
@@ -265,16 +269,13 @@ impl<'a> BindGroupBuilder<'a> {
             binding_type,
         });
 
-        self.texture_bindings.push((binding, texture_view_handle, binding_type));
+        self.texture_bindings
+            .push((binding, texture_view_handle, binding_type));
         self
     }
 
     /// Add a sampler binding
-    pub fn sampler(
-        mut self,
-        binding: u32,
-        sampler_handle: Handle<wgpu::Sampler>,
-    ) -> Self {
+    pub fn sampler(mut self, binding: u32, sampler_handle: Handle<wgpu::Sampler>) -> Self {
         self.entries.push(BindGroupLayoutEntry {
             binding,
             visibility: ShaderStage::All,
@@ -287,7 +288,7 @@ impl<'a> BindGroupBuilder<'a> {
 
     /// Build the bind group layout and bind group
     pub fn build(
-        self,
+        mut self,
         registry: &mut ResourceRegistry,
     ) -> Result<(Handle<wgpu::BindGroupLayout>, Handle<wgpu::BindGroup>), BindGroupBuildError> {
         if self.entries.is_empty() {
@@ -306,10 +307,16 @@ impl<'a> BindGroupBuilder<'a> {
             })
             .collect();
 
-        let bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: self.label.as_deref().map(|l| format!("{} Layout", l)).as_deref(),
-            entries: &layout_entries,
-        });
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: self
+                        .label
+                        .as_deref()
+                        .map(|l| format!("{} Layout", l))
+                        .as_deref(),
+                    entries: &layout_entries,
+                });
         let layout_handle = registry.insert(bind_group_layout);
 
         // Build bind group entries from stored handles
@@ -353,7 +360,9 @@ impl<'a> BindGroupBuilder<'a> {
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: self.label.as_deref(),
-            layout: registry.get(layout_handle).ok_or(BindGroupBuildError::LayoutNotFound)?,
+            layout: registry
+                .get(layout_handle)
+                .ok_or(BindGroupBuildError::LayoutNotFound)?,
             entries: &bind_group_entries,
         });
         let bind_group_handle = registry.insert(bind_group);
@@ -438,9 +447,21 @@ mod tests {
         }
 
         let vertices = vec![
-            TestVertex { x: 0.0, y: 0.0, z: 0.0 },
-            TestVertex { x: 1.0, y: 0.0, z: 0.0 },
-            TestVertex { x: 0.0, y: 1.0, z: 0.0 },
+            TestVertex {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            TestVertex {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            TestVertex {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
         ];
 
         let handle = BufferBuilder::new(&device)
@@ -450,7 +471,10 @@ mod tests {
             .expect("Failed to build buffer");
 
         let buffer = registry.get(handle).expect("Buffer not found");
-        assert_eq!(buffer.size(), (std::mem::size_of::<TestVertex>() * 3) as u64);
+        assert_eq!(
+            buffer.size(),
+            (std::mem::size_of::<TestVertex>() * 3) as u64
+        );
     }
 
     #[test]
@@ -470,16 +494,18 @@ mod tests {
 
     #[test]
     fn test_buffer_usage_conversion() {
-        assert_eq!(
-            BufferUsage::Vertex.to_wgpu(),
-            wgpu::BufferUsages::VERTEX
+        assert_eq!(BufferUsage::Vertex.to_wgpu(), wgpu::BufferUsages::VERTEX);
+        assert_eq!(BufferUsage::Index.to_wgpu(), wgpu::BufferUsages::INDEX);
+        assert!(
+            BufferUsage::Uniform
+                .to_wgpu()
+                .contains(wgpu::BufferUsages::UNIFORM)
         );
-        assert_eq!(
-            BufferUsage::Index.to_wgpu(),
-            wgpu::BufferUsages::INDEX
+        assert!(
+            BufferUsage::Uniform
+                .to_wgpu()
+                .contains(wgpu::BufferUsages::COPY_DST)
         );
-        assert!(BufferUsage::Uniform.to_wgpu().contains(wgpu::BufferUsages::UNIFORM));
-        assert!(BufferUsage::Uniform.to_wgpu().contains(wgpu::BufferUsages::COPY_DST));
         assert_eq!(
             BufferUsage::Storage { read_only: true }.to_wgpu(),
             wgpu::BufferUsages::STORAGE
@@ -492,8 +518,7 @@ mod tests {
         let registry = ResourceRegistry::default();
         let mut registry_mut = ResourceRegistry::default();
 
-        let result = BindGroupBuilder::new(&device, &registry)
-            .build(&mut registry_mut);
+        let result = BindGroupBuilder::new(&device, &registry).build(&mut registry_mut);
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -530,20 +555,22 @@ mod tests {
 
     #[test]
     fn test_shader_stage_conversion() {
-        assert_eq!(
-            ShaderStage::Vertex.to_wgpu(),
-            wgpu::ShaderStages::VERTEX
-        );
+        assert_eq!(ShaderStage::Vertex.to_wgpu(), wgpu::ShaderStages::VERTEX);
         assert_eq!(
             ShaderStage::Fragment.to_wgpu(),
             wgpu::ShaderStages::FRAGMENT
         );
-        assert_eq!(
-            ShaderStage::Compute.to_wgpu(),
-            wgpu::ShaderStages::COMPUTE
+        assert_eq!(ShaderStage::Compute.to_wgpu(), wgpu::ShaderStages::COMPUTE);
+        assert!(
+            ShaderStage::VertexFragment
+                .to_wgpu()
+                .contains(wgpu::ShaderStages::VERTEX)
         );
-        assert!(ShaderStage::VertexFragment.to_wgpu().contains(wgpu::ShaderStages::VERTEX));
-        assert!(ShaderStage::VertexFragment.to_wgpu().contains(wgpu::ShaderStages::FRAGMENT));
+        assert!(
+            ShaderStage::VertexFragment
+                .to_wgpu()
+                .contains(wgpu::ShaderStages::FRAGMENT)
+        );
     }
 
     #[test]
@@ -560,12 +587,10 @@ mod tests {
         // Test Storage binding types
         let storage_read_ty = BindingType::StorageRead.to_wgpu_binding_type();
         match storage_read_ty {
-            wgpu::BindingType::Buffer { ty, .. } => {
-                match ty {
-                    wgpu::BufferBindingType::Storage { read_only } => assert!(read_only),
-                    _ => panic!("Expected Storage binding type"),
-                }
-            }
+            wgpu::BindingType::Buffer { ty, .. } => match ty {
+                wgpu::BufferBindingType::Storage { read_only } => assert!(read_only),
+                _ => panic!("Expected Storage binding type"),
+            },
             _ => panic!("Expected Buffer binding type"),
         }
 

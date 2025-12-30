@@ -1,0 +1,20 @@
+[package]
+name = "triad-capture"
+version = "0.1.0"
+edition = "2024"
+description = "Video capture from webcams, files, and streams for triad applications"
+
+[dependencies]
+triad-train = { path = "../triad-train" }
+glam = "0.30"
+image = "0.25"
+tracing = "0.1"
+thiserror = "2.0"
+
+# Webcam capture (cross-platform)
+nokhwa = { version = "0.10", features = ["input-native"], optional = true }
+
+[features]
+default = []
+webcam = ["nokhwa"]
+

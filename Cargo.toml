@@ -4,6 +4,9 @@ members = [
 "triad-window",
 "triad-train",
 "triad-data",
+"triad-ui",
+"triad-capture",
+"triad-app",
 ]
 resolver = "3"
 
@@ -20,6 +23,8 @@ triad-gpu = { path = "triad-gpu" }
 triad-window = { path = "triad-window" }
 triad-train = { path = "triad-train" }
 triad-data = { path = "triad-data" }
+triad-ui = { path = "triad-ui" }
+triad-capture = { path = "triad-capture" }
 glam = "0.30"
 tracing = "0.1"
 tracing-subscriber = "0.3"

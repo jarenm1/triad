@@ -1,5 +1,60 @@
 use glam::{Mat4, Vec3};
 
+/// CPU-side representation of a simple point for GPU rendering.
+/// Matches the layout used by `point_vertex.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Debug)]
+pub struct PointPrimitive {
+    /// xyz position.
+    pub position: [f32; 3],
+    /// Point size (radius in world units).
+    pub size: f32,
+    /// rgba color (linear 0-1).
+    pub color: [f32; 4],
+}
+
+impl PointPrimitive {
+    /// Create a new point primitive.
+    pub fn new(position: Vec3, size: f32, color: Vec3, opacity: f32) -> Self {
+        Self {
+            position: [position.x, position.y, position.z],
+            size,
+            color: [color.x, color.y, color.z, opacity],
+        }
+    }
+
+    /// Get position as Vec3.
+    pub fn position(&self) -> Vec3 {
+        Vec3::from_slice(&self.position)
+    }
+
+    /// Get color as Vec3.
+    pub fn color_rgb(&self) -> Vec3 {
+        Vec3::new(self.color[0], self.color[1], self.color[2])
+    }
+
+    /// Get opacity.
+    pub fn opacity(&self) -> f32 {
+        self.color[3]
+    }
+}
+
+impl Default for PointPrimitive {
+    fn default() -> Self {
+        Self {
+            position: [0.0, 0.0, 0.0],
+            size: 0.01,
+            color: [0.8, 0.8, 0.8, 1.0],
+        }
+    }
+}
+
+impl From<&triad_data::Point> for PointPrimitive {
+    fn from(point: &triad_data::Point) -> Self {
+        Self::new(point.position, 0.01, point.color, 1.0)
+    }
+}
+
 /// CPU-side representation of a Gaussian splat instance.
 /// Matches the layout used by `gaussian_vertex.wgsl`.
 #[repr(C)]
@@ -18,6 +73,22 @@ pub struct GaussianPoint {
 }
 
 impl GaussianPoint {
+    pub fn new(
+        position: Vec3,
+        color: Vec3,
+        opacity: f32,
+        rotation: [f32; 4],
+        scale: Vec3,
+    ) -> Self {
+        Self {
+            position: [position.x, position.y, position.z],
+            _pad0: 0.0,
+            color_opacity: [color.x, color.y, color.z, opacity],
+            rotation,
+            scale: [scale.x, scale.y, scale.z, 0.0],
+        }
+    }
+
     pub fn position(&self) -> Vec3 {
         Vec3::from_slice(&self.position)
     }
@@ -40,6 +111,18 @@ impl GaussianPoint {
 
     pub fn scale(&self) -> Vec3 {
         Vec3::new(self.scale[0], self.scale[1], self.scale[2])
+    }
+}
+
+impl From<&triad_data::Gaussian> for GaussianPoint {
+    fn from(gaussian: &triad_data::Gaussian) -> Self {
+        Self::new(
+            gaussian.position,
+            gaussian.color,
+            gaussian.opacity,
+            gaussian.rotation,
+            gaussian.scale,
+        )
     }
 }
 
@@ -125,5 +208,17 @@ impl TrianglePrimitive {
         let e1 = self.vertex1() - self.vertex0();
         let e2 = self.vertex2() - self.vertex0();
         e1.cross(e2)
+    }
+}
+
+impl From<&triad_data::Triangle> for TrianglePrimitive {
+    fn from(triangle: &triad_data::Triangle) -> Self {
+        Self::new(
+            triangle.v0,
+            triangle.v1,
+            triangle.v2,
+            triangle.color,
+            triangle.opacity,
+        )
     }
 }

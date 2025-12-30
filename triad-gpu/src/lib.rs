@@ -1,19 +1,27 @@
 use wgpu::{Instance, SurfaceConfiguration};
 mod builder;
+mod delegate;
+pub mod delegates;
 mod frame_graph;
 mod pipeline;
 pub mod ply_loader;
 mod resource_registry;
+pub mod shaders;
 mod surface;
 mod type_map;
 mod types;
 
 pub use builder::{BindGroupBuilder, BindingType, BufferBuilder, BufferUsage, ShaderStage};
+pub use delegate::{RenderContext, RenderDelegate, SceneBounds};
+pub use delegates::{
+    GaussianDelegate, GaussianInitData, PointDelegate, PointInitData, TriangleDelegate,
+    TriangleInitData,
+};
 pub use frame_graph::{FrameGraph, Handle, Pass, PassBuilder, PassContext, ResourceType};
 pub use pipeline::{PipelineBuildError, RenderPipelineBuilder};
 pub use resource_registry::ResourceRegistry;
 pub use surface::SurfaceWrapper;
-pub use types::{CameraUniforms, GaussianPoint, TrianglePrimitive};
+pub use types::{CameraUniforms, GaussianPoint, PointPrimitive, TrianglePrimitive};
 pub use wgpu;
 
 #[derive(Debug, thiserror::Error)]
@@ -177,21 +185,27 @@ mod tests {
 
     #[test]
     fn test_renderer_device_access() {
-        let renderer = Renderer::new().block_on().expect("Failed to create renderer");
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
         let device = renderer.device();
         assert!(device.limits().max_buffer_size > 0);
     }
 
     #[test]
     fn test_renderer_queue_access() {
-        let renderer = Renderer::new().block_on().expect("Failed to create renderer");
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
         let _queue = renderer.queue();
         // Queue is accessible, test passes if no panic
     }
 
     #[test]
     fn test_renderer_create_buffer() {
-        let renderer = Renderer::new().block_on().expect("Failed to create renderer");
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
         let builder = renderer.create_buffer();
         // Builder created successfully
         assert!(std::mem::size_of_val(&builder) > 0);
@@ -199,7 +213,9 @@ mod tests {
 
     #[test]
     fn test_renderer_create_bind_group() {
-        let renderer = Renderer::new().block_on().expect("Failed to create renderer");
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
         let registry = ResourceRegistry::default();
         let builder = renderer.create_bind_group(&registry);
         // Builder created successfully
@@ -208,7 +224,9 @@ mod tests {
 
     #[test]
     fn test_renderer_write_buffer() {
-        let renderer = Renderer::new().block_on().expect("Failed to create renderer");
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
         let mut registry = ResourceRegistry::default();
 
         // Create a buffer
@@ -233,12 +251,14 @@ mod tests {
 
     #[test]
     fn test_renderer_write_buffer_not_found() {
-        let renderer = Renderer::new().block_on().expect("Failed to create renderer");
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
         let registry = ResourceRegistry::default();
 
         // Try to write to a non-existent buffer
         let fake_handle = crate::frame_graph::resource::Handle::<wgpu::Buffer>::next();
-        
+
         #[repr(C)]
         #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
         struct TestData {
@@ -255,7 +275,9 @@ mod tests {
 
     #[test]
     fn test_renderer_integration_buffer_build_and_write() {
-        let renderer = Renderer::new().block_on().expect("Failed to create renderer");
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
         let mut registry = ResourceRegistry::default();
 
         // Create buffer with data
