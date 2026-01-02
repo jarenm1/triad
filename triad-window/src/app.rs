@@ -15,6 +15,9 @@ use winit::event_loop::EventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+// Re-export egui for use by applications
+pub use egui;
+
 /// Run the viewer with a custom render delegate.
 pub fn run_with_delegate<D: RenderDelegate + 'static>(
     title: &str,
@@ -134,8 +137,14 @@ impl<D: RenderDelegate + 'static> ApplicationHandler for App<D> {
             return;
         }
 
-        if state.handle_window_event(event_loop, &event) {
-            return;
+        // Pass events to egui first
+        let egui_consumed = state.handle_egui_event(&event);
+
+        // Only pass to other handlers if egui didn't want the event
+        if !egui_consumed {
+            if state.handle_window_event(event_loop, &event) {
+                return;
+            }
         }
 
         match event {
@@ -182,6 +191,10 @@ struct ViewerState<D: RenderDelegate> {
     last_frame: Instant,
     depth_texture: Option<triad_gpu::wgpu::Texture>,
     depth_view: Option<triad_gpu::wgpu::TextureView>,
+    // egui integration
+    egui_ctx: egui::Context,
+    egui_winit: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
 }
 
 impl<D: RenderDelegate> ViewerState<D> {
@@ -235,6 +248,22 @@ impl<D: RenderDelegate> ViewerState<D> {
             (None, None)
         };
 
+        // Initialize egui
+        let egui_ctx = egui::Context::default();
+        let egui_winit = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            renderer.device(),
+            surface.format(),
+            egui_wgpu::RendererOptions::default(),
+        );
+
         Ok(Self {
             window,
             renderer,
@@ -247,6 +276,9 @@ impl<D: RenderDelegate> ViewerState<D> {
             last_frame: Instant::now(),
             depth_texture,
             depth_view,
+            egui_ctx,
+            egui_winit,
+            egui_renderer,
         })
     }
 
@@ -273,6 +305,11 @@ impl<D: RenderDelegate> ViewerState<D> {
         });
         let view = texture.create_view(&triad_gpu::wgpu::TextureViewDescriptor::default());
         (texture, view)
+    }
+
+    fn handle_egui_event(&mut self, event: &WindowEvent) -> bool {
+        let response = self.egui_winit.on_window_event(&self.window, event);
+        response.consumed
     }
 
     fn handle_window_event(
@@ -350,10 +387,95 @@ impl<D: RenderDelegate> ViewerState<D> {
             depth_view: self.depth_view.as_ref(),
         };
 
+        // Render the 3D scene first
         self.delegate.render(&mut encoder, ctx, &self.registry);
 
+        // Run egui frame
+        let raw_input = self.egui_winit.take_egui_input(&self.window);
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            self.controls.run_ui(ctx);
+        });
+
+        // Handle egui platform output (clipboard, cursor, etc.)
+        self.egui_winit
+            .handle_platform_output(&self.window, full_output.platform_output);
+
+        // Render egui
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.surface.config().width, self.surface.config().height],
+            pixels_per_point: self.window.scale_factor() as f32,
+        };
+
+        let tris = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        for (id, image_delta) in &full_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(device, self.renderer.queue(), *id, image_delta);
+        }
+
+        // Submit 3D scene commands
         self.renderer.queue().submit(Some(encoder.finish()));
+
+        // Create separate encoder for egui to work around lifetime requirements
+        let mut egui_encoder =
+            device.create_command_encoder(&triad_gpu::wgpu::CommandEncoderDescriptor {
+                label: Some("egui Encoder"),
+            });
+
+        self.egui_renderer.update_buffers(
+            device,
+            self.renderer.queue(),
+            &mut egui_encoder,
+            &tris,
+            &screen_descriptor,
+        );
+
+        // Render egui - the render_pass must be dropped before encoder.finish()
+        render_egui(
+            &self.egui_renderer,
+            &mut egui_encoder,
+            &surface_view,
+            &tris,
+            &screen_descriptor,
+        );
+
+        // Free textures that are no longer needed
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        self.renderer.queue().submit(Some(egui_encoder.finish()));
         surface_texture.present();
         Ok(())
     }
+}
+
+/// Helper function to render egui, encapsulating the render pass lifetime
+fn render_egui(
+    renderer: &egui_wgpu::Renderer,
+    encoder: &mut triad_gpu::wgpu::CommandEncoder,
+    view: &triad_gpu::wgpu::TextureView,
+    paint_jobs: &[egui::ClippedPrimitive],
+    screen_descriptor: &egui_wgpu::ScreenDescriptor,
+) {
+    let render_pass = encoder.begin_render_pass(&triad_gpu::wgpu::RenderPassDescriptor {
+        label: Some("egui Render Pass"),
+        color_attachments: &[Some(triad_gpu::wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            ops: triad_gpu::wgpu::Operations {
+                load: triad_gpu::wgpu::LoadOp::Load,
+                store: triad_gpu::wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+    });
+    let mut render_pass = render_pass.forget_lifetime();
+
+    renderer.render(&mut render_pass, paint_jobs, screen_descriptor);
 }

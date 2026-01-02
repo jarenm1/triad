@@ -53,6 +53,7 @@ impl OrbitCam {
             .asin()
             .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
         CameraPose {
+            center: self.focus,
             position,
             yaw,
             pitch,

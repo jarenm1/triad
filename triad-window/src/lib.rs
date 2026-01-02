@@ -8,8 +8,8 @@ pub use triad_gpu::{
     RenderDelegate, SceneBounds, TriangleDelegate, TriangleInitData,
 };
 
-pub use app::{run_with_delegate, run_with_delegate_config};
-pub use camera::{Camera, CameraPose, Projection};
+pub use app::{egui, run_with_delegate, run_with_delegate_config};
+pub use camera::{Camera, CameraController};
 pub use controls::{
     CameraControl, CameraIntent, Controls, FrameUpdate, InputState, IntentMode, MouseController,
 };

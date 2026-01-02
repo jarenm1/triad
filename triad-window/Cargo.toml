@@ -12,6 +12,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 bytemuck = { version = "1.24", features = ["derive"] }
 tracing-tracy = { version = "0.11", optional = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }
 
 [features]
 default = []

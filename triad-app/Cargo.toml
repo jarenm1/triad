@@ -13,7 +13,6 @@ triad-gpu = { workspace = true }
 triad-window = { workspace = true }
 triad-train = { workspace = true }
 triad-data = { workspace = true }
-triad-ui = { workspace = true }
 triad-capture = { workspace = true }
 glam = { workspace = true }
 tracing = { workspace = true }
