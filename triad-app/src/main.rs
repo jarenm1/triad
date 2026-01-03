@@ -4,9 +4,9 @@ mod app;
 mod camera;
 mod layers;
 mod menu;
-mod multi_delegate;
+pub mod renderer_manager;
 
-use app::{AppBuilder, ModeSignal, MultiDelegateConfig};
+use app::{AppBuilder, ModeSignal, RendererConfig};
 use clap::Parser;
 use menu::{MenuAction, create_full_menu};
 use std::path::PathBuf;
@@ -92,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = AppBuilder::new()
         .with_title("Triad Viewer")
         .with_window_size(args.width, args.height)
-        .with_multi_delegate(MultiDelegateConfig {
+        .with_renderer_config(RendererConfig {
             initial_mode,
             point_size: 0.01,
         })

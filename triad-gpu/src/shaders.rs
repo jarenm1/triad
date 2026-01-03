@@ -25,15 +25,6 @@ pub const TRIANGLE_FRAGMENT: &str = include_str!("../shaders/triangle_fragment.w
 /// Gaussian sorting compute shader - sorts gaussians by depth.
 pub const GAUSSIAN_SORT: &str = include_str!("../shaders/gaussian_sort.wgsl");
 
-/// Basic vertex shader for simple geometry.
-pub const VERTEX: &str = include_str!("../shaders/vertex.wgsl");
-
-/// Basic fragment shader.
-pub const FRAGMENT: &str = include_str!("../shaders/fragment.wgsl");
-
-/// Debug test shader.
-pub const DEBUG_TEST: &str = include_str!("../shaders/debug_test.wgsl");
-
-/// Triangle compute shader.
-pub const TRIANGLE_COMPUTE: &str = include_str!("../shaders/triangle_compute.wgsl");
+/// Layer blending shader - composites multiple layer textures with opacity.
+pub const LAYER_BLEND: &str = include_str!("../shaders/layer_blend.wgsl");
 

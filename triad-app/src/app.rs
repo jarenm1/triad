@@ -1,17 +1,15 @@
 //! Application state and main run loop with builder pattern.
 
 use crate::layers::LayerMode;
-use crate::multi_delegate::{MultiDelegate, MultiInitData};
+use crate::renderer_manager::RendererInitData;
 use glam::Vec3;
 use std::error::Error;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use triad_gpu::SceneBounds;
+use std::sync::{Arc, Mutex};
 use triad_window::{
-    CameraControl, Controls, FrameUpdate, GaussianDelegate, GaussianInitData, InputState, KeyCode,
-    MouseButton, PhysicalKey, PointDelegate, PointInitData, TriangleDelegate, TriangleInitData,
-    egui, run_with_delegate_config,
+    CameraControl, Controls, FrameUpdate, InputState, KeyCode, MouseButton, PhysicalKey, egui,
+    run_with_renderer_config,
 };
 
 /// Thread-safe signal for mode switching.
@@ -37,13 +35,13 @@ pub fn write_mode(signal: &ModeSignal, mode: LayerMode) {
     signal.store(value, Ordering::Relaxed);
 }
 
-/// Configuration for MultiDelegate.
-pub struct MultiDelegateConfig {
+/// Configuration for RendererManager.
+pub struct RendererConfig {
     pub initial_mode: LayerMode,
     pub point_size: f32,
 }
 
-impl Default for MultiDelegateConfig {
+impl Default for RendererConfig {
     fn default() -> Self {
         Self {
             initial_mode: LayerMode::Points,
@@ -82,19 +80,13 @@ impl Default for LoggingConfig {
     }
 }
 
-/// Delegate configuration enum.
-pub enum DelegateConfig {
-    Point(PointInitData),
-    Gaussian(GaussianInitData),
-    Triangle(TriangleInitData),
-    Multi(MultiDelegateConfig),
-}
+// Removed DelegateConfig - now using RendererConfig directly
 
 /// Builder for configuring and running the application.
 pub struct AppBuilder {
     title: String,
     window_size: (u32, u32),
-    delegate_config: Option<DelegateConfig>,
+    renderer_config: Option<RendererConfig>,
     controls_config: Option<Box<dyn FnOnce(&mut Controls) + Send>>,
     camera_config: CameraConfig,
     logging: LoggingConfig,
@@ -110,7 +102,7 @@ impl AppBuilder {
         Self {
             title: "Triad Viewer".to_string(),
             window_size: (1280, 720),
-            delegate_config: None,
+            renderer_config: None,
             controls_config: None,
             camera_config: CameraConfig::default(),
             logging: LoggingConfig::default(),
@@ -145,27 +137,15 @@ impl AppBuilder {
         self
     }
 
-    /// Configure with Point delegate.
-    pub fn with_point_delegate(mut self, init_data: PointInitData) -> Self {
-        self.delegate_config = Some(DelegateConfig::Point(init_data));
+    /// Configure with renderer settings.
+    pub fn with_renderer_config(mut self, config: RendererConfig) -> Self {
+        self.renderer_config = Some(config);
         self
     }
 
-    /// Configure with Gaussian delegate.
-    pub fn with_gaussian_delegate(mut self, init_data: GaussianInitData) -> Self {
-        self.delegate_config = Some(DelegateConfig::Gaussian(init_data));
-        self
-    }
-
-    /// Configure with Triangle delegate.
-    pub fn with_triangle_delegate(mut self, init_data: TriangleInitData) -> Self {
-        self.delegate_config = Some(DelegateConfig::Triangle(init_data));
-        self
-    }
-
-    /// Configure with MultiDelegate.
-    pub fn with_multi_delegate(mut self, config: MultiDelegateConfig) -> Self {
-        self.delegate_config = Some(DelegateConfig::Multi(config));
+    /// Configure with MultiDelegate (deprecated - use with_renderer_config).
+    pub fn with_multi_delegate(mut self, config: RendererConfig) -> Self {
+        self.renderer_config = Some(config);
         self
     }
 
@@ -219,105 +199,86 @@ impl AppBuilder {
         // Initialize logging
         self.init_logging();
 
-        // Determine delegate and run
-        match self.delegate_config {
-            Some(DelegateConfig::Multi(config)) => {
-                let mode_signal: ModeSignal = self.mode_signal.unwrap_or_else(|| {
-                    Arc::new(AtomicU8::new(match config.initial_mode {
-                        LayerMode::Points => 0,
-                        LayerMode::Gaussians => 1,
-                        LayerMode::Triangles => 2,
-                    }))
-                });
+        // Get renderer config or use default
+        let config = self.renderer_config.unwrap_or_default();
 
-                let init_data = MultiInitData {
-                    ply_path: self.ply_path.clone(),
-                    initial_mode: config.initial_mode,
-                    point_size: config.point_size,
-                    mode_signal: mode_signal.clone(),
-                    ply_receiver: self.ply_receiver.take(),
+        let init_data = RendererInitData {
+            ply_path: self.ply_path,
+            initial_mode: config.initial_mode,
+            point_size: config.point_size,
+            ply_receiver: self.ply_receiver.take().map(|r| {
+                // Wrap the receiver in Arc<Mutex<>> for thread safety
+                Arc::new(Mutex::new(r))
+            }),
+        };
+
+        let mut controls_config = self.controls_config;
+        let mut menu_config = self.menu_config;
+
+        // Convert RendererInitData from triad-app to triad-window format
+        let window_init_data = triad_window::RendererInitData {
+            ply_path: init_data.ply_path,
+            initial_mode: match init_data.initial_mode {
+                LayerMode::Points => 0,
+                LayerMode::Gaussians => 1,
+                LayerMode::Triangles => 2,
+            },
+            point_size: init_data.point_size,
+            ply_receiver: init_data.ply_receiver.and_then(|r| {
+                // Unwrap from Arc<Mutex<>> to get the receiver
+                Arc::try_unwrap(r).ok()
+                    .and_then(|m| m.into_inner().ok())
+            }),
+        };
+
+        run_with_renderer_config(
+            &self.title,
+            window_init_data,
+            move |controls| {
+                // Apply controls configuration
+                if let Some(config_fn) = controls_config.take() {
+                    config_fn(controls);
+                }
+
+                // Add menu UI hook
+                if let Some(mut menu_fn) = menu_config.take() {
+                    controls.on_ui(move |ctx| {
+                        menu_fn(ctx);
+                    });
+                }
+            },
+            move |window_init_data,
+                  renderer,
+                  registry,
+                  surface_format: triad_gpu::wgpu::TextureFormat,
+                  width,
+                  height| {
+                // Convert back to triad-app format
+                let app_init_data = crate::renderer_manager::RendererInitData {
+                    ply_path: window_init_data.ply_path,
+                    initial_mode: match window_init_data.initial_mode {
+                        0 => LayerMode::Points,
+                        1 => LayerMode::Gaussians,
+                        2 => LayerMode::Triangles,
+                        _ => LayerMode::Points,
+                    },
+                    point_size: window_init_data.point_size,
+                    ply_receiver: window_init_data.ply_receiver.map(|r| Arc::new(Mutex::new(r))),
                 };
 
-                let mut controls_config = self.controls_config;
-                let mut menu_config = self.menu_config;
+                // Create the renderer manager
+                let manager = crate::renderer_manager::RendererManager::create(
+                    renderer,
+                    registry,
+                    surface_format,
+                    width,
+                    height,
+                    app_init_data,
+                )?;
 
-                run_with_delegate_config::<MultiDelegate, _>(
-                    &self.title,
-                    init_data,
-                    move |controls| {
-                        // Apply controls configuration
-                        if let Some(config_fn) = controls_config.take() {
-                            config_fn(controls);
-                        }
-
-                        // Add menu UI hook
-                        if let Some(mut menu_fn) = menu_config.take() {
-                            controls.on_ui(move |ctx| {
-                                menu_fn(ctx);
-                            });
-                        }
-                    },
-                )
-            }
-            Some(DelegateConfig::Point(init_data)) => {
-                let mut controls_config = self.controls_config;
-                let mut menu_config = self.menu_config;
-
-                run_with_delegate_config::<PointDelegate, _>(
-                    &self.title,
-                    init_data,
-                    move |controls| {
-                        if let Some(config_fn) = controls_config.take() {
-                            config_fn(controls);
-                        }
-                        if let Some(mut menu_fn) = menu_config.take() {
-                            controls.on_ui(move |ctx| {
-                                menu_fn(ctx);
-                            });
-                        }
-                    },
-                )
-            }
-            Some(DelegateConfig::Gaussian(init_data)) => {
-                let mut controls_config = self.controls_config;
-                let mut menu_config = self.menu_config;
-
-                run_with_delegate_config::<GaussianDelegate, _>(
-                    &self.title,
-                    init_data,
-                    move |controls| {
-                        if let Some(config_fn) = controls_config.take() {
-                            config_fn(controls);
-                        }
-                        if let Some(mut menu_fn) = menu_config.take() {
-                            controls.on_ui(move |ctx| {
-                                menu_fn(ctx);
-                            });
-                        }
-                    },
-                )
-            }
-            Some(DelegateConfig::Triangle(init_data)) => {
-                let mut controls_config = self.controls_config;
-                let mut menu_config = self.menu_config;
-
-                run_with_delegate_config::<TriangleDelegate, _>(
-                    &self.title,
-                    init_data,
-                    move |controls| {
-                        if let Some(config_fn) = controls_config.take() {
-                            config_fn(controls);
-                        }
-                        if let Some(mut menu_fn) = menu_config.take() {
-                            controls.on_ui(move |ctx| {
-                                menu_fn(ctx);
-                            });
-                        }
-                    },
-                )
-            }
-            None => Err("No delegate configured. Use one of: with_point_delegate, with_gaussian_delegate, with_triangle_delegate, or with_multi_delegate".into()),
-        }
+                Ok(Box::new(manager))
+            },
+        )
     }
 
     fn init_logging(&self) {

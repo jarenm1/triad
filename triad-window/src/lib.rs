@@ -2,13 +2,10 @@ mod app;
 mod camera;
 pub mod controls;
 
-// Re-export render delegate types from triad-gpu
-pub use triad_gpu::{
-    GaussianDelegate, GaussianInitData, PointDelegate, PointInitData, RenderContext,
-    RenderDelegate, SceneBounds, TriangleDelegate, TriangleInitData,
-};
+// Re-export types from triad-gpu
+// Note: RenderDelegate and SceneBounds have been removed
 
-pub use app::{egui, run_with_delegate, run_with_delegate_config};
+pub use app::{egui, run_with_renderer_config, RendererInitData, RendererManager};
 pub use camera::{Camera, CameraController, CameraPose, Projection};
 pub use controls::{
     CameraControl, CameraIntent, Controls, FrameUpdate, InputState, IntentMode, MouseController,

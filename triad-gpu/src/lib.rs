@@ -1,7 +1,5 @@
 use wgpu::{Instance, SurfaceConfiguration};
 mod builder;
-mod delegate;
-pub mod delegates;
 mod frame_graph;
 mod pipeline;
 pub mod ply_loader;
@@ -12,12 +10,7 @@ mod type_map;
 mod types;
 
 pub use builder::{BindGroupBuilder, BindingType, BufferBuilder, BufferUsage, ShaderStage};
-pub use delegate::{RenderContext, RenderDelegate, SceneBounds};
-pub use delegates::{
-    GaussianDelegate, GaussianInitData, PointDelegate, PointInitData, TriangleDelegate,
-    TriangleInitData,
-};
-pub use frame_graph::{FrameGraph, Handle, Pass, PassBuilder, PassContext, ResourceType};
+pub use frame_graph::{ExecutableFrameGraph, FrameGraph, FrameGraphError, Handle, Pass, PassBuilder, PassContext, ResourceType};
 pub use pipeline::{PipelineBuildError, RenderPipelineBuilder};
 pub use resource_registry::ResourceRegistry;
 pub use surface::SurfaceWrapper;

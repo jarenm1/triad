@@ -20,4 +20,5 @@ tracing-subscriber = { workspace = true }
 bytemuck = { workspace = true }
 clap = { version = "4.4", features = ["derive"] }
 rfd = "0.14"
+thiserror = "1.0"
 
