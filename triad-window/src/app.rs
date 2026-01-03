@@ -39,33 +39,6 @@ where
     D::InitData: 'static,
     F: FnOnce(&mut Controls),
 {
-    #[cfg(feature = "tracy")]
-    {
-        use tracing_subscriber::Layer;
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-        tracing_subscriber::registry()
-            .with(tracing_tracy::TracyLayer::default())
-            .with(
-                tracing_subscriber::fmt::layer().with_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "info".into()),
-                ),
-            )
-            .init();
-    }
-
-    #[cfg(not(feature = "tracy"))]
-    {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .with_target(false)
-            .init();
-    }
-
     let event_loop = EventLoop::new().map_err(|e| format!("Failed to create event loop: {e}"))?;
     let mut controls = Controls::default();
     configure_controls(&mut controls);
@@ -227,12 +200,14 @@ impl<D: RenderDelegate> ViewerState<D> {
 
         let camera_pos = bounds.center + Vec3::new(0.0, 0.0, bounds.radius * 2.5);
         let camera = Camera::new(camera_pos, bounds.center);
+        // Use a larger multiplier and ensure minimum far plane for better view range
+        let far_plane = (bounds.radius * 50.0).max(100.0).min(10000.0);
         let projection = Projection::new(
             size.width.max(1),
             size.height.max(1),
             std::f32::consts::FRAC_PI_3,
             0.01,
-            bounds.radius * 10.0,
+            far_plane,
         );
 
         // Create depth texture if delegate needs one
@@ -370,6 +345,25 @@ impl<D: RenderDelegate> ViewerState<D> {
 
         self.delegate
             .update(self.renderer.queue(), &self.registry, &uniforms);
+
+        // Check for pending PLY reload
+        if let Err(e) = self
+            .delegate
+            .handle_pending_ply_reload(&self.renderer, &mut self.registry)
+        {
+            tracing::error!("Failed to handle pending PLY reload: {}", e);
+        }
+
+        // Update projection far plane if bounds changed (e.g., after PLY reload)
+        let bounds = self.delegate.bounds();
+        let new_far = (bounds.radius * 50.0).max(100.0).min(10000.0);
+        if (self.projection.far() - new_far).abs() > 0.1 {
+            self.projection.set_far(new_far);
+            info!(
+                "Updated projection far plane to {} (bounds radius: {})",
+                new_far, bounds.radius
+            );
+        }
 
         let surface_texture = self.surface.get_current_texture()?;
         let surface_view = surface_texture

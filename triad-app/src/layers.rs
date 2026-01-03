@@ -26,7 +26,11 @@ impl fmt::Display for LayerMode {
 impl LayerMode {
     /// Get all available modes.
     pub fn all() -> &'static [LayerMode] {
-        &[LayerMode::Points, LayerMode::Gaussians, LayerMode::Triangles]
+        &[
+            LayerMode::Points,
+            LayerMode::Gaussians,
+            LayerMode::Triangles,
+        ]
     }
 
     /// Cycle to the next mode.
@@ -91,7 +95,7 @@ impl LayerManager {
     /// Toggle a specific layer.
     pub fn toggle(&mut self, mode: LayerMode) {
         self.enabled[mode as usize] = !self.enabled[mode as usize];
-        
+
         // If we disabled the current mode, switch to the first enabled one
         if !self.is_enabled(self.current_mode) {
             for mode in LayerMode::all() {
@@ -119,4 +123,3 @@ impl Default for LayerManager {
         Self::new(LayerMode::Points)
     }
 }
-

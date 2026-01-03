@@ -12,7 +12,6 @@ pub use resource::{Handle, HandleId, ResourceType};
 
 pub type SurfaceId = u64;
 
-/// Frame graph builder
 #[derive(Default)]
 pub struct FrameGraph {
     passes: Vec<PassNode>,
@@ -21,7 +20,6 @@ pub struct FrameGraph {
 }
 
 impl FrameGraph {
-    /// Register a resource in the frame graph
     pub fn register_resource<T: ResourceType>(&mut self, handle: Handle<T>) -> &mut Self {
         self.resource_info
             .entry(handle.id())
@@ -29,7 +27,6 @@ impl FrameGraph {
         self
     }
 
-    /// Add a pass to the frame graph
     pub fn add_pass(&mut self, builder: PassBuilder) -> &mut Self {
         let pass = builder.build();
 
@@ -62,12 +59,9 @@ impl FrameGraph {
         }
         self
     }
-    /// Build and validate the frame graph
     pub fn build(mut self) -> Result<ExecutableFrameGraph, FrameGraphError> {
-        // Topological sort for execution order
         let execution_order = execution::topological_sort(&self.passes)?;
 
-        // Update resource usage tracking
         for (idx, &pass_idx) in execution_order.iter().enumerate() {
             let pass = &self.passes[pass_idx];
             for read_id in pass.reads() {

@@ -114,5 +114,16 @@ pub trait RenderDelegate: Sized {
         ctx: RenderContext,
         registry: &ResourceRegistry,
     );
+
+    /// Check if there's a pending PLY reload and handle it.
+    /// Returns true if a reload was performed.
+    /// Default implementation does nothing.
+    fn handle_pending_ply_reload(
+        &mut self,
+        _renderer: &Renderer,
+        _registry: &mut ResourceRegistry,
+    ) -> Result<bool, Box<dyn Error>> {
+        Ok(false)
+    }
 }
 

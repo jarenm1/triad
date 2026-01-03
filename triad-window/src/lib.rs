@@ -9,7 +9,7 @@ pub use triad_gpu::{
 };
 
 pub use app::{egui, run_with_delegate, run_with_delegate_config};
-pub use camera::{Camera, CameraController};
+pub use camera::{Camera, CameraController, CameraPose, Projection};
 pub use controls::{
     CameraControl, CameraIntent, Controls, FrameUpdate, InputState, IntentMode, MouseController,
 };
