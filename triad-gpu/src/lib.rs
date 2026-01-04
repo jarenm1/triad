@@ -16,7 +16,10 @@ pub use error::{
     RendererError, Result,
 };
 
-pub use builder::{BindGroupBuilder, BindingType, BufferBuilder, BufferUsage, ShaderStage};
+pub use builder::{
+    BindGroupBuilder, BindingType, BufferBuilder, BufferUsage, DynamicBuffer, DynamicBufferBuilder,
+    ShaderStage,
+};
 pub use frame_graph::{ExecutableFrameGraph, FrameGraph, Handle, Pass, PassBuilder, PassContext, ResourceType};
 pub use pipeline::RenderPipelineBuilder;
 pub use resource_registry::ResourceRegistry;
@@ -79,6 +82,14 @@ impl Renderer {
         BindGroupBuilder::new(&self.device, registry)
     }
 
+    /// Create a DynamicBuffer for incremental updates
+    ///
+    /// DynamicBuffer pre-allocates capacity and supports efficient partial updates
+    /// without recreating bind groups.
+    pub fn create_dynamic_buffer<T: bytemuck::Pod>(&self) -> builder::DynamicBufferBuilder<'_, T> {
+        builder::DynamicBufferBuilder::new(&self.device)
+    }
+
     /// Write data to a buffer
     pub fn write_buffer<T: bytemuck::Pod>(
         &self,
@@ -89,6 +100,36 @@ impl Renderer {
         let buffer_ref = registry.get(buffer).ok_or(BufferError::NotFound)?;
         self.queue
             .write_buffer(buffer_ref, 0, bytemuck::cast_slice(data));
+        Ok(())
+    }
+
+    /// Write data to a buffer at a specified byte offset.
+    ///
+    /// This enables incremental buffer updates without recreating the entire buffer.
+    ///
+    /// # Errors
+    /// - `BufferError::NotFound` if buffer handle is invalid
+    /// - `BufferError::InvalidOffset` if offset + data size exceeds buffer size
+    pub fn write_buffer_offset<T: bytemuck::Pod>(
+        &self,
+        buffer: Handle<wgpu::Buffer>,
+        offset: u64,
+        data: &[T],
+        registry: &ResourceRegistry,
+    ) -> std::result::Result<(), BufferError> {
+        let buffer_ref = registry.get(buffer).ok_or(BufferError::NotFound)?;
+        let data_bytes = bytemuck::cast_slice::<T, u8>(data);
+        let data_size = data_bytes.len() as u64;
+
+        if offset + data_size > buffer_ref.size() {
+            return Err(BufferError::InvalidOffset {
+                offset,
+                data_size,
+                buffer_size: buffer_ref.size(),
+            });
+        }
+
+        self.queue.write_buffer(buffer_ref, offset, data_bytes);
         Ok(())
     }
 
@@ -270,5 +311,401 @@ mod tests {
         renderer
             .write_buffer(buffer_handle, &new_data, &registry)
             .expect("Failed to write buffer");
+    }
+
+    #[test]
+    fn test_write_buffer_offset_success() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        // Create buffer with COPY_DST (Uniform includes it)
+        let buffer_handle = renderer
+            .create_buffer()
+            .label("test_offset_buffer")
+            .size(64)
+            .usage(BufferUsage::Uniform)
+            .build(&mut registry)
+            .expect("Failed to create buffer");
+
+        // Write at offset 0
+        let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let result = renderer.write_buffer_offset(buffer_handle, 0, &data, &registry);
+        assert!(result.is_ok());
+
+        // Write at offset 16 (after the first 4 floats)
+        let result = renderer.write_buffer_offset(buffer_handle, 16, &data, &registry);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_write_buffer_offset_invalid() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        let buffer_handle = renderer
+            .create_buffer()
+            .size(64)
+            .usage(BufferUsage::Uniform)
+            .build(&mut registry)
+            .expect("Failed to create buffer");
+
+        // Try to write past buffer end: offset 60 + 16 bytes (4 floats) = 76 > 64
+        let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let result = renderer.write_buffer_offset(buffer_handle, 60, &data, &registry);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            BufferError::InvalidOffset { .. }
+        ));
+    }
+
+    #[test]
+    fn test_write_buffer_offset_not_found() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let registry = ResourceRegistry::default();
+
+        let fake_handle = crate::frame_graph::resource::Handle::<wgpu::Buffer>::next();
+        let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let result = renderer.write_buffer_offset(fake_handle, 0, &data, &registry);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), BufferError::NotFound));
+    }
+
+    #[test]
+    fn test_dynamic_buffer_creation_with_capacity() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+        struct TestElement {
+            value: f32,
+            _pad: [f32; 3],
+        }
+
+        let buf: DynamicBuffer<TestElement> = renderer
+            .create_dynamic_buffer()
+            .label("test_dynamic")
+            .capacity(100)
+            .build(&mut registry)
+            .expect("Failed to create dynamic buffer");
+
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.capacity(), 100);
+        assert!(buf.is_empty());
+
+        // Verify underlying buffer exists
+        let buffer = registry.get(buf.buffer()).expect("Buffer not found");
+        assert_eq!(
+            buffer.size(),
+            (100 * std::mem::size_of::<TestElement>()) as u64
+        );
+    }
+
+    #[test]
+    fn test_dynamic_buffer_creation_with_data() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+        struct TestElement {
+            value: f32,
+            _pad: [f32; 3],
+        }
+
+        let initial_data = vec![TestElement::default(); 10];
+        let buf: DynamicBuffer<TestElement> = renderer
+            .create_dynamic_buffer()
+            .label("test_dynamic_with_data")
+            .with_data(&initial_data)
+            .build(&mut registry)
+            .expect("Failed to create dynamic buffer");
+
+        assert_eq!(buf.len(), 10);
+        assert_eq!(buf.capacity(), 10);
+    }
+
+    #[test]
+    fn test_dynamic_buffer_creation_with_data_and_extra_capacity() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+        struct TestElement {
+            value: f32,
+            _pad: [f32; 3],
+        }
+
+        let initial_data = vec![TestElement::default(); 10];
+        let buf: DynamicBuffer<TestElement> = renderer
+            .create_dynamic_buffer()
+            .label("test_dynamic_extra_cap")
+            .capacity(50) // Extra capacity beyond initial data
+            .with_data(&initial_data)
+            .build(&mut registry)
+            .expect("Failed to create dynamic buffer");
+
+        assert_eq!(buf.len(), 10);
+        assert_eq!(buf.capacity(), 50);
+    }
+
+    #[test]
+    fn test_dynamic_buffer_push() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+        struct TestElement {
+            value: f32,
+            _pad: [f32; 3],
+        }
+
+        let mut buf: DynamicBuffer<TestElement> = renderer
+            .create_dynamic_buffer()
+            .label("test_push")
+            .capacity(100)
+            .build(&mut registry)
+            .expect("Failed to create dynamic buffer");
+
+        let elements = vec![TestElement { value: 1.0, _pad: [0.0; 3] }; 10];
+        let idx = buf
+            .push(&renderer, &registry, &elements)
+            .expect("Failed to push");
+
+        assert_eq!(idx, 0);
+        assert_eq!(buf.len(), 10);
+
+        // Push more elements
+        let more_elements = vec![TestElement { value: 2.0, _pad: [0.0; 3] }; 5];
+        let idx = buf
+            .push(&renderer, &registry, &more_elements)
+            .expect("Failed to push");
+
+        assert_eq!(idx, 10);
+        assert_eq!(buf.len(), 15);
+    }
+
+    #[test]
+    fn test_dynamic_buffer_update_at() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+        struct TestElement {
+            value: f32,
+            _pad: [f32; 3],
+        }
+
+        let initial = vec![TestElement::default(); 10];
+        let mut buf: DynamicBuffer<TestElement> = renderer
+            .create_dynamic_buffer()
+            .with_data(&initial)
+            .build(&mut registry)
+            .expect("Failed to create dynamic buffer");
+
+        let updated = TestElement {
+            value: 42.0,
+            _pad: [0.0; 3],
+        };
+        let result = buf.update_at(&renderer, &registry, 5, &updated);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_dynamic_buffer_update_at_out_of_bounds() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+        struct TestElement {
+            value: f32,
+            _pad: [f32; 3],
+        }
+
+        let initial = vec![TestElement::default(); 10];
+        let buf: DynamicBuffer<TestElement> = renderer
+            .create_dynamic_buffer()
+            .with_data(&initial)
+            .build(&mut registry)
+            .expect("Failed to create dynamic buffer");
+
+        let updated = TestElement {
+            value: 42.0,
+            _pad: [0.0; 3],
+        };
+        // Index 10 is out of bounds (len is 10, indices 0-9 valid)
+        let result = buf.update_at(&renderer, &registry, 10, &updated);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            BufferError::CapacityExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn test_dynamic_buffer_capacity_exceeded() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+        struct TestElement {
+            value: f32,
+            _pad: [f32; 3],
+        }
+
+        let mut buf: DynamicBuffer<TestElement> = renderer
+            .create_dynamic_buffer()
+            .capacity(10)
+            .build(&mut registry)
+            .expect("Failed to create dynamic buffer");
+
+        // Try to push more than capacity
+        let elements = vec![TestElement::default(); 20];
+        let result = buf.push(&renderer, &registry, &elements);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            BufferError::CapacityExceeded {
+                requested: 20,
+                capacity: 10
+            }
+        ));
+    }
+
+    #[test]
+    fn test_dynamic_buffer_clear() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+        struct TestElement {
+            value: f32,
+            _pad: [f32; 3],
+        }
+
+        let initial = vec![TestElement::default(); 10];
+        let mut buf: DynamicBuffer<TestElement> = renderer
+            .create_dynamic_buffer()
+            .with_data(&initial)
+            .build(&mut registry)
+            .expect("Failed to create dynamic buffer");
+
+        assert_eq!(buf.len(), 10);
+        buf.clear();
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+        // Capacity unchanged
+        assert_eq!(buf.capacity(), 10);
+    }
+
+    #[test]
+    fn test_dynamic_buffer_set_len() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default)]
+        struct TestElement {
+            value: f32,
+            _pad: [f32; 3],
+        }
+
+        let mut buf: DynamicBuffer<TestElement> = renderer
+            .create_dynamic_buffer()
+            .capacity(100)
+            .build(&mut registry)
+            .expect("Failed to create dynamic buffer");
+
+        // Set length (e.g., after GPU compute shader writes data)
+        let result = buf.set_len(50);
+        assert!(result.is_ok());
+        assert_eq!(buf.len(), 50);
+
+        // Try to set beyond capacity
+        let result = buf.set_len(200);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            BufferError::CapacityExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn test_dynamic_buffer_missing_size_or_data() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        #[repr(C)]
+        #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable, Default, Debug)]
+        struct TestElement {
+            value: f32,
+        }
+
+        // Neither capacity nor data specified
+        let result: std::result::Result<DynamicBuffer<TestElement>, BufferError> = renderer
+            .create_dynamic_buffer()
+            .label("test")
+            .build(&mut registry);
+
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            BufferError::MissingSizeOrData
+        ));
+    }
+
+    #[test]
+    fn test_storage_writable_usage() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let mut registry = ResourceRegistry::default();
+
+        // Create a StorageWritable buffer
+        let buffer_handle = renderer
+            .create_buffer()
+            .label("storage_writable")
+            .size(256)
+            .usage(BufferUsage::StorageWritable)
+            .build(&mut registry)
+            .expect("Failed to create buffer");
+
+        // Should be able to write to it
+        let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let result = renderer.write_buffer_offset(buffer_handle, 0, &data, &registry);
+        assert!(result.is_ok());
     }
 }

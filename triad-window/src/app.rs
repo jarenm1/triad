@@ -216,7 +216,7 @@ struct ViewerState {
     projection: Projection,
     last_frame: Instant,
     depth_texture: Option<triad_gpu::wgpu::Texture>,
-    depth_view: Option<triad_gpu::wgpu::TextureView>,
+    depth_view: Option<Arc<triad_gpu::wgpu::TextureView>>,
     // egui integration
     egui_ctx: egui::Context,
     egui_winit: egui_winit::State,
@@ -232,13 +232,11 @@ pub trait RendererManager: Send + Sync {
         camera: &CameraUniforms,
     );
     fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry);
-    fn check_pending_ply(&mut self) -> Option<std::path::PathBuf>;
-    fn load_ply(
-        &mut self,
-        renderer: &Renderer,
-        registry: &mut ResourceRegistry,
-        ply_path: &std::path::PathBuf,
-    ) -> Result<(), Box<dyn Error>>;
+    /// Check for pending PLY requests and start background loading (non-blocking).
+    fn check_and_start_ply_loading(&mut self);
+    /// Check for completed background loading and apply to GPU (fast).
+    fn apply_parsed_ply_data(&mut self, renderer: &Renderer, registry: &mut ResourceRegistry)
+        -> bool;
     fn build_frame_graph(
         &mut self,
         final_view: Arc<wgpu::TextureView>,
@@ -266,13 +264,9 @@ pub trait RendererManagerTrait: Send + Sync {
         camera: &CameraUniforms,
     );
     fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry);
-    fn check_pending_ply(&mut self) -> Option<std::path::PathBuf>;
-    fn load_ply(
-        &mut self,
-        renderer: &Renderer,
-        registry: &mut ResourceRegistry,
-        ply_path: &std::path::PathBuf,
-    ) -> Result<(), Box<dyn Error>>;
+    fn check_and_start_ply_loading(&mut self);
+    fn apply_parsed_ply_data(&mut self, renderer: &Renderer, registry: &mut ResourceRegistry)
+        -> bool;
     fn build_frame_graph(
         &mut self,
         final_view: Arc<wgpu::TextureView>,
@@ -303,16 +297,15 @@ impl<M: RendererManager> RendererManagerTrait for M {
     fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry) {
         RendererManager::update_opacity_buffer(self, queue, registry);
     }
-    fn check_pending_ply(&mut self) -> Option<std::path::PathBuf> {
-        RendererManager::check_pending_ply(self)
+    fn check_and_start_ply_loading(&mut self) {
+        RendererManager::check_and_start_ply_loading(self);
     }
-    fn load_ply(
+    fn apply_parsed_ply_data(
         &mut self,
         renderer: &Renderer,
         registry: &mut ResourceRegistry,
-        ply_path: &std::path::PathBuf,
-    ) -> Result<(), Box<dyn Error>> {
-        RendererManager::load_ply(self, renderer, registry, ply_path)
+    ) -> bool {
+        RendererManager::apply_parsed_ply_data(self, renderer, registry)
     }
     fn build_frame_graph(
         &mut self,
@@ -430,7 +423,7 @@ impl ViewerState {
             projection,
             last_frame: Instant::now(),
             depth_texture: Some(depth_texture),
-            depth_view: Some(depth_view),
+            depth_view: Some(Arc::new(depth_view)),
             egui_ctx,
             egui_winit,
             egui_renderer,
@@ -517,7 +510,7 @@ impl ViewerState {
             triad_gpu::wgpu::TextureFormat::Depth32Float,
         );
         self.depth_texture = Some(tex);
-        self.depth_view = Some(view);
+        self.depth_view = Some(Arc::new(view));
     }
 
     fn render(&mut self) -> Result<(), RenderError> {
@@ -539,15 +532,12 @@ impl ViewerState {
         self.renderer_manager
             .update_opacity_buffer(self.renderer.queue(), &self.registry);
 
-        // Check for pending PLY reload
-        if let Some(ply_path) = self.renderer_manager.check_pending_ply() {
-            if let Err(e) =
-                self.renderer_manager
-                    .load_ply(&self.renderer, &mut self.registry, &ply_path)
-            {
-                error!("Failed to load PLY: {}", e);
-            }
-        }
+        // Check for pending PLY requests and start background loading (non-blocking)
+        self.renderer_manager.check_and_start_ply_loading();
+
+        // Check for completed background loading and apply to GPU (fast)
+        self.renderer_manager
+            .apply_parsed_ply_data(&self.renderer, &mut self.registry);
 
         let surface_texture = self.surface.get_current_texture()?;
         let surface_view = Arc::new(
@@ -556,14 +546,10 @@ impl ViewerState {
                 .create_view(&triad_gpu::wgpu::TextureViewDescriptor::default()),
         );
 
-        // Build and execute frame graph
-        // Create Arc for depth view - we need to create a new view from the texture
-        let depth_view_arc = self.depth_texture.as_ref().map(|tex| {
-            Arc::new(tex.create_view(&triad_gpu::wgpu::TextureViewDescriptor::default()))
-        });
+        // Build and execute frame graph using cached depth view
         let mut frame_graph = self
             .renderer_manager
-            .build_frame_graph(surface_view.clone(), depth_view_arc)?;
+            .build_frame_graph(surface_view.clone(), self.depth_view.clone())?;
 
         frame_graph.execute(
             self.renderer.device(),

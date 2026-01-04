@@ -3,9 +3,12 @@
 //! These builders provide a simpler, more ergonomic API compared to
 //! directly using wgpu descriptors.
 
+use std::marker::PhantomData;
+
 use crate::error::{BindGroupError, BufferError};
 use crate::frame_graph::resource::Handle;
 use crate::resource_registry::ResourceRegistry;
+use crate::Renderer;
 
 /// Buffer usage flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +21,9 @@ pub enum BufferUsage {
     Uniform,
     /// Storage buffer (read-only or read-write)
     Storage { read_only: bool },
+    /// Storage buffer with CPU write access (STORAGE | COPY_DST)
+    /// Use this for buffers that need incremental updates via write_buffer_offset
+    StorageWritable,
     /// Copy source
     CopySrc,
     /// Copy destination
@@ -31,6 +37,9 @@ impl BufferUsage {
             BufferUsage::Index => wgpu::BufferUsages::INDEX,
             BufferUsage::Uniform => wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             BufferUsage::Storage { read_only: _ } => wgpu::BufferUsages::STORAGE,
+            BufferUsage::StorageWritable => {
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+            }
             BufferUsage::CopySrc => wgpu::BufferUsages::COPY_SRC,
             BufferUsage::CopyDst => wgpu::BufferUsages::COPY_DST,
         }
@@ -115,6 +124,202 @@ impl<'a> BufferBuilder<'a> {
         };
 
         Ok(registry.insert(buffer))
+    }
+}
+
+/// A buffer that supports incremental updates with pre-allocated capacity.
+///
+/// DynamicBuffer wraps a GPU buffer with tracking for:
+/// - Element count vs capacity
+/// - Element size for offset calculations
+/// - Efficient partial updates without bind group recreation
+///
+/// The underlying buffer handle remains constant, so bind groups don't need
+/// to be recreated when data is updated.
+#[derive(Debug)]
+pub struct DynamicBuffer<T: bytemuck::Pod> {
+    buffer: Handle<wgpu::Buffer>,
+    capacity: usize,
+    len: usize,
+    element_size: usize,
+    _marker: PhantomData<T>,
+}
+
+impl<T: bytemuck::Pod> DynamicBuffer<T> {
+    /// Returns the underlying buffer handle (for bind groups)
+    pub fn buffer(&self) -> Handle<wgpu::Buffer> {
+        self.buffer
+    }
+
+    /// Current number of elements
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Maximum capacity in elements
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Update element at index
+    pub fn update_at(
+        &self,
+        renderer: &Renderer,
+        registry: &ResourceRegistry,
+        index: usize,
+        element: &T,
+    ) -> Result<(), BufferError> {
+        if index >= self.len {
+            return Err(BufferError::CapacityExceeded {
+                requested: index + 1,
+                capacity: self.len,
+            });
+        }
+        let offset = (index * self.element_size) as u64;
+        renderer.write_buffer_offset(self.buffer, offset, std::slice::from_ref(element), registry)
+    }
+
+    /// Update range of elements starting at index
+    pub fn update_range(
+        &mut self,
+        renderer: &Renderer,
+        registry: &ResourceRegistry,
+        start_index: usize,
+        elements: &[T],
+    ) -> Result<(), BufferError> {
+        let end_index = start_index + elements.len();
+        if end_index > self.capacity {
+            return Err(BufferError::CapacityExceeded {
+                requested: end_index,
+                capacity: self.capacity,
+            });
+        }
+        let offset = (start_index * self.element_size) as u64;
+        renderer.write_buffer_offset(self.buffer, offset, elements, registry)?;
+        // Extend len if we wrote past current end
+        if end_index > self.len {
+            self.len = end_index;
+        }
+        Ok(())
+    }
+
+    /// Push elements to the end, returns start index
+    pub fn push(
+        &mut self,
+        renderer: &Renderer,
+        registry: &ResourceRegistry,
+        elements: &[T],
+    ) -> Result<usize, BufferError> {
+        let start_index = self.len;
+        self.update_range(renderer, registry, start_index, elements)?;
+        Ok(start_index)
+    }
+
+    /// Clear (logical only, doesn't zero memory)
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Set length (for cases where GPU compute modified data)
+    pub fn set_len(&mut self, len: usize) -> Result<(), BufferError> {
+        if len > self.capacity {
+            return Err(BufferError::CapacityExceeded {
+                requested: len,
+                capacity: self.capacity,
+            });
+        }
+        self.len = len;
+        Ok(())
+    }
+}
+
+/// Builder for creating DynamicBuffer instances
+pub struct DynamicBufferBuilder<'a, T: bytemuck::Pod> {
+    device: &'a wgpu::Device,
+    label: Option<String>,
+    capacity: Option<usize>,
+    initial_data: Option<&'a [T]>,
+    _marker: PhantomData<T>,
+}
+
+impl<'a, T: bytemuck::Pod> DynamicBufferBuilder<'a, T> {
+    pub(crate) fn new(device: &'a wgpu::Device) -> Self {
+        Self {
+            device,
+            label: None,
+            capacity: None,
+            initial_data: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Set the buffer label
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Set maximum capacity (number of elements)
+    pub fn capacity(mut self, capacity: usize) -> Self {
+        self.capacity = Some(capacity);
+        self
+    }
+
+    /// Initialize with data (capacity defaults to data.len() if not set)
+    pub fn with_data(mut self, data: &'a [T]) -> Self {
+        self.initial_data = Some(data);
+        self
+    }
+
+    /// Build the DynamicBuffer and register it
+    pub fn build(self, registry: &mut ResourceRegistry) -> Result<DynamicBuffer<T>, BufferError> {
+        use wgpu::util::DeviceExt;
+
+        let element_size = std::mem::size_of::<T>();
+
+        let (capacity, initial_len) = match (self.capacity, self.initial_data) {
+            (Some(cap), Some(data)) => (cap.max(data.len()), data.len()),
+            (Some(cap), None) => (cap, 0),
+            (None, Some(data)) => (data.len(), data.len()),
+            (None, None) => return Err(BufferError::MissingSizeOrData),
+        };
+
+        let buffer_size = (capacity * element_size) as u64;
+
+        let buffer = if let Some(data) = self.initial_data {
+            // Create with initial data, but allocate full capacity
+            let mut padded = bytemuck::cast_slice::<T, u8>(data).to_vec();
+            padded.resize(buffer_size as usize, 0);
+
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: self.label.as_deref(),
+                    contents: &padded,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                })
+        } else {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: self.label.as_deref(),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+
+        let handle = registry.insert(buffer);
+
+        Ok(DynamicBuffer {
+            buffer: handle,
+            capacity,
+            len: initial_len,
+            element_size,
+            _marker: PhantomData,
+        })
     }
 }
 
@@ -489,6 +694,17 @@ mod tests {
         assert_eq!(
             BufferUsage::Storage { read_only: true }.to_wgpu(),
             wgpu::BufferUsages::STORAGE
+        );
+        // StorageWritable should have both STORAGE and COPY_DST
+        assert!(
+            BufferUsage::StorageWritable
+                .to_wgpu()
+                .contains(wgpu::BufferUsages::STORAGE)
+        );
+        assert!(
+            BufferUsage::StorageWritable
+                .to_wgpu()
+                .contains(wgpu::BufferUsages::COPY_DST)
         );
     }
 

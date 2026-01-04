@@ -12,22 +12,27 @@ struct VertexOutput {
 // Edge falloff parameters
 // Wider falloff creates smoother blending between triangles
 const EDGE_FALLOFF_START: f32 = 0.0;   // Start fading at edge
-const EDGE_FALLOFF_END: f32 = 0.0;    // Fully opaque at this distance from edge
+const EDGE_FALLOFF_END: f32 = 0.05;    // Fully opaque at this distance from edge
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Compute distance to nearest edge using barycentric coordinates
     // Each barycentric coord represents distance to the opposite edge
     let edge_dist = min(min(input.barycentric.x, input.barycentric.y), input.barycentric.z);
-    
+
     // Smooth falloff using smoothstep - creates C1 continuous blending
     // At edge (edge_dist=0): alpha=0
     // At EDGE_FALLOFF_END: alpha=1 (fully opaque)
     let edge_alpha = smoothstep(EDGE_FALLOFF_START, EDGE_FALLOFF_END, edge_dist);
-    
+
+    // Early discard for nearly transparent pixels
+    if (edge_alpha < 0.01) {
+        discard;
+    }
+
     // Combine with base opacity
     let final_alpha = input.opacity * edge_alpha;
-    
-    // Premultiplied alpha output for better blending
-    return vec4<f32>(input.color * final_alpha, final_alpha);
+
+    // Output with standard alpha blending
+    return vec4<f32>(input.color, final_alpha);
 }

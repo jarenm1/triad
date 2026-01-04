@@ -84,6 +84,18 @@ pub enum BufferError {
     /// Buffer handle not found in registry
     #[error("buffer not found in registry")]
     NotFound,
+
+    /// Buffer write would exceed buffer bounds
+    #[error("invalid buffer offset: offset {offset} + data size {data_size} exceeds buffer size {buffer_size}")]
+    InvalidOffset {
+        offset: u64,
+        data_size: u64,
+        buffer_size: u64,
+    },
+
+    /// DynamicBuffer capacity exceeded
+    #[error("buffer capacity exceeded: requested {requested} elements but capacity is {capacity}")]
+    CapacityExceeded { requested: usize, capacity: usize },
 }
 
 /// Errors that occur during bind group operations.

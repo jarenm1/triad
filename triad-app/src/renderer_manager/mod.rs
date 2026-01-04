@@ -20,13 +20,22 @@ use layer_factory::{
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use tracing::info;
+use std::thread;
+use tracing::{error, info};
 use triad_data::triangulation;
 use triad_gpu::{
-    BufferUsage, CameraUniforms, ExecutableFrameGraph, FrameGraphError, Handle, Renderer,
-    ResourceRegistry, ply_loader, wgpu,
+    BufferUsage, CameraUniforms, ExecutableFrameGraph, FrameGraphError, GaussianPoint, Handle,
+    PointPrimitive, Renderer, ResourceRegistry, TrianglePrimitive, ply_loader, wgpu,
 };
 use triad_window::RendererManager as RendererManagerTrait;
+
+/// Parsed PLY data ready for GPU upload.
+/// This is computed on a background thread to avoid blocking the render loop.
+pub struct ParsedPlyData {
+    pub points: Vec<PointPrimitive>,
+    pub gaussians: Vec<GaussianPoint>,
+    pub triangles: Vec<TrianglePrimitive>,
+}
 
 // Re-export public types
 pub use errors::RendererManagerError;
@@ -77,9 +86,12 @@ pub struct RendererManager {
     surface_width: u32,
     surface_height: u32,
 
-    // PLY loading
+    // PLY loading - path receiver from UI
     ply_receiver: Option<Arc<Mutex<mpsc::Receiver<PathBuf>>>>,
-    pending_ply: Option<PathBuf>,
+    // Parsed data receiver from background thread (wrapped in Mutex for Sync)
+    parsed_data_receiver: Option<Mutex<mpsc::Receiver<ParsedPlyData>>>,
+    // Flag indicating loading is in progress
+    loading_in_progress: bool,
 
     // Frame graph cache - stores cache key and execution order
     // Execution order is cached to avoid expensive topological sort when structure unchanged
@@ -206,7 +218,8 @@ impl RendererManager {
             surface_width,
             surface_height,
             ply_receiver: init_data.ply_receiver,
-            pending_ply: None,
+            parsed_data_receiver: None,
+            loading_in_progress: false,
             frame_graph_cache: None,
         })
     }
@@ -627,16 +640,367 @@ impl RendererManager {
         Ok(())
     }
 
-    /// Check for pending PLY reload requests.
-    pub fn check_pending_ply(&mut self) -> Option<PathBuf> {
+    /// Check for pending PLY path requests and spawn background loading.
+    /// This does NOT block the render thread - loading happens in background.
+    pub fn check_and_start_ply_loading(&mut self) {
+        // Don't start new loading if already in progress
+        if self.loading_in_progress {
+            return;
+        }
+
+        // Check for new PLY path requests
+        let mut new_path = None;
         if let Some(ref receiver) = self.ply_receiver {
-            let receiver = receiver.lock().unwrap();
-            while let Ok(ply_path) = receiver.try_recv() {
-                info!("Received PLY import request: {:?}", ply_path);
-                self.pending_ply = Some(ply_path);
+            if let Ok(receiver) = receiver.lock() {
+                while let Ok(ply_path) = receiver.try_recv() {
+                    info!("Received PLY import request: {:?}", ply_path);
+                    new_path = Some(ply_path);
+                }
             }
         }
-        self.pending_ply.take()
+
+        // Start background loading if we have a new path
+        if let Some(ply_path) = new_path {
+            self.start_background_loading(ply_path);
+        }
+    }
+
+    /// Spawn background thread to parse PLY file.
+    fn start_background_loading(&mut self, ply_path: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        let point_size = self.point_size;
+
+        self.parsed_data_receiver = Some(Mutex::new(rx));
+        self.loading_in_progress = true;
+
+        thread::spawn(move || {
+            info!("Background: Starting PLY parse for {:?}", ply_path);
+
+            let ply_path_str = match ply_path.to_str() {
+                Some(s) => s.to_string(),
+                None => {
+                    error!("Invalid PLY path: {:?}", ply_path);
+                    return;
+                }
+            };
+
+            // Load vertices (used for points and triangulation)
+            let vertices = match ply_loader::load_vertices_from_ply(&ply_path_str) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Failed to load vertices: {}", e);
+                    return;
+                }
+            };
+            info!("Background: Loaded {} vertices", vertices.len());
+
+            // Convert to points
+            let points: Vec<PointPrimitive> = if vertices.is_empty() {
+                vec![PointPrimitive::new(Vec3::ZERO, point_size, Vec3::ZERO, 0.0)]
+            } else {
+                vertices
+                    .iter()
+                    .map(|v| PointPrimitive::new(v.position, point_size, v.color, v.opacity))
+                    .collect()
+            };
+
+            // Load gaussians
+            let gaussians: Vec<GaussianPoint> =
+                match ply_loader::load_gaussians_from_ply(&ply_path_str) {
+                    Ok(g) if !g.is_empty() => g,
+                    _ => vec![GaussianPoint::new(
+                        Vec3::ZERO,
+                        Vec3::ZERO,
+                        0.0,
+                        [0.0, 0.0, 0.0, 1.0],
+                        Vec3::ONE,
+                    )],
+                };
+            info!("Background: Loaded {} gaussians", gaussians.len());
+
+            // Load or generate triangles
+            let triangles: Vec<TrianglePrimitive> =
+                if ply_loader::ply_has_faces(&ply_path_str).unwrap_or(false) {
+                    match ply_loader::load_triangles_from_ply(&ply_path_str) {
+                        Ok(t) if !t.is_empty() => t,
+                        _ => vec![TrianglePrimitive::new(
+                            Vec3::ZERO,
+                            Vec3::new(1.0, 0.0, 0.0),
+                            Vec3::new(0.0, 1.0, 0.0),
+                            Vec3::ZERO,
+                            0.0,
+                        )],
+                    }
+                } else if !vertices.is_empty() {
+                    info!("Background: Starting triangulation...");
+                    let positions: Vec<Vec3> = vertices.iter().map(|v| v.position).collect();
+                    let triangle_indices = triangulation::triangulate_points(&positions);
+                    info!(
+                        "Background: Triangulation complete, {} triangles",
+                        triangle_indices.len()
+                    );
+
+                    triangle_indices
+                        .iter()
+                        .map(|[i0, i1, i2]| {
+                            let v0 = &vertices[*i0];
+                            let v1 = &vertices[*i1];
+                            let v2 = &vertices[*i2];
+                            let avg_color = (v0.color + v1.color + v2.color) / 3.0;
+                            let avg_opacity = (v0.opacity + v1.opacity + v2.opacity) / 3.0;
+                            TrianglePrimitive::new(
+                                v0.position, v1.position, v2.position, avg_color, avg_opacity,
+                            )
+                        })
+                        .collect()
+                } else {
+                    vec![TrianglePrimitive::new(
+                        Vec3::ZERO,
+                        Vec3::new(1.0, 0.0, 0.0),
+                        Vec3::new(0.0, 1.0, 0.0),
+                        Vec3::ZERO,
+                        0.0,
+                    )]
+                };
+
+            info!("Background: PLY parse complete, sending data to main thread");
+            let _ = tx.send(ParsedPlyData {
+                points,
+                gaussians,
+                triangles,
+            });
+        });
+    }
+
+    /// Check for parsed PLY data from background thread and apply to GPU buffers.
+    /// Returns true if data was applied (caller may want to log this).
+    pub fn apply_parsed_ply_data(
+        &mut self,
+        renderer: &Renderer,
+        registry: &mut ResourceRegistry,
+    ) -> bool {
+        // Check if we have parsed data ready
+        let parsed_data = if let Some(ref receiver) = self.parsed_data_receiver {
+            let receiver = receiver.lock().unwrap();
+            match receiver.try_recv() {
+                Ok(data) => Some(data),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Thread finished but didn't send data (error case)
+                    drop(receiver); // Release lock before modifying self
+                    self.loading_in_progress = false;
+                    self.parsed_data_receiver = None;
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+
+        // Apply parsed data if available
+        if let Some(data) = parsed_data {
+            info!("Applying parsed PLY data to GPU buffers");
+            if let Err(e) = self.apply_parsed_data(renderer, registry, data) {
+                error!("Failed to apply parsed PLY data: {}", e);
+            }
+            self.loading_in_progress = false;
+            self.parsed_data_receiver = None;
+            return true;
+        }
+
+        false
+    }
+
+    /// Apply parsed PLY data to GPU buffers (fast - just buffer creation).
+    fn apply_parsed_data(
+        &mut self,
+        renderer: &Renderer,
+        registry: &mut ResourceRegistry,
+        data: ParsedPlyData,
+    ) -> Result<(), errors::RendererManagerError> {
+        // Update point buffer
+        let point_buffer = renderer
+            .create_buffer()
+            .label("Point Buffer")
+            .with_pod_data(&data.points)
+            .usage(BufferUsage::Storage { read_only: true })
+            .build(registry)?;
+
+        let new_point_bind_group = update_layer_bind_group(
+            renderer,
+            registry,
+            "Point",
+            self.point_resources.bind_group_layout,
+            point_buffer,
+            self.camera_buffer,
+        )?;
+
+        self.point_resources.data_buffer = point_buffer;
+        self.point_resources.bind_group = new_point_bind_group;
+        self.point_resources.vertex_count = data.points.len() as u32 * 3;
+
+        // Update gaussian buffer
+        let gaussian_buffer = renderer
+            .create_buffer()
+            .label("Gaussian Buffer")
+            .with_pod_data(&data.gaussians)
+            .usage(BufferUsage::Storage { read_only: true })
+            .build(registry)?;
+
+        let sort_data_size = data.gaussians.len() * std::mem::size_of::<(f32, u32)>();
+        let sort_buffer_handle = renderer
+            .create_buffer()
+            .label("Sort Buffer")
+            .size(sort_data_size as u64)
+            .usage(BufferUsage::Storage { read_only: false })
+            .build(registry)?;
+
+        // Recreate compute bind group
+        let device = renderer.device();
+        let compute_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Gaussian Sort Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let gaussian_buf = registry.get(gaussian_buffer).ok_or_else(|| {
+            errors::RendererManagerError::Resource("Gaussian buffer not found".to_string())
+        })?;
+        let sort_buf = registry.get(sort_buffer_handle).ok_or_else(|| {
+            errors::RendererManagerError::Resource("Sort buffer not found".to_string())
+        })?;
+        let camera_buf = registry.get(self.camera_buffer).ok_or_else(|| {
+            errors::RendererManagerError::Resource("Camera buffer not found".to_string())
+        })?;
+
+        let compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Gaussian Sort Bind Group"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: gaussian_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: sort_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: camera_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let compute_layout = registry.insert(compute_bind_group_layout);
+        let compute_bind_group = registry.insert(compute_bind_group);
+
+        // Update gaussian render bind group
+        let new_gaussian_bind_group = update_layer_bind_group(
+            renderer,
+            registry,
+            "Gaussian",
+            self.gaussian_resources.bind_group_layout,
+            gaussian_buffer,
+            self.camera_buffer,
+        )?;
+
+        // Generate index buffer for gaussians
+        let mut indices = Vec::with_capacity(data.gaussians.len() * 3);
+        for i in 0..data.gaussians.len() as u32 {
+            let base = i * 3;
+            indices.push(base);
+            indices.push(base + 1);
+            indices.push(base + 2);
+        }
+        let index_buffer = renderer
+            .create_buffer()
+            .label("Gaussian Index Buffer")
+            .with_pod_data(&indices)
+            .usage(BufferUsage::Index)
+            .build(registry)?;
+
+        self.gaussian_resources.data_buffer = gaussian_buffer;
+        self.gaussian_resources.index_buffer = Some(index_buffer);
+        self.gaussian_resources.index_count = data.gaussians.len() as u32 * 3;
+        self.gaussian_resources.bind_group = new_gaussian_bind_group;
+
+        self.gaussian_compute.sort_buffer = sort_buffer_handle;
+        self.gaussian_compute.sort_bind_group = compute_bind_group;
+        self.gaussian_compute.sort_bind_group_layout = compute_layout;
+
+        // Update triangle buffer
+        let triangle_buffer = renderer
+            .create_buffer()
+            .label("Triangle Buffer")
+            .with_pod_data(&data.triangles)
+            .usage(BufferUsage::Storage { read_only: true })
+            .build(registry)?;
+
+        let mut tri_indices = Vec::with_capacity(data.triangles.len() * 3);
+        for i in 0..data.triangles.len() as u32 {
+            let base = i * 3;
+            tri_indices.push(base);
+            tri_indices.push(base + 1);
+            tri_indices.push(base + 2);
+        }
+        let tri_index_buffer = renderer
+            .create_buffer()
+            .label("Triangle Index Buffer")
+            .with_pod_data(&tri_indices)
+            .usage(BufferUsage::Index)
+            .build(registry)?;
+
+        let new_triangle_bind_group = update_layer_bind_group(
+            renderer,
+            registry,
+            "Triangle",
+            self.triangle_resources.bind_group_layout,
+            triangle_buffer,
+            self.camera_buffer,
+        )?;
+
+        self.triangle_resources.data_buffer = triangle_buffer;
+        self.triangle_resources.index_buffer = Some(tri_index_buffer);
+        self.triangle_resources.index_count = data.triangles.len() as u32 * 3;
+        self.triangle_resources.bind_group = new_triangle_bind_group;
+
+        Ok(())
+    }
+
+    /// Returns true if PLY loading is currently in progress.
+    pub fn is_loading(&self) -> bool {
+        self.loading_in_progress
     }
 
     /// Resize layer textures when surface is resized.
@@ -724,18 +1088,16 @@ impl RendererManagerTrait for RendererManager {
         self.update_opacity_buffer(queue, registry);
     }
 
-    fn check_pending_ply(&mut self) -> Option<PathBuf> {
-        self.check_pending_ply()
+    fn check_and_start_ply_loading(&mut self) {
+        self.check_and_start_ply_loading();
     }
 
-    fn load_ply(
+    fn apply_parsed_ply_data(
         &mut self,
         renderer: &Renderer,
         registry: &mut ResourceRegistry,
-        ply_path: &PathBuf,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        self.load_ply(renderer, registry, ply_path)
-            .map_err(|e| e.into())
+    ) -> bool {
+        self.apply_parsed_ply_data(renderer, registry)
     }
 
     fn build_frame_graph(
