@@ -1,30 +1,31 @@
-use glam::{EulerRot, Mat4, Quat, Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 
-#[derive(Debug)]
-pub struct Camera {
-    position: Vec3,
-    yaw: f32,
-    pitch: f32,
-    roll: f32,
-}
-
+/// Camera pose representing position and orientation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CameraPose {
+    /// Center/focus point that the camera orbits around.
+    pub center: Vec3,
+    /// Camera position in world space.
     pub position: Vec3,
+    /// Yaw angle in radians (rotation around Y axis).
     pub yaw: f32,
+    /// Pitch angle in radians (rotation around X axis).
     pub pitch: f32,
+    /// Roll angle in radians (rotation around Z axis).
     pub roll: f32,
 }
 
-impl Camera {
-    pub fn new(position: Vec3, target: Vec3) -> Self {
-        let forward = (target - position).normalize_or_zero();
+impl CameraPose {
+    /// Create a new camera pose.
+    pub fn new(position: Vec3, center: Vec3) -> Self {
+        let forward = (center - position).normalize_or_zero();
         let yaw = forward.x.atan2(-forward.z);
         let pitch = forward
             .y
             .asin()
             .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
         Self {
+            center,
             position,
             yaw,
             pitch,
@@ -32,153 +33,127 @@ impl Camera {
         }
     }
 
-    pub fn position(&self) -> Vec3 {
-        self.position
+    /// Orbit around the center point.
+    pub fn orbit_around_center(&mut self, delta: Vec2, sensitivity: f32) {
+        self.yaw -= delta.x * sensitivity;
+        self.pitch = (self.pitch - delta.y * sensitivity).clamp(
+            -std::f32::consts::FRAC_PI_2 + 0.01,
+            std::f32::consts::FRAC_PI_2 - 0.01,
+        );
+
+        // Update position based on new angles
+        let dir = glam::Quat::from_euler(glam::EulerRot::YXZ, self.yaw, self.pitch, 0.0) * -Vec3::Z;
+        let distance = (self.position - self.center).length();
+        self.position = self.center - dir.normalize() * distance;
     }
 
-    pub fn pose(&self) -> CameraPose {
-        CameraPose {
-            position: self.position,
-            yaw: self.yaw,
-            pitch: self.pitch,
-            roll: self.roll,
+    /// Pan the camera and center together.
+    pub fn pan(&mut self, delta: Vec2, sensitivity: f32) {
+        let right = glam::Quat::from_euler(glam::EulerRot::YXZ, self.yaw, 0.0, 0.0) * Vec3::X;
+        let up = Vec3::Y;
+        let distance = (self.position - self.center).length();
+        let pan = (-delta.x * sensitivity * distance) * right
+            + (delta.y * sensitivity * distance) * up;
+        self.center += pan;
+        self.position += pan;
+    }
+
+    /// Zoom in/out by changing distance to center.
+    pub fn zoom(&mut self, amount: f32) {
+        let direction = (self.position - self.center).normalize_or_zero();
+        let distance = (self.position - self.center).length();
+        let new_distance = (distance + amount).max(0.1).min(1000.0);
+        self.position = self.center + direction * new_distance;
+    }
+}
+
+/// Camera that manages position and view matrix.
+pub struct Camera {
+    pose: CameraPose,
+}
+
+impl Camera {
+    /// Creates a camera at the given position looking at the center.
+    pub fn new(position: Vec3, center: Vec3) -> Self {
+        Self {
+            pose: CameraPose::new(position, center),
         }
     }
 
+    /// Get the current pose.
+    pub fn pose(&self) -> CameraPose {
+        self.pose
+    }
+
+    /// Apply a pose to the camera.
     pub fn apply_pose(&mut self, pose: &CameraPose) {
-        self.position = pose.position;
-        self.yaw = pose.yaw;
-        self.pitch = pose.pitch;
-        self.roll = pose.roll;
+        self.pose = *pose;
     }
 
-    pub fn set_position(&mut self, position: Vec3) {
-        self.position = position;
+    /// Get the camera position.
+    pub fn position(&self) -> Vec3 {
+        self.pose.position
     }
 
-    pub fn look_at(&mut self, target: Vec3) {
-        let forward = (target - self.position).normalize_or_zero();
-        self.yaw = forward.x.atan2(-forward.z);
-        self.pitch = forward
-            .y
-            .asin()
-            .clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
-        // Reset roll to keep horizon level when tracking a target.
-        self.roll = 0.0;
-    }
-
-    pub fn set_orientation(&mut self, yaw: f32, pitch: f32, roll: f32) {
-        self.yaw = yaw;
-        self.pitch = pitch.clamp(-std::f32::consts::FRAC_PI_2, std::f32::consts::FRAC_PI_2);
-        self.roll = roll;
-    }
-
+    /// Get the view matrix.
     pub fn view_matrix(&self) -> Mat4 {
-        Mat4::look_to_rh(self.position, self.forward(), self.up())
-    }
-
-    pub fn forward(&self) -> Vec3 {
-        (self.orientation() * -Vec3::Z).normalize()
-    }
-
-    pub fn right(&self) -> Vec3 {
-        (self.orientation() * Vec3::X).normalize()
-    }
-
-    pub fn up(&self) -> Vec3 {
-        (self.orientation() * Vec3::Y).normalize()
-    }
-
-    fn orientation(&self) -> Quat {
-        Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, self.roll)
-    }
-
-    pub fn orbit(&mut self, delta: Vec2, sensitivity: f32) {
-        self.yaw -= delta.x * sensitivity;
-        self.pitch = (self.pitch - delta.y * sensitivity).clamp(
-            -std::f32::consts::FRAC_PI_2 + 0.01,
-            std::f32::consts::FRAC_PI_2 - 0.01,
-        );
-    }
-
-    pub fn roll(&mut self, delta: f32, sensitivity: f32) {
-        self.roll = (self.roll - delta * sensitivity) % (std::f32::consts::TAU);
-    }
-
-    pub fn pan(&mut self, delta: Vec2, sensitivity: f32) {
-        let translation =
-            (-delta.x * sensitivity) * self.right() + (delta.y * sensitivity) * self.up();
-        self.position += translation;
-    }
-
-    pub fn dolly(&mut self, amount: f32) {
-        self.position += self.forward() * amount;
+        let forward = (self.pose.center - self.pose.position).normalize_or_zero();
+        let right = forward.cross(Vec3::Y).normalize_or_zero();
+        let up = right.cross(forward).normalize_or_zero();
+        Mat4::look_to_rh(self.pose.position, forward, up)
     }
 }
 
-impl CameraPose {
-    pub fn forward(&self) -> Vec3 {
-        (self.orientation() * -Vec3::Z).normalize()
-    }
-
-    pub fn right(&self) -> Vec3 {
-        (self.orientation() * Vec3::X).normalize()
-    }
-
-    pub fn up(&self) -> Vec3 {
-        (self.orientation() * Vec3::Y).normalize()
-    }
-
-    fn orientation(&self) -> Quat {
-        Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, self.roll)
-    }
-
-    pub fn orbit(&mut self, delta: Vec2, sensitivity: f32) {
-        self.yaw -= delta.x * sensitivity;
-        self.pitch = (self.pitch - delta.y * sensitivity).clamp(
-            -std::f32::consts::FRAC_PI_2 + 0.01,
-            std::f32::consts::FRAC_PI_2 - 0.01,
-        );
-    }
-
-    pub fn roll(&mut self, delta: f32, sensitivity: f32) {
-        self.roll = (self.roll - delta * sensitivity) % (std::f32::consts::TAU);
-    }
-
-    pub fn pan(&mut self, delta: Vec2, sensitivity: f32) {
-        let translation =
-            (-delta.x * sensitivity) * self.right() + (delta.y * sensitivity) * self.up();
-        self.position += translation;
-    }
-
-    pub fn dolly(&mut self, amount: f32) {
-        self.position += self.forward() * amount;
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
+/// Projection matrix configuration.
 pub struct Projection {
-    pub fovy: f32,
-    pub aspect: f32,
-    pub znear: f32,
-    pub zfar: f32,
+    width: u32,
+    height: u32,
+    fov: f32,
+    near: f32,
+    far: f32,
 }
 
 impl Projection {
-    pub fn new(width: u32, height: u32, fovy: f32, znear: f32, zfar: f32) -> Self {
+    /// Create a new projection.
+    pub fn new(width: u32, height: u32, fov: f32, near: f32, far: f32) -> Self {
         Self {
-            fovy,
-            aspect: width as f32 / height.max(1) as f32,
-            znear,
-            zfar,
+            width,
+            height,
+            fov,
+            near,
+            far,
         }
     }
 
-    pub fn update_size(&mut self, width: u32, height: u32) {
-        self.aspect = width as f32 / height.max(1) as f32;
+    /// Get the projection matrix.
+    pub fn matrix(&self) -> Mat4 {
+        Mat4::perspective_rh(self.fov, self.width as f32 / self.height as f32, self.near, self.far)
     }
 
-    pub fn matrix(&self) -> Mat4 {
-        Mat4::perspective_rh(self.fovy, self.aspect, self.znear, self.zfar)
+    /// Update the projection size.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
     }
+
+    /// Update the projection size (alias for resize).
+    pub fn update_size(&mut self, width: u32, height: u32) {
+        self.resize(width, height);
+    }
+
+    /// Set the far plane distance.
+    pub fn set_far(&mut self, far: f32) {
+        self.far = far;
+    }
+
+    /// Get the far plane distance.
+    pub fn far(&self) -> f32 {
+        self.far
+    }
+}
+
+/// Trait for camera controllers (legacy - use CameraControl in controls.rs instead).
+pub trait CameraController {
+    fn update() {}
+    fn setup() {}
 }

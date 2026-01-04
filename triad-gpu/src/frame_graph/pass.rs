@@ -61,6 +61,7 @@ pub trait Pass: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ResourceAccess {
     pub handle_id: u64,
+    #[allow(dead_code)]
     pub state: ResourceState,
 }
 

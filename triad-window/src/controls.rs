@@ -66,6 +66,11 @@ impl InputState {
             || self.key_down(PhysicalKey::Code(winit::keyboard::KeyCode::ControlRight))
     }
 
+    pub fn is_shift_pressed(&self) -> bool {
+        self.key_down(PhysicalKey::Code(winit::keyboard::KeyCode::ShiftLeft))
+            || self.key_down(PhysicalKey::Code(winit::keyboard::KeyCode::ShiftRight))
+    }
+
     fn end_frame(&mut self) {
         self.mouse_delta = Vec2::ZERO;
         self.scroll_delta = 0.0;
@@ -159,6 +164,7 @@ pub struct Controls {
     input: InputState,
     controllers: Vec<ControllerEntry>,
     frame_hooks: Vec<Box<dyn FnMut(FrameUpdate<'_>) + Send>>,
+    ui_hooks: Vec<Box<dyn FnMut(&egui::Context) + Send>>,
     reset: Option<CameraPose>,
     single_active: bool,
 }
@@ -175,6 +181,7 @@ impl Controls {
             input: InputState::default(),
             controllers: Vec::new(),
             frame_hooks: Vec::new(),
+            ui_hooks: Vec::new(),
             reset: None,
             single_active: false,
         }
@@ -223,6 +230,22 @@ impl Controls {
     {
         self.frame_hooks.push(Box::new(hook));
         self
+    }
+
+    /// Register a callback to draw egui UI each frame.
+    pub fn on_ui<F>(&mut self, hook: F) -> &mut Self
+    where
+        F: FnMut(&egui::Context) + Send + 'static,
+    {
+        self.ui_hooks.push(Box::new(hook));
+        self
+    }
+
+    /// Run all registered UI hooks (called by the render loop).
+    pub fn run_ui(&mut self, ctx: &egui::Context) {
+        for hook in self.ui_hooks.iter_mut() {
+            hook(ctx);
+        }
     }
 
     /// Request a camera reset that will be applied before the next update.
@@ -315,17 +338,19 @@ fn apply_intent(pose: &mut CameraPose, intent: CameraIntent) {
     }
 }
 
+/// Orbit camera controller with center-point based controls.
+/// 
+/// Controls:
+/// - Left mouse drag: Orbit camera around the center point
+/// - Shift + Left mouse drag: Pan (move center point and camera together)
+/// - Mouse wheel: Zoom in/out (change distance to center)
 #[derive(Debug)]
 pub struct MouseController {
-    rotate_button: MouseButton,
-    pan_button: MouseButton,
-    roll_button: MouseButton,
+    drag_button: MouseButton,
     drag_state: Option<DragState>,
-    rotation_sensitivity: f32,
+    orbit_sensitivity: f32,
     pan_sensitivity: f32,
-    roll_sensitivity: f32,
-    scroll_sensitivity: f32,
-    translate_sensitivity: f32,
+    zoom_sensitivity: f32,
 }
 
 impl MouseController {
@@ -333,8 +358,8 @@ impl MouseController {
         Self::default()
     }
 
-    pub fn rotation_sensitivity(&mut self, value: f32) -> &mut Self {
-        self.rotation_sensitivity = value;
+    pub fn orbit_sensitivity(&mut self, value: f32) -> &mut Self {
+        self.orbit_sensitivity = value;
         self
     }
 
@@ -343,44 +368,45 @@ impl MouseController {
         self
     }
 
-    pub fn roll_sensitivity(&mut self, value: f32) -> &mut Self {
-        self.roll_sensitivity = value;
+    pub fn zoom_sensitivity(&mut self, value: f32) -> &mut Self {
+        self.zoom_sensitivity = value;
         self
+    }
+
+    // Keep old method names as aliases for compatibility
+    pub fn rotation_sensitivity(&mut self, value: f32) -> &mut Self {
+        self.orbit_sensitivity(value)
     }
 
     pub fn scroll_sensitivity(&mut self, value: f32) -> &mut Self {
-        self.scroll_sensitivity = value;
-        self
+        self.zoom_sensitivity(value)
     }
 
-    pub fn translate_sensitivity(&mut self, value: f32) -> &mut Self {
-        self.translate_sensitivity = value;
-        self
+    pub fn roll_sensitivity(&mut self, _value: f32) -> &mut Self {
+        self // No-op, roll not supported in orbit mode
+    }
+
+    pub fn translate_sensitivity(&mut self, _value: f32) -> &mut Self {
+        self // No-op, use pan_sensitivity instead
     }
 }
 
 impl Default for MouseController {
     fn default() -> Self {
         Self {
-            rotate_button: MouseButton::Left,
-            pan_button: MouseButton::Middle,
-            roll_button: MouseButton::Right,
+            drag_button: MouseButton::Left,
             drag_state: None,
-            rotation_sensitivity: 0.005,
-            pan_sensitivity: 0.0025,
-            roll_sensitivity: 0.004,
-            scroll_sensitivity: 0.2,
-            translate_sensitivity: 0.2,
+            orbit_sensitivity: 0.005,
+            pan_sensitivity: 0.002,
+            zoom_sensitivity: 0.15,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum DragMode {
-    Rotate,
+    Orbit,
     Pan,
-    Roll,
-    Translate,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -399,38 +425,21 @@ impl CameraControl for MouseController {
     fn handle_event(&mut self, event: &WindowEvent, input: &mut InputState) -> bool {
         match event {
             WindowEvent::MouseInput { state, button, .. } => {
-                if *state == ElementState::Pressed {
-                    let mode = if *button == self.rotate_button {
-                        Some(DragMode::Rotate)
-                    } else if *button == self.pan_button {
-                        Some(DragMode::Pan)
-                    } else if *button == self.roll_button && !input.is_ctrl_pressed() {
-                        Some(DragMode::Roll)
-                    } else if *button == self.roll_button && input.is_ctrl_pressed() {
-                        Some(DragMode::Translate)
+                if *state == ElementState::Pressed && *button == self.drag_button {
+                    // Shift + drag = Pan, otherwise Orbit
+                    let mode = if input.is_shift_pressed() {
+                        DragMode::Pan
                     } else {
-                        None
+                        DragMode::Orbit
                     };
-
-                    if let Some(mode) = mode {
-                        let start = input.mouse_position();
-                        self.drag_state = Some(DragState::new(mode, start));
+                    let start = input.mouse_position();
+                    self.drag_state = Some(DragState::new(mode, start));
+                    return true;
+                } else if *state == ElementState::Released && *button == self.drag_button {
+                    if self.drag_state.is_some() {
+                        self.drag_state = None;
                         return true;
                     }
-                } else if self
-                    .drag_state
-                    .as_ref()
-                    .map(|state| match (state.mode, button) {
-                        (DragMode::Rotate, btn) if *btn == self.rotate_button => true,
-                        (DragMode::Pan, btn) if *btn == self.pan_button => true,
-                        (DragMode::Roll, btn) if *btn == self.roll_button => true,
-                        (DragMode::Translate, btn) if *btn == self.roll_button => true,
-                        _ => false,
-                    })
-                    .unwrap_or(false)
-                {
-                    self.drag_state = None;
-                    return true;
                 }
                 false
             }
@@ -447,24 +456,21 @@ impl CameraControl for MouseController {
         let mut pose = *current;
 
         if let Some(state) = self.drag_state.as_mut() {
+            // Allow switching between orbit and pan mid-drag based on shift key
+            let current_mode = if input.is_shift_pressed() {
+                DragMode::Pan
+            } else {
+                DragMode::Orbit
+            };
+            state.mode = current_mode;
+
             if let Some(current_pos) = input.mouse_position() {
                 if let Some(last) = state.last {
                     let delta = current_pos - last;
                     state.last = Some(current_pos);
                     match state.mode {
-                        DragMode::Rotate => pose.orbit(delta, self.rotation_sensitivity),
+                        DragMode::Orbit => pose.orbit_around_center(delta, self.orbit_sensitivity),
                         DragMode::Pan => pose.pan(delta, self.pan_sensitivity),
-                        DragMode::Roll => {
-                            pose.roll(delta.x, self.roll_sensitivity);
-                            pose.dolly(-delta.y * self.scroll_sensitivity * 0.1);
-                        }
-                        DragMode::Translate => {
-                            let forward = pose.forward();
-                            let right = pose.right();
-                            let translation = (-delta.y * self.translate_sensitivity) * forward
-                                + (-delta.x * self.translate_sensitivity) * right;
-                            pose.position += translation;
-                        }
                     }
                 } else {
                     state.last = Some(current_pos);
@@ -472,9 +478,10 @@ impl CameraControl for MouseController {
             }
         }
 
+        // Mouse wheel for zoom
         let scroll = input.scroll_delta();
         if scroll != 0.0 {
-            pose.dolly(scroll * self.scroll_sensitivity);
+            pose.zoom(scroll * self.zoom_sensitivity);
         }
 
         if pose == *current {

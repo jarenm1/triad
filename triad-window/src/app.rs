@@ -4,8 +4,11 @@ use glam::Vec3;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, info};
-use triad_gpu::{CameraUniforms, Renderer, ResourceRegistry, SurfaceWrapper};
+use tracing::error;
+use triad_gpu::{
+    CameraUniforms, ExecutableFrameGraph, FrameGraphError, Renderer, ResourceRegistry, SurfaceWrapper,
+};
+use triad_gpu::wgpu;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -13,164 +16,67 @@ use winit::event_loop::EventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-/// Scene bounds computed from primitive positions.
-#[derive(Debug, Clone)]
-pub struct SceneBounds {
-    pub min: Vec3,
-    pub max: Vec3,
-    pub center: Vec3,
-    pub radius: f32,
+// Re-export egui for use by applications
+pub use egui;
+
+/// Error type for rendering operations.
+#[derive(Debug, thiserror::Error)]
+pub enum RenderError {
+    #[error("Surface error: {0}")]
+    Surface(#[from] triad_gpu::wgpu::SurfaceError),
+    #[error("Frame graph error: {0}")]
+    FrameGraph(#[from] FrameGraphError),
 }
 
-impl SceneBounds {
-    pub fn from_positions<'a>(positions: impl Iterator<Item = Vec3>) -> Self {
-        let mut min = Vec3::splat(f32::MAX);
-        let mut max = Vec3::splat(f32::MIN);
-        let mut count = 0;
-
-        for pos in positions {
-            min = min.min(pos);
-            max = max.max(pos);
-            count += 1;
-        }
-
-        if count == 0 {
-            return Self {
-                min: Vec3::ZERO,
-                max: Vec3::ZERO,
-                center: Vec3::ZERO,
-                radius: 1.0,
-            };
-        }
-
-        let center = (min + max) * 0.5;
-        let radius = (max - min).length().max(1.0);
-        Self {
-            min,
-            max,
-            center,
-            radius,
-        }
-    }
-}
-
-/// Context passed to the render delegate for rendering.
-pub struct RenderContext<'a> {
-    pub color_view: &'a triad_gpu::wgpu::TextureView,
-    pub depth_view: Option<&'a triad_gpu::wgpu::TextureView>,
-}
-
-/// Trait for shader-agnostic rendering. Implement this to render different primitive types.
-pub trait RenderDelegate: Sized {
-    /// Data needed to construct the delegate (e.g., loaded primitives, file path).
-    type InitData;
-
-    /// Create GPU resources for rendering.
-    fn create(
-        renderer: &Renderer,
-        registry: &mut ResourceRegistry,
-        surface_format: triad_gpu::wgpu::TextureFormat,
-        init_data: Self::InitData,
-    ) -> Result<Self, Box<dyn Error>>;
-
-    /// Get the scene bounds for camera positioning.
-    fn bounds(&self) -> &SceneBounds;
-
-    /// Return depth format if depth testing is needed. Default is None (no depth).
-    fn depth_format(&self) -> Option<triad_gpu::wgpu::TextureFormat> {
-        None
-    }
-
-    /// Update GPU resources (e.g., camera uniforms).
-    fn update(
-        &mut self,
-        queue: &triad_gpu::wgpu::Queue,
-        registry: &ResourceRegistry,
-        camera: &CameraUniforms,
-    );
-
-    /// Record render commands.
-    fn render(
-        &self,
-        encoder: &mut triad_gpu::wgpu::CommandEncoder,
-        ctx: RenderContext,
-        registry: &ResourceRegistry,
-    );
-}
-
-/// Run the viewer with a custom render delegate.
-pub fn run_with_delegate<D: RenderDelegate + 'static>(
+/// Run the viewer with renderer initialization data and factory.
+pub fn run_with_renderer_config<F, M>(
     title: &str,
-    init_data: D::InitData,
-) -> Result<(), Box<dyn Error>>
-where
-    D::InitData: 'static,
-{
-    run_with_delegate_config::<D, _>(title, init_data, |_| {})
-}
-
-/// Run the viewer with a custom render delegate and control configuration.
-pub fn run_with_delegate_config<D: RenderDelegate + 'static, F>(
-    title: &str,
-    init_data: D::InitData,
+    init_data: RendererInitData,
     configure_controls: F,
+    create_manager: M,
 ) -> Result<(), Box<dyn Error>>
 where
-    D::InitData: 'static,
     F: FnOnce(&mut Controls),
+    M: FnOnce(RendererInitData, &Renderer, &mut ResourceRegistry, triad_gpu::wgpu::TextureFormat, u32, u32) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>> + Send + 'static,
 {
-    #[cfg(feature = "tracy")]
-    {
-        use tracing_subscriber::Layer;
-        use tracing_subscriber::layer::SubscriberExt;
-        use tracing_subscriber::util::SubscriberInitExt;
-        tracing_subscriber::registry()
-            .with(tracing_tracy::TracyLayer::default())
-            .with(
-                tracing_subscriber::fmt::layer().with_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| "info".into()),
-                ),
-            )
-            .init();
-    }
-
-    #[cfg(not(feature = "tracy"))]
-    {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .with_target(false)
-            .init();
-    }
-
     let event_loop = EventLoop::new().map_err(|e| format!("Failed to create event loop: {e}"))?;
     let mut controls = Controls::default();
     configure_controls(&mut controls);
 
-    let mut app = App::<D>::new(title.to_string(), init_data, controls);
+    let mut app = App::new(title.to_string(), init_data, controls, create_manager);
     let run_result = event_loop.run_app(&mut app);
     let app_result = app.finish();
     run_result?;
     app_result
 }
 
-struct App<D: RenderDelegate> {
+/// Initialization data for renderer.
+pub struct RendererInitData {
+    pub ply_path: Option<std::path::PathBuf>,
+    pub initial_mode: u8, // 0=Points, 1=Gaussians, 2=Triangles
+    pub point_size: f32,
+    pub ply_receiver: Option<std::sync::mpsc::Receiver<std::path::PathBuf>>,
+}
+
+struct App {
     title: String,
-    init_data: Option<D::InitData>,
+    init_data: Option<RendererInitData>,
     controls: Option<Controls>,
-    state: Option<ViewerState<D>>,
+    create_manager: Option<Box<dyn FnOnce(RendererInitData, &Renderer, &mut ResourceRegistry, wgpu::TextureFormat, u32, u32) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>> + Send>>,
+    state: Option<ViewerState>,
     error: Option<String>,
 }
 
-impl<D: RenderDelegate> App<D> {
-    fn new(title: String, init_data: D::InitData, controls: Controls) -> Self {
+impl App {
+    fn new<M>(title: String, init_data: RendererInitData, controls: Controls, create_manager: M) -> Self
+    where
+        M: FnOnce(RendererInitData, &Renderer, &mut ResourceRegistry, wgpu::TextureFormat, u32, u32) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>> + Send + 'static,
+    {
         Self {
             title,
             init_data: Some(init_data),
             controls: Some(controls),
+            create_manager: Some(Box::new(create_manager)),
             state: None,
             error: None,
         }
@@ -185,7 +91,7 @@ impl<D: RenderDelegate> App<D> {
     }
 }
 
-impl<D: RenderDelegate + 'static> ApplicationHandler for App<D> {
+impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
         if self.state.is_some() || self.error.is_some() {
             return;
@@ -193,8 +99,9 @@ impl<D: RenderDelegate + 'static> ApplicationHandler for App<D> {
 
         let init_data = self.init_data.take().expect("init_data already consumed");
         let controls = self.controls.take().expect("controls already consumed");
+        let create_manager = self.create_manager.take().expect("create_manager already consumed");
 
-        match ViewerState::<D>::new(event_loop, &self.title, init_data, controls) {
+        match ViewerState::new(event_loop, &self.title, init_data, controls, create_manager) {
             Ok(state) => self.state = Some(state),
             Err(err) => {
                 error!("Failed to initialize viewer: {err}");
@@ -217,8 +124,14 @@ impl<D: RenderDelegate + 'static> ApplicationHandler for App<D> {
             return;
         }
 
-        if state.handle_window_event(event_loop, &event) {
-            return;
+        // Pass events to egui first
+        let egui_consumed = state.handle_egui_event(&event);
+
+        // Only pass to other handlers if egui didn't want the event
+        if !egui_consumed {
+            if state.handle_window_event(event_loop, &event) {
+                return;
+            }
         }
 
         match event {
@@ -229,13 +142,13 @@ impl<D: RenderDelegate + 'static> ApplicationHandler for App<D> {
                 match state.render() {
                     Ok(()) => {}
                     Err(
-                        triad_gpu::wgpu::SurfaceError::Lost
-                        | triad_gpu::wgpu::SurfaceError::Outdated,
+                        RenderError::Surface(triad_gpu::wgpu::SurfaceError::Lost)
+                        | RenderError::Surface(triad_gpu::wgpu::SurfaceError::Outdated),
                     ) => {
                         let size = state.window.inner_size();
                         state.resize(size);
                     }
-                    Err(triad_gpu::wgpu::SurfaceError::OutOfMemory) => {
+                    Err(RenderError::Surface(triad_gpu::wgpu::SurfaceError::OutOfMemory)) => {
                         error!("GPU Out of Memory - exiting");
                         event_loop.exit();
                     }
@@ -253,26 +166,92 @@ impl<D: RenderDelegate + 'static> ApplicationHandler for App<D> {
     }
 }
 
-struct ViewerState<D: RenderDelegate> {
+struct ViewerState {
     window: Arc<Window>,
     renderer: Renderer,
     surface: SurfaceWrapper,
     registry: ResourceRegistry,
-    delegate: D,
+    renderer_manager: Box<dyn RendererManagerTrait>,
     camera: Camera,
     controls: Controls,
     projection: Projection,
     last_frame: Instant,
     depth_texture: Option<triad_gpu::wgpu::Texture>,
     depth_view: Option<triad_gpu::wgpu::TextureView>,
+    // egui integration
+    egui_ctx: egui::Context,
+    egui_winit: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
 }
 
-impl<D: RenderDelegate> ViewerState<D> {
+/// Trait for renderer managers that can build frame graphs.
+pub trait RendererManager: Send + Sync {
+    fn update_camera(&self, queue: &wgpu::Queue, registry: &ResourceRegistry, camera: &CameraUniforms);
+    fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry);
+    fn check_pending_ply(&mut self) -> Option<std::path::PathBuf>;
+    fn load_ply(&mut self, renderer: &Renderer, registry: &mut ResourceRegistry, ply_path: &std::path::PathBuf) -> Result<(), Box<dyn Error>>;
+    fn build_frame_graph(&mut self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<triad_gpu::ExecutableFrameGraph, triad_gpu::FrameGraphError>;
+    fn resize_textures(&mut self, device: &wgpu::Device, registry: &mut ResourceRegistry, width: u32, height: u32) -> Result<(), Box<dyn Error>>;
+    fn set_layer_opacity(&mut self, layer: u8, opacity: f32);
+    fn get_layer_opacity(&self, layer: u8) -> f32;
+    fn set_layer_enabled(&mut self, layer: u8, enabled: bool);
+    fn is_layer_enabled(&self, layer: u8) -> bool;
+}
+
+/// Trait object for renderer manager
+pub trait RendererManagerTrait: Send + Sync {
+    fn update_camera(&self, queue: &wgpu::Queue, registry: &ResourceRegistry, camera: &CameraUniforms);
+    fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry);
+    fn check_pending_ply(&mut self) -> Option<std::path::PathBuf>;
+    fn load_ply(&mut self, renderer: &Renderer, registry: &mut ResourceRegistry, ply_path: &std::path::PathBuf) -> Result<(), Box<dyn Error>>;
+    fn build_frame_graph(&mut self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<triad_gpu::ExecutableFrameGraph, triad_gpu::FrameGraphError>;
+    fn resize_textures(&mut self, device: &wgpu::Device, registry: &mut ResourceRegistry, width: u32, height: u32) -> Result<(), Box<dyn Error>>;
+    fn set_layer_opacity(&mut self, layer: u8, opacity: f32);
+    fn get_layer_opacity(&self, layer: u8) -> f32;
+    fn set_layer_enabled(&mut self, layer: u8, enabled: bool);
+    fn is_layer_enabled(&self, layer: u8) -> bool;
+}
+
+impl<M: RendererManager> RendererManagerTrait for M {
+    fn update_camera(&self, queue: &wgpu::Queue, registry: &ResourceRegistry, camera: &CameraUniforms) {
+        RendererManager::update_camera(self, queue, registry, camera);
+    }
+    fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry) {
+        RendererManager::update_opacity_buffer(self, queue, registry);
+    }
+    fn check_pending_ply(&mut self) -> Option<std::path::PathBuf> {
+        RendererManager::check_pending_ply(self)
+    }
+    fn load_ply(&mut self, renderer: &Renderer, registry: &mut ResourceRegistry, ply_path: &std::path::PathBuf) -> Result<(), Box<dyn Error>> {
+        RendererManager::load_ply(self, renderer, registry, ply_path)
+    }
+    fn build_frame_graph(&mut self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<ExecutableFrameGraph, FrameGraphError> {
+        RendererManager::build_frame_graph(self, final_view, depth_view)
+    }
+    fn resize_textures(&mut self, device: &wgpu::Device, registry: &mut ResourceRegistry, width: u32, height: u32) -> Result<(), Box<dyn Error>> {
+        RendererManager::resize_textures(self, device, registry, width, height)
+    }
+    fn set_layer_opacity(&mut self, layer: u8, opacity: f32) {
+        RendererManager::set_layer_opacity(self, layer, opacity);
+    }
+    fn get_layer_opacity(&self, layer: u8) -> f32 {
+        RendererManager::get_layer_opacity(self, layer)
+    }
+    fn set_layer_enabled(&mut self, layer: u8, enabled: bool) {
+        RendererManager::set_layer_enabled(self, layer, enabled);
+    }
+    fn is_layer_enabled(&self, layer: u8) -> bool {
+        RendererManager::is_layer_enabled(self, layer)
+    }
+}
+
+impl ViewerState {
     fn new(
         event_loop: &winit::event_loop::ActiveEventLoop,
         title: &str,
-        init_data: D::InitData,
+        init_data: RendererInitData,
         controls: Controls,
+        create_manager: Box<dyn FnOnce(RendererInitData, &Renderer, &mut ResourceRegistry, triad_gpu::wgpu::TextureFormat, u32, u32) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>> + Send>,
     ) -> Result<Self, Box<dyn Error>> {
         let window_attributes = Window::default_attributes()
             .with_title(title)
@@ -287,49 +266,68 @@ impl<D: RenderDelegate> ViewerState<D> {
 
         let mut registry = ResourceRegistry::default();
 
-        let delegate = D::create(&renderer, &mut registry, surface.format(), init_data)?;
-
-        let bounds = delegate.bounds();
-        info!(
-            "Scene bounds: center={:?}, radius={}",
-            bounds.center, bounds.radius
+        // Initialize camera - just use default position (camera renders everything)
+        let camera = Camera::new(
+            Vec3::new(0.0, 0.0, 5.0),
+            Vec3::ZERO,
         );
-
-        let camera_pos = bounds.center + Vec3::new(0.0, 0.0, bounds.radius * 2.5);
-        let camera = Camera::new(camera_pos, bounds.center);
         let projection = Projection::new(
             size.width.max(1),
             size.height.max(1),
             std::f32::consts::FRAC_PI_3,
             0.01,
-            bounds.radius * 10.0,
+            10000.0, // Fixed far plane
         );
 
-        // Create depth texture if delegate needs one
-        let (depth_texture, depth_view) = if let Some(depth_format) = delegate.depth_format() {
-            let (tex, view) = Self::create_depth_texture(
-                renderer.device(),
-                size.width.max(1),
-                size.height.max(1),
-                depth_format,
-            );
-            (Some(tex), Some(view))
-        } else {
-            (None, None)
-        };
+        // Create depth texture
+        let (depth_texture, depth_view) = Self::create_depth_texture(
+            renderer.device(),
+            size.width.max(1),
+            size.height.max(1),
+            triad_gpu::wgpu::TextureFormat::Depth32Float,
+        );
+
+        // Initialize egui
+        let egui_ctx = egui::Context::default();
+        let egui_winit = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            renderer.device(),
+            surface.format(),
+            egui_wgpu::RendererOptions::default(),
+        );
+
+        // Create renderer manager using factory function
+        let renderer_manager = create_manager(
+            init_data,
+            &renderer,
+            &mut registry,
+            surface.format(),
+            size.width.max(1),
+            size.height.max(1),
+        )?;
 
         Ok(Self {
             window,
             renderer,
             surface,
             registry,
-            delegate,
+            renderer_manager,
             camera,
             controls,
             projection,
             last_frame: Instant::now(),
-            depth_texture,
-            depth_view,
+            depth_texture: Some(depth_texture),
+            depth_view: Some(depth_view),
+            egui_ctx,
+            egui_winit,
+            egui_renderer,
         })
     }
 
@@ -356,6 +354,11 @@ impl<D: RenderDelegate> ViewerState<D> {
         });
         let view = texture.create_view(&triad_gpu::wgpu::TextureViewDescriptor::default());
         (texture, view)
+    }
+
+    fn handle_egui_event(&mut self, event: &WindowEvent) -> bool {
+        let response = self.egui_winit.on_window_event(&self.window, event);
+        response.consumed
     }
 
     fn handle_window_event(
@@ -390,20 +393,28 @@ impl<D: RenderDelegate> ViewerState<D> {
         self.surface.reconfigure(self.renderer.device(), config);
         self.projection.update_size(new_size.width, new_size.height);
 
-        // Recreate depth texture if needed
-        if let Some(depth_format) = self.delegate.depth_format() {
-            let (tex, view) = Self::create_depth_texture(
-                self.renderer.device(),
-                new_size.width,
-                new_size.height,
-                depth_format,
-            );
-            self.depth_texture = Some(tex);
-            self.depth_view = Some(view);
+        // Resize layer textures
+        if let Err(e) = self.renderer_manager.resize_textures(
+            self.renderer.device(),
+            &mut self.registry,
+            new_size.width,
+            new_size.height,
+        ) {
+            error!("Failed to resize layer textures: {}", e);
         }
+
+        // Recreate depth texture
+        let (tex, view) = Self::create_depth_texture(
+            self.renderer.device(),
+            new_size.width,
+            new_size.height,
+            triad_gpu::wgpu::TextureFormat::Depth32Float,
+        );
+        self.depth_texture = Some(tex);
+        self.depth_view = Some(view);
     }
 
-    fn render(&mut self) -> Result<(), triad_gpu::wgpu::SurfaceError> {
+    fn render(&mut self) -> Result<(), RenderError> {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -414,29 +425,163 @@ impl<D: RenderDelegate> ViewerState<D> {
         let proj = self.projection.matrix();
         let uniforms = CameraUniforms::from_matrices(view, proj, self.camera.position());
 
-        self.delegate
-            .update(self.renderer.queue(), &self.registry, &uniforms);
+        // Update camera
+        self.renderer_manager.update_camera(
+            self.renderer.queue(),
+            &self.registry,
+            &uniforms,
+        );
+        
+        // Update opacity buffer
+        self.renderer_manager.update_opacity_buffer(
+            self.renderer.queue(),
+            &self.registry,
+        );
+
+        // Check for pending PLY reload
+        if let Some(ply_path) = self.renderer_manager.check_pending_ply() {
+            if let Err(e) = self.renderer_manager.load_ply(
+                &self.renderer,
+                &mut self.registry,
+                &ply_path,
+            ) {
+                error!("Failed to load PLY: {}", e);
+            }
+        }
 
         let surface_texture = self.surface.get_current_texture()?;
-        let surface_view = surface_texture
-            .texture
-            .create_view(&triad_gpu::wgpu::TextureViewDescriptor::default());
+        let surface_view = Arc::new(
+            surface_texture
+                .texture
+                .create_view(&triad_gpu::wgpu::TextureViewDescriptor::default())
+        );
 
-        let device = self.renderer.device();
-        let mut encoder =
-            device.create_command_encoder(&triad_gpu::wgpu::CommandEncoderDescriptor {
-                label: Some("Frame Encoder"),
+        // Build and execute frame graph
+        // Create Arc for depth view - we need to create a new view from the texture
+        let depth_view_arc = self.depth_texture.as_ref().map(|tex| {
+            Arc::new(tex.create_view(&triad_gpu::wgpu::TextureViewDescriptor::default()))
+        });
+        let mut frame_graph = self.renderer_manager.build_frame_graph(
+            surface_view.clone(),
+            depth_view_arc,
+        )?;
+        
+        frame_graph.execute(
+            self.renderer.device(),
+            self.renderer.queue(),
+            &self.registry,
+        );
+
+        // Run egui frame
+        let raw_input = self.egui_winit.take_egui_input(&self.window);
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            self.controls.run_ui(ctx);
+            
+            // Add layer controls UI
+            egui::Window::new("Layers").show(ctx, |ui| {
+                for layer_idx in 0..3 {
+                    ui.horizontal(|ui| {
+                        let mut enabled = self.renderer_manager.is_layer_enabled(layer_idx);
+                        let layer_name = match layer_idx {
+                            0 => "Points",
+                            1 => "Gaussians",
+                            2 => "Triangles",
+                            _ => "Unknown",
+                        };
+                        if ui.checkbox(&mut enabled, layer_name).changed() {
+                            self.renderer_manager.set_layer_enabled(layer_idx, enabled);
+                        }
+                        
+                        if enabled {
+                            let mut opacity = self.renderer_manager.get_layer_opacity(layer_idx);
+                            ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0)
+                                .text("Opacity"));
+                            if (opacity - self.renderer_manager.get_layer_opacity(layer_idx)).abs() > 0.001 {
+                                self.renderer_manager.set_layer_opacity(layer_idx, opacity);
+                            }
+                        }
+                    });
+                }
             });
+        });
 
-        let ctx = RenderContext {
-            color_view: &surface_view,
-            depth_view: self.depth_view.as_ref(),
+        // Handle egui platform output (clipboard, cursor, etc.)
+        self.egui_winit
+            .handle_platform_output(&self.window, full_output.platform_output);
+
+        // Render egui
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.surface.config().width, self.surface.config().height],
+            pixels_per_point: self.window.scale_factor() as f32,
         };
 
-        self.delegate.render(&mut encoder, ctx, &self.registry);
+        let tris = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
 
-        self.renderer.queue().submit(Some(encoder.finish()));
+        for (id, image_delta) in &full_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(self.renderer.device(), self.renderer.queue(), *id, image_delta);
+        }
+
+        // Create separate encoder for egui to work around lifetime requirements
+        let mut egui_encoder =
+            self.renderer.device().create_command_encoder(&triad_gpu::wgpu::CommandEncoderDescriptor {
+                label: Some("egui Encoder"),
+            });
+
+        self.egui_renderer.update_buffers(
+            self.renderer.device(),
+            self.renderer.queue(),
+            &mut egui_encoder,
+            &tris,
+            &screen_descriptor,
+        );
+
+        // Render egui - the render_pass must be dropped before encoder.finish()
+        render_egui(
+            &self.egui_renderer,
+            &mut egui_encoder,
+            &surface_view,
+            &tris,
+            &screen_descriptor,
+        );
+
+        // Free textures that are no longer needed
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        self.renderer.queue().submit(Some(egui_encoder.finish()));
         surface_texture.present();
         Ok(())
     }
+}
+
+/// Helper function to render egui, encapsulating the render pass lifetime
+fn render_egui(
+    renderer: &egui_wgpu::Renderer,
+    encoder: &mut triad_gpu::wgpu::CommandEncoder,
+    view: &triad_gpu::wgpu::TextureView,
+    paint_jobs: &[egui::ClippedPrimitive],
+    screen_descriptor: &egui_wgpu::ScreenDescriptor,
+) {
+    let render_pass = encoder.begin_render_pass(&triad_gpu::wgpu::RenderPassDescriptor {
+        label: Some("egui Render Pass"),
+        color_attachments: &[Some(triad_gpu::wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            ops: triad_gpu::wgpu::Operations {
+                load: triad_gpu::wgpu::LoadOp::Load,
+                store: triad_gpu::wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+    });
+    let mut render_pass = render_pass.forget_lifetime();
+
+    renderer.render(&mut render_pass, paint_jobs, screen_descriptor);
 }

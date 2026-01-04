@@ -8,6 +8,7 @@ use crate::{GaussianPoint, TrianglePrimitive};
 use glam::Vec3;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use serde_ply::PlyReader;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -23,15 +24,6 @@ struct PlyFace {
     vertex_indices: Vec<i32>,
 }
 
-// PLY file structure (needed for load_gaussians_from_ply and load_triangles_from_ply)
-#[derive(Deserialize, Debug)]
-struct PlyFile {
-    #[serde(rename = "vertex")]
-    vertex: Vec<HashMap<String, JsonValue>>,
-    #[serde(default, rename = "face", skip_serializing_if = "Vec::is_empty")]
-    face: Vec<PlyFace>,
-}
-
 /// Load Gaussian points from a PLY file
 /// Supports ASCII and binary PLY formats via serde_ply
 /// For Gaussian splatting, expects: x, y, z, scale_0/1/2, rot_0/1/2/3, red/green/blue, opacity
@@ -45,24 +37,50 @@ pub fn load_gaussians_from_ply(
     let reader = BufReader::new(file);
 
     info!("Parsing PLY file (this may take a while for large files)...");
-    let ply_data: PlyFile = serde_ply::from_reader(reader).map_err(|e| {
-        warn!("Failed to parse PLY file: {}", e);
-        let error_msg = format!("PLY parsing error: {}", e);
-        // Provide helpful hints for common errors
-        if error_msg.contains("missing field") {
-            warn!("Hint: This PLY file may have a different structure than expected.");
-            warn!("Supported fields: x, y, z, [red/green/blue or r/g/b], [scale_*], [rot_* or q*], [opacity/alpha]");
-            warn!("Missing fields will use defaults (light gray color, adaptive scale, identity rotation)");
-        }
-        error_msg
+
+    // Use PlyReader to handle each element type explicitly.
+    // This allows us to skip unknown element types (like multi_texture_vertex)
+    // that would cause errors with the simple from_reader approach.
+    let mut ply_reader = PlyReader::from_reader(reader).map_err(|e| {
+        warn!("Failed to parse PLY header: {}", e);
+        format!("PLY parsing error: {}", e)
     })?;
 
+    let mut vertex_data: Vec<HashMap<String, JsonValue>> = Vec::new();
+
+    // Process each element in the PLY file
+    while let Some(element) = ply_reader.current_element() {
+        let element_name = element.name.clone();
+        let element_count = element.count;
+
+        match element_name.as_str() {
+            "vertex" => {
+                debug!("Reading {} vertices", element_count);
+                vertex_data = ply_reader.next_element().map_err(|e| {
+                    warn!("Failed to parse vertex element: {}", e);
+                    format!("PLY vertex parsing error: {}", e)
+                })?;
+            }
+            _ => {
+                // Skip unknown elements (face, multi_texture_vertex, etc.)
+                debug!(
+                    "Skipping element '{}' ({} items)",
+                    element_name, element_count
+                );
+                let _: Vec<HashMap<String, JsonValue>> =
+                    ply_reader.next_element().map_err(|e| {
+                        warn!("Failed to skip element '{}': {}", element_name, e);
+                        format!("PLY parsing error for '{}': {}", element_name, e)
+                    })?;
+            }
+        }
+    }
+
     info!(
-        "PLY file parsed successfully: {} vertices, {} faces",
-        ply_data.vertex.len(),
-        ply_data.face.len()
+        "PLY file parsed successfully: {} vertices",
+        vertex_data.len()
     );
-    debug!("PLY file has {} vertices", ply_data.vertex.len());
+    debug!("PLY file has {} vertices", vertex_data.len());
 
     // Calculate bounding box for adaptive scaling
     let mut bbox_min = Vec3::new(f32::MAX, f32::MAX, f32::MAX);
@@ -76,7 +94,7 @@ pub fn load_gaussians_from_ply(
         })
     }
 
-    for vertex in &ply_data.vertex {
+    for vertex in &vertex_data {
         if let (Some(x), Some(y), Some(z)) = (
             get_f32_for_bbox(vertex.get("x")),
             get_f32_for_bbox(vertex.get("y")),
@@ -129,7 +147,7 @@ pub fn load_gaussians_from_ply(
         })
     }
 
-    for (i, vertex) in ply_data.vertex.iter().enumerate() {
+    for (i, vertex) in vertex_data.iter().enumerate() {
         // Extract position (required)
         let x = get_f32(vertex.get("x"))
             .ok_or_else(|| format!("Missing 'x' coordinate in PLY file at vertex {}", i))?;
@@ -291,25 +309,61 @@ pub fn load_vertices_from_ply(path: &str) -> Result<Vec<PlyVertex>, Box<dyn std:
 pub fn load_triangles_from_ply(
     path: &str,
 ) -> Result<Vec<TrianglePrimitive>, Box<dyn std::error::Error>> {
-    use std::fs::File;
-    use std::io::BufReader;
-
     debug!("Loading PLY triangles from: {}", path);
     let file = File::open(path)?;
     let reader = BufReader::new(file);
 
-    let ply_data: PlyFile = serde_ply::from_reader(reader).map_err(|e| {
-        warn!("Failed to parse PLY file: {}", e);
+    // Use PlyReader to handle each element type explicitly.
+    let mut ply_reader = PlyReader::from_reader(reader).map_err(|e| {
+        warn!("Failed to parse PLY header: {}", e);
         format!("PLY parsing error: {}", e)
     })?;
 
+    let mut vertex_data: Vec<HashMap<String, JsonValue>> = Vec::new();
+    let mut face_data: Vec<PlyFace> = Vec::new();
+
+    // Process each element in the PLY file
+    while let Some(element) = ply_reader.current_element() {
+        let element_name = element.name.clone();
+        let element_count = element.count;
+
+        match element_name.as_str() {
+            "vertex" => {
+                debug!("Reading {} vertices", element_count);
+                vertex_data = ply_reader.next_element().map_err(|e| {
+                    warn!("Failed to parse vertex element: {}", e);
+                    format!("PLY vertex parsing error: {}", e)
+                })?;
+            }
+            "face" => {
+                debug!("Reading {} faces", element_count);
+                face_data = ply_reader.next_element().map_err(|e| {
+                    warn!("Failed to parse face element: {}", e);
+                    format!("PLY face parsing error: {}", e)
+                })?;
+            }
+            _ => {
+                // Skip unknown elements
+                debug!(
+                    "Skipping element '{}' ({} items)",
+                    element_name, element_count
+                );
+                let _: Vec<HashMap<String, JsonValue>> =
+                    ply_reader.next_element().map_err(|e| {
+                        warn!("Failed to skip element '{}': {}", element_name, e);
+                        format!("PLY parsing error for '{}': {}", element_name, e)
+                    })?;
+            }
+        }
+    }
+
     info!(
         "PLY file parsed: {} vertices, {} faces",
-        ply_data.vertex.len(),
-        ply_data.face.len()
+        vertex_data.len(),
+        face_data.len()
     );
 
-    if ply_data.face.is_empty() {
+    if face_data.is_empty() {
         return Err("PLY file contains no face data. Use triangulation for point clouds.".into());
     }
 
@@ -331,9 +385,9 @@ pub fn load_triangles_from_ply(
         })
     }
 
-    let mut vertices = Vec::with_capacity(ply_data.vertex.len());
+    let mut vertices = Vec::with_capacity(vertex_data.len());
 
-    for (i, vertex) in ply_data.vertex.iter().enumerate() {
+    for (i, vertex) in vertex_data.iter().enumerate() {
         let x = get_f32(vertex.get("x")).ok_or_else(|| format!("Missing 'x' at vertex {}", i))?;
         let y = get_f32(vertex.get("y")).ok_or_else(|| format!("Missing 'y' at vertex {}", i))?;
         let z = get_f32(vertex.get("z")).ok_or_else(|| format!("Missing 'z' at vertex {}", i))?;
@@ -373,7 +427,7 @@ pub fn load_triangles_from_ply(
     // Build triangles from faces
     let mut triangles = Vec::new();
 
-    for (face_idx, face) in ply_data.face.iter().enumerate() {
+    for (face_idx, face) in face_data.iter().enumerate() {
         let indices = &face.vertex_indices;
 
         if indices.len() < 3 {
