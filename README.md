@@ -1,4 +1,6 @@
-# Triad
+<div align="center">
+  <img src="./header.svg" alt="Triad Header" width="800"/>
+</div>
 
 Triangular splatting rendering application for use in realtime SLAM and sim applications.
 
