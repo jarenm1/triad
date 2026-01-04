@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="./header.svg" alt="Triad Header" width="800"/>
+  <img src="./header.svg" alt="Triad Header" width="100%"/>
 </div>
 
 Triangular splatting rendering application for use in realtime SLAM and sim applications.
