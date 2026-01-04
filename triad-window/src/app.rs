@@ -190,7 +190,7 @@ pub trait RendererManager: Send + Sync {
     fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry);
     fn check_pending_ply(&mut self) -> Option<std::path::PathBuf>;
     fn load_ply(&mut self, renderer: &Renderer, registry: &mut ResourceRegistry, ply_path: &std::path::PathBuf) -> Result<(), Box<dyn Error>>;
-    fn build_frame_graph(&self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<triad_gpu::ExecutableFrameGraph, triad_gpu::FrameGraphError>;
+    fn build_frame_graph(&mut self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<triad_gpu::ExecutableFrameGraph, triad_gpu::FrameGraphError>;
     fn resize_textures(&mut self, device: &wgpu::Device, registry: &mut ResourceRegistry, width: u32, height: u32) -> Result<(), Box<dyn Error>>;
     fn set_layer_opacity(&mut self, layer: u8, opacity: f32);
     fn get_layer_opacity(&self, layer: u8) -> f32;
@@ -204,7 +204,7 @@ pub trait RendererManagerTrait: Send + Sync {
     fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry);
     fn check_pending_ply(&mut self) -> Option<std::path::PathBuf>;
     fn load_ply(&mut self, renderer: &Renderer, registry: &mut ResourceRegistry, ply_path: &std::path::PathBuf) -> Result<(), Box<dyn Error>>;
-    fn build_frame_graph(&self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<triad_gpu::ExecutableFrameGraph, triad_gpu::FrameGraphError>;
+    fn build_frame_graph(&mut self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<triad_gpu::ExecutableFrameGraph, triad_gpu::FrameGraphError>;
     fn resize_textures(&mut self, device: &wgpu::Device, registry: &mut ResourceRegistry, width: u32, height: u32) -> Result<(), Box<dyn Error>>;
     fn set_layer_opacity(&mut self, layer: u8, opacity: f32);
     fn get_layer_opacity(&self, layer: u8) -> f32;
@@ -225,7 +225,7 @@ impl<M: RendererManager> RendererManagerTrait for M {
     fn load_ply(&mut self, renderer: &Renderer, registry: &mut ResourceRegistry, ply_path: &std::path::PathBuf) -> Result<(), Box<dyn Error>> {
         RendererManager::load_ply(self, renderer, registry, ply_path)
     }
-    fn build_frame_graph(&self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<ExecutableFrameGraph, FrameGraphError> {
+    fn build_frame_graph(&mut self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<ExecutableFrameGraph, FrameGraphError> {
         RendererManager::build_frame_graph(self, final_view, depth_view)
     }
     fn resize_textures(&mut self, device: &wgpu::Device, registry: &mut ResourceRegistry, width: u32, height: u32) -> Result<(), Box<dyn Error>> {

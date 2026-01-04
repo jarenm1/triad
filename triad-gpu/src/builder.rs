@@ -288,7 +288,7 @@ impl<'a> BindGroupBuilder<'a> {
 
     /// Build the bind group layout and bind group
     pub fn build(
-        mut self,
+        self,
         registry: &mut ResourceRegistry,
     ) -> Result<(Handle<wgpu::BindGroupLayout>, Handle<wgpu::BindGroup>), BindGroupBuildError> {
         if self.entries.is_empty() {

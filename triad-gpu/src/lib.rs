@@ -81,7 +81,7 @@ impl Renderer {
     }
 
     /// Create a buffer builder for constructing GPU buffers
-    pub fn create_buffer(&self) -> BufferBuilder {
+    pub fn create_buffer(&self) -> BufferBuilder<'_> {
         BufferBuilder::new(&self.device)
     }
 

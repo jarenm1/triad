@@ -4,9 +4,7 @@ use crate::layers::LayerMode;
 use crate::renderer_manager::layer_resources::LayerResources;
 use crate::renderer_manager::passes::{GaussianSortPass, GenericRenderPass, LayerBlendPass};
 use std::sync::Arc;
-use triad_gpu::{
-    wgpu, ExecutableFrameGraph, FrameGraph, FrameGraphError, Handle, PassBuilder,
-};
+use triad_gpu::{ExecutableFrameGraph, FrameGraph, FrameGraphError, Handle, PassBuilder, wgpu};
 
 /// Add a Gaussian sort compute pass to the frame graph.
 pub fn add_gaussian_sort_pass(
@@ -66,17 +64,15 @@ pub fn add_layer_pass(
         pass_builder.read(idx_buf);
     }
 
-    frame_graph.add_pass(
-        pass_builder.with_pass(Box::new(GenericRenderPass::new(
-            resources.pipeline,
-            resources.bind_group,
-            resources.index_buffer,
-            resources.index_count,
-            resources.vertex_count,
-            resources.texture_view.clone(),
-            depth_view,
-        ))),
-    );
+    frame_graph.add_pass(pass_builder.with_pass(Box::new(GenericRenderPass::new(
+        resources.pipeline,
+        resources.bind_group,
+        resources.index_buffer,
+        resources.index_count,
+        resources.vertex_count,
+        resources.texture_view.clone(),
+        depth_view,
+    ))));
 }
 
 /// Add blend pass to composite all layers.
@@ -138,6 +134,44 @@ pub fn build_frame_graph(
     final_view: Arc<wgpu::TextureView>,
     depth_view: Option<Arc<wgpu::TextureView>>,
 ) -> Result<ExecutableFrameGraph, FrameGraphError> {
+    build_frame_graph_with_cache(
+        camera_buffer,
+        enabled_layers,
+        layer_opacity,
+        point_resources,
+        gaussian_resources,
+        triangle_resources,
+        gaussian_sort_pipeline,
+        gaussian_sort_bind_group,
+        sort_buffer,
+        blend_pipeline,
+        blend_bind_group,
+        blend_opacity_buffer,
+        final_view,
+        depth_view,
+        None, // No cached order for this public API
+    )
+}
+
+/// Build a complete frame graph with all enabled layers, optionally using cached execution order.
+/// This is the internal version that supports caching.
+pub(crate) fn build_frame_graph_with_cache(
+    camera_buffer: Handle<wgpu::Buffer>,
+    enabled_layers: &[bool; 3],
+    _layer_opacity: &[f32; 3],
+    point_resources: &LayerResources,
+    gaussian_resources: &LayerResources,
+    triangle_resources: &LayerResources,
+    gaussian_sort_pipeline: Option<Handle<wgpu::ComputePipeline>>,
+    gaussian_sort_bind_group: Option<Handle<wgpu::BindGroup>>,
+    sort_buffer: Option<Handle<wgpu::Buffer>>,
+    blend_pipeline: Handle<wgpu::RenderPipeline>,
+    blend_bind_group: Handle<wgpu::BindGroup>,
+    blend_opacity_buffer: Handle<wgpu::Buffer>,
+    final_view: Arc<wgpu::TextureView>,
+    depth_view: Option<Arc<wgpu::TextureView>>,
+    cached_execution_order: Option<&[usize]>,
+) -> Result<ExecutableFrameGraph, FrameGraphError> {
     let mut frame_graph = FrameGraph::default();
 
     // Register shared camera buffer
@@ -181,7 +215,13 @@ pub fn build_frame_graph(
             }
         }
 
-        add_layer_pass(&mut frame_graph, *layer_mode, resources, camera_buffer, depth_view.clone());
+        add_layer_pass(
+            &mut frame_graph,
+            *layer_mode,
+            resources,
+            camera_buffer,
+            depth_view.clone(),
+        );
     }
 
     // Add blend pass to composite all layers
@@ -211,5 +251,5 @@ pub fn build_frame_graph(
         );
     }
 
-    frame_graph.build()
+    frame_graph.build_with_cached_order(cached_execution_order)
 }

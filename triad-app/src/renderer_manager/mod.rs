@@ -11,7 +11,7 @@ mod passes;
 use crate::layers::LayerMode;
 use blend::{create_blend_resources, recreate_blend_bind_group, BlendResources, LayerUniforms};
 use constants::{DEFAULT_OPACITY, LAYER_COUNT};
-use frame_graph_builder::build_frame_graph;
+use frame_graph_builder::build_frame_graph_with_cache;
 use glam::{Mat4, Vec3};
 use layer_factory::{
     create_gaussian_resources, create_point_resources, create_triangle_resources,
@@ -80,6 +80,10 @@ pub struct RendererManager {
     // PLY loading
     ply_receiver: Option<Arc<Mutex<mpsc::Receiver<PathBuf>>>>,
     pending_ply: Option<PathBuf>,
+
+    // Frame graph cache - stores cache key and execution order
+    // Execution order is cached to avoid expensive topological sort when structure unchanged
+    frame_graph_cache: Option<(u8, Vec<usize>)>,
 }
 
 impl RendererManager {
@@ -202,6 +206,7 @@ impl RendererManager {
             surface_height,
             ply_receiver: init_data.ply_receiver,
             pending_ply: None,
+            frame_graph_cache: None,
         })
     }
 
@@ -228,13 +233,48 @@ impl RendererManager {
         }))
     }
 
+    /// Compute cache key from enabled layers state.
+    fn compute_cache_key(&self) -> u8 {
+        let mut key = 0u8;
+        if self.enabled_layers[0] {
+            key |= 1 << 0;
+        }
+        if self.enabled_layers[1] {
+            key |= 1 << 1;
+        }
+        if self.enabled_layers[2] {
+            key |= 1 << 2;
+        }
+        key
+    }
+
     /// Build frame graph with all enabled layers.
+    /// The frame graph structure is cached - the expensive topological sort is skipped
+    /// when layer enable/disable state hasn't changed.
+    /// Note: Views change every frame, so Pass objects are rebuilt each frame,
+    /// but the expensive dependency analysis is cached and reused.
     pub fn build_frame_graph(
-        &self,
+        &mut self,
         final_view: Arc<wgpu::TextureView>,
         depth_view: Option<Arc<wgpu::TextureView>>,
     ) -> Result<ExecutableFrameGraph, FrameGraphError> {
-        build_frame_graph(
+        let cache_key = self.compute_cache_key();
+
+        // Get cached execution order if structure hasn't changed
+        let cached_order = if let Some((cached_key, cached_order)) = &self.frame_graph_cache {
+            if *cached_key == cache_key {
+                Some(cached_order.as_slice())
+            } else {
+                // Structure changed, clear cache
+                self.frame_graph_cache = None;
+                None
+            }
+        } else {
+            None
+        };
+
+        // Build frame graph (will use cached execution order if available)
+        let frame_graph = build_frame_graph_with_cache(
             self.camera_buffer,
             &self.enabled_layers,
             &self.layer_opacity,
@@ -249,7 +289,13 @@ impl RendererManager {
             self.blend_resources.opacity_buffer,
             final_view,
             depth_view,
-        )
+            cached_order,
+        )?;
+
+        // Cache the execution order for next frame
+        self.frame_graph_cache = Some((cache_key, frame_graph.execution_order().to_vec()));
+
+        Ok(frame_graph)
     }
 
     /// Update camera uniforms.
@@ -290,8 +336,11 @@ impl RendererManager {
     }
 
     /// Set layer enabled state.
+    /// This invalidates the frame graph cache since the structure changes.
     pub fn set_layer_enabled(&mut self, layer: LayerMode, enabled: bool) {
         self.enabled_layers[layer as usize] = enabled;
+        // Invalidate cache when layer state changes
+        self.frame_graph_cache = None;
     }
 
     /// Check if layer is enabled.
@@ -686,7 +735,7 @@ impl RendererManagerTrait for RendererManager {
     }
 
     fn build_frame_graph(
-        &self,
+        &mut self,
         final_view: Arc<wgpu::TextureView>,
         depth_view: Option<Arc<wgpu::TextureView>>,
     ) -> Result<ExecutableFrameGraph, FrameGraphError> {

@@ -109,6 +109,7 @@ impl<T> Clone for Handle<T> {
 
 impl<T> Copy for Handle<T> {}
 impl<T: ResourceType> Handle<T> {
+    #[allow(dead_code)]
     pub(crate) fn new(id: u64) -> Self {
         Self {
             id,
