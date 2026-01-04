@@ -41,8 +41,7 @@ pub fn create_blend_resources(
             _padding: 0.0,
         }])
         .usage(triad_gpu::BufferUsage::Uniform)
-        .build(registry)
-        .map_err(|e| RendererManagerError::BufferBuildError(e.to_string()))?;
+        .build(registry)?;
 
     let device = renderer.device();
 

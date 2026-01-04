@@ -9,22 +9,22 @@ mod layer_resources;
 mod passes;
 
 use crate::layers::LayerMode;
-use blend::{create_blend_resources, recreate_blend_bind_group, BlendResources, LayerUniforms};
+use blend::{BlendResources, LayerUniforms, create_blend_resources, recreate_blend_bind_group};
 use constants::{DEFAULT_OPACITY, LAYER_COUNT};
 use frame_graph_builder::build_frame_graph_with_cache;
 use glam::{Mat4, Vec3};
 use layer_factory::{
-    create_gaussian_resources, create_point_resources, create_triangle_resources,
-    update_layer_bind_group, GaussianComputeResources,
+    GaussianComputeResources, create_gaussian_resources, create_point_resources,
+    create_triangle_resources, update_layer_bind_group,
 };
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use tracing::info;
 use triad_data::triangulation;
 use triad_gpu::{
-    wgpu, BufferUsage, CameraUniforms, ExecutableFrameGraph, FrameGraphError, Handle,
-    Renderer, ResourceRegistry, ply_loader,
+    BufferUsage, CameraUniforms, ExecutableFrameGraph, FrameGraphError, Handle, Renderer,
+    ResourceRegistry, ply_loader, wgpu,
 };
 use triad_window::RendererManager as RendererManagerTrait;
 
@@ -105,9 +105,9 @@ impl RendererManager {
 
         // Load vertices if PLY path is provided
         let vertices = if let Some(ref ply_path) = init_data.ply_path {
-            let ply_path_str = ply_path
-                .to_str()
-                .ok_or_else(|| errors::RendererManagerError::ResourceError(format!("Invalid PLY path: {:?}", ply_path)))?;
+            let ply_path_str = ply_path.to_str().ok_or_else(|| {
+                errors::RendererManagerError::Resource(format!("Invalid PLY path: {:?}", ply_path))
+            })?;
             info!("Loading PLY data from {}", ply_path_str);
             ply_loader::load_vertices_from_ply(ply_path_str)?
         } else {
@@ -126,24 +126,25 @@ impl RendererManager {
                 _padding: 0.0,
             }])
             .usage(BufferUsage::Uniform)
-            .build(registry)
-            .map_err(|e| errors::RendererManagerError::BufferBuildError(e.to_string()))?;
+            .build(registry)?;
 
         // Create layer textures
-        let point_texture = create_layer_texture(device, surface_width, surface_height, surface_format);
-        let point_texture_view = Arc::new(point_texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let point_texture =
+            create_layer_texture(device, surface_width, surface_height, surface_format);
+        let point_texture_view =
+            Arc::new(point_texture.create_view(&wgpu::TextureViewDescriptor::default()));
         let point_texture_handle = registry.insert(point_texture);
 
-        let gaussian_texture = create_layer_texture(device, surface_width, surface_height, surface_format);
-        let gaussian_texture_view = Arc::new(
-            gaussian_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-        );
+        let gaussian_texture =
+            create_layer_texture(device, surface_width, surface_height, surface_format);
+        let gaussian_texture_view =
+            Arc::new(gaussian_texture.create_view(&wgpu::TextureViewDescriptor::default()));
         let gaussian_texture_handle = registry.insert(gaussian_texture);
 
-        let triangle_texture = create_layer_texture(device, surface_width, surface_height, surface_format);
-        let triangle_texture_view = Arc::new(
-            triangle_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-        );
+        let triangle_texture =
+            create_layer_texture(device, surface_width, surface_height, surface_format);
+        let triangle_texture_view =
+            Arc::new(triangle_texture.create_view(&wgpu::TextureViewDescriptor::default()));
         let triangle_texture_handle = registry.insert(triangle_texture);
 
         // Create point resources
@@ -310,11 +311,7 @@ impl RendererManager {
     }
 
     /// Update layer opacity buffer.
-    pub fn update_opacity_buffer(
-        &self,
-        queue: &wgpu::Queue,
-        registry: &ResourceRegistry,
-    ) {
+    pub fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry) {
         let opacity_buffer = registry
             .get(self.blend_resources.opacity_buffer)
             .expect("opacity buffer");
@@ -355,9 +352,9 @@ impl RendererManager {
         registry: &mut ResourceRegistry,
         ply_path: &PathBuf,
     ) -> Result<(), errors::RendererManagerError> {
-        let ply_path_str = ply_path
-            .to_str()
-            .ok_or_else(|| errors::RendererManagerError::ResourceError(format!("Invalid PLY path: {:?}", ply_path)))?;
+        let ply_path_str = ply_path.to_str().ok_or_else(|| {
+            errors::RendererManagerError::Resource(format!("Invalid PLY path: {:?}", ply_path))
+        })?;
 
         info!("Loading PLY data from {}", ply_path_str);
         let vertices = ply_loader::load_vertices_from_ply(ply_path_str)?;
@@ -366,7 +363,9 @@ impl RendererManager {
         // Update point buffer
         let mut points: Vec<triad_gpu::PointPrimitive> = vertices
             .iter()
-            .map(|v| triad_gpu::PointPrimitive::new(v.position, self.point_size, v.color, v.opacity))
+            .map(|v| {
+                triad_gpu::PointPrimitive::new(v.position, self.point_size, v.color, v.opacity)
+            })
             .collect();
 
         if points.is_empty() {
@@ -383,8 +382,7 @@ impl RendererManager {
             .label("Point Buffer")
             .with_pod_data(&points)
             .usage(BufferUsage::Storage { read_only: true })
-            .build(registry)
-            .map_err(|e| errors::RendererManagerError::BufferBuildError(e.to_string()))?;
+            .build(registry)?;
 
         // Recreate bind group with new buffer
         let new_bind_group = update_layer_bind_group(
@@ -422,8 +420,7 @@ impl RendererManager {
             .label("Gaussian Buffer")
             .with_pod_data(&gaussians)
             .usage(BufferUsage::Storage { read_only: true })
-            .build(registry)
-            .map_err(|e| errors::RendererManagerError::BufferBuildError(e.to_string()))?;
+            .build(registry)?;
 
         // Update sort buffer size if needed
         let sort_data_size = gaussians.len() * std::mem::size_of::<(f32, u32)>();
@@ -432,68 +429,79 @@ impl RendererManager {
             .label("Sort Buffer")
             .size(sort_data_size as u64)
             .usage(BufferUsage::Storage { read_only: false })
-            .build(registry)
-            .map_err(|e| errors::RendererManagerError::BufferBuildError(e.to_string()))?;
+            .build(registry)?;
 
         // Recreate compute bind group manually (builder has borrow issues)
         let device = renderer.device();
-        let compute_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Gaussian Sort Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let compute_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Gaussian Sort Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
         let compute_layout = registry.insert(compute_bind_group_layout);
 
         let compute_bind_group_inner = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Gaussian Sort Bind Group"),
-            layout: registry.get::<wgpu::BindGroupLayout>(compute_layout).unwrap(),
+            layout: registry
+                .get::<wgpu::BindGroupLayout>(compute_layout)
+                .unwrap(),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: wgpu::BindingResource::Buffer(
-                        registry.get::<wgpu::Buffer>(gaussian_buffer).unwrap().as_entire_buffer_binding(),
+                        registry
+                            .get::<wgpu::Buffer>(gaussian_buffer)
+                            .unwrap()
+                            .as_entire_buffer_binding(),
                     ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Buffer(
-                        registry.get::<wgpu::Buffer>(sort_buffer_handle).unwrap().as_entire_buffer_binding(),
+                        registry
+                            .get::<wgpu::Buffer>(sort_buffer_handle)
+                            .unwrap()
+                            .as_entire_buffer_binding(),
                     ),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Buffer(
-                        registry.get::<wgpu::Buffer>(self.camera_buffer).unwrap().as_entire_buffer_binding(),
+                        registry
+                            .get::<wgpu::Buffer>(self.camera_buffer)
+                            .unwrap()
+                            .as_entire_buffer_binding(),
                     ),
                 },
             ],
@@ -517,8 +525,7 @@ impl RendererManager {
             .label("Gaussian Index Buffer")
             .with_pod_data(&indices)
             .usage(BufferUsage::Index)
-            .build(registry)
-            .map_err(|e| errors::RendererManagerError::BufferBuildError(e.to_string()))?;
+            .build(registry)?;
 
         // Recreate render bind group
         let new_gaussian_bind_group = update_layer_bind_group(
@@ -586,8 +593,7 @@ impl RendererManager {
             .label("Triangle Buffer")
             .with_pod_data(&triangles)
             .usage(BufferUsage::Storage { read_only: true })
-            .build(registry)
-            .map_err(|e| errors::RendererManagerError::BufferBuildError(e.to_string()))?;
+            .build(registry)?;
 
         let mut indices = Vec::with_capacity(triangles.len() * 3);
         for i in 0..triangles.len() as u32 {
@@ -601,8 +607,7 @@ impl RendererManager {
             .label("Triangle Index Buffer")
             .with_pod_data(&indices)
             .usage(BufferUsage::Index)
-            .build(registry)
-            .map_err(|e| errors::RendererManagerError::BufferBuildError(e.to_string()))?;
+            .build(registry)?;
 
         // Recreate triangle bind group
         let new_triangle_bind_group = update_layer_bind_group(
@@ -647,21 +652,20 @@ impl RendererManager {
 
         // Recreate textures
         let point_texture = create_layer_texture(device, width, height, self.surface_format);
-        let point_texture_view = Arc::new(point_texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let point_texture_view =
+            Arc::new(point_texture.create_view(&wgpu::TextureViewDescriptor::default()));
         self.point_resources.texture = registry.insert(point_texture);
         self.point_resources.texture_view = point_texture_view.clone();
 
         let gaussian_texture = create_layer_texture(device, width, height, self.surface_format);
-        let gaussian_texture_view = Arc::new(
-            gaussian_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-        );
+        let gaussian_texture_view =
+            Arc::new(gaussian_texture.create_view(&wgpu::TextureViewDescriptor::default()));
         self.gaussian_resources.texture = registry.insert(gaussian_texture);
         self.gaussian_resources.texture_view = gaussian_texture_view.clone();
 
         let triangle_texture = create_layer_texture(device, width, height, self.surface_format);
-        let triangle_texture_view = Arc::new(
-            triangle_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-        );
+        let triangle_texture_view =
+            Arc::new(triangle_texture.create_view(&wgpu::TextureViewDescriptor::default()));
         self.triangle_resources.texture = registry.insert(triangle_texture);
         self.triangle_resources.texture_view = triangle_texture_view.clone();
 

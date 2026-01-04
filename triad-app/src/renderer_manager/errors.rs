@@ -4,37 +4,37 @@ use thiserror::Error;
 
 /// Errors that can occur in the renderer manager.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum RendererManagerError {
-    #[error("PLY loading error: {0}")]
-    PlyError(String),
+    /// PLY file loading error
+    #[error(transparent)]
+    Ply(#[from] triad_gpu::PlyError),
 
-    #[error("Resource creation error: {0}")]
-    ResourceError(String),
+    /// Resource creation error
+    #[error("resource creation error: {0}")]
+    Resource(String),
 
-    #[error("Invalid layer index: {0}")]
+    /// Invalid layer index
+    #[error("invalid layer index: {0}")]
     InvalidLayerIndex(u8),
 
-    #[error("Buffer build error: {0}")]
-    BufferBuildError(String),
+    /// Buffer operation error
+    #[error(transparent)]
+    Buffer(#[from] triad_gpu::BufferError),
 
-    #[error("Bind group build error: {0}")]
-    BindGroupBuildError(String),
+    /// Bind group operation error
+    #[error(transparent)]
+    BindGroup(#[from] triad_gpu::BindGroupError),
 
-    #[error("Pipeline build error: {0}")]
-    PipelineBuildError(#[from] triad_gpu::PipelineBuildError),
+    /// Pipeline operation error
+    #[error(transparent)]
+    Pipeline(#[from] triad_gpu::PipelineError),
 
-    #[error("Frame graph error: {0}")]
-    FrameGraphError(#[from] triad_gpu::FrameGraphError),
+    /// Frame graph error
+    #[error(transparent)]
+    FrameGraph(#[from] triad_gpu::FrameGraphError),
 
-    #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
-}
-
-// Note: Builder errors are not publicly exported, so we handle them via .map_err() at call sites
-
-// Conversion from Box<dyn Error> for PLY loading errors
-impl From<Box<dyn std::error::Error>> for RendererManagerError {
-    fn from(err: Box<dyn std::error::Error>) -> Self {
-        RendererManagerError::PlyError(err.to_string())
-    }
+    /// IO error
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }

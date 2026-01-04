@@ -1,5 +1,6 @@
 use wgpu::{Instance, SurfaceConfiguration};
 mod builder;
+pub mod error;
 mod frame_graph;
 mod pipeline;
 pub mod ply_loader;
@@ -9,31 +10,19 @@ mod surface;
 mod type_map;
 mod types;
 
+// Re-export all error types at crate root for convenience
+pub use error::{
+    BindGroupError, BufferError, FrameGraphError, GpuError, PipelineError, PlyError,
+    RendererError, Result,
+};
+
 pub use builder::{BindGroupBuilder, BindingType, BufferBuilder, BufferUsage, ShaderStage};
-pub use frame_graph::{ExecutableFrameGraph, FrameGraph, FrameGraphError, Handle, Pass, PassBuilder, PassContext, ResourceType};
-pub use pipeline::{PipelineBuildError, RenderPipelineBuilder};
+pub use frame_graph::{ExecutableFrameGraph, FrameGraph, Handle, Pass, PassBuilder, PassContext, ResourceType};
+pub use pipeline::RenderPipelineBuilder;
 pub use resource_registry::ResourceRegistry;
 pub use surface::SurfaceWrapper;
 pub use types::{CameraUniforms, GaussianPoint, PointPrimitive, TrianglePrimitive};
 pub use wgpu;
-
-#[derive(Debug, thiserror::Error)]
-pub enum RendererError {
-    #[error("Request Adapter Error: {0}")]
-    RequestAdapterError(#[from] wgpu::RequestAdapterError),
-    #[error("Request Device Error: {0}")]
-    RequestDeviceError(#[from] wgpu::RequestDeviceError),
-    #[error("Surface Error: {0}")]
-    SurfaceError(#[from] wgpu::SurfaceError),
-    #[error("Surface Configuration Error: {0}")]
-    SurfaceConfigurationError(String),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum BufferWriteError {
-    #[error("Buffer not found in registry")]
-    BufferNotFound,
-}
 
 pub struct Renderer {
     device: wgpu::Device,
@@ -43,7 +32,7 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub async fn new() -> Result<Self, RendererError> {
+    pub async fn new() -> std::result::Result<Self, RendererError> {
         let instance = Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
 
         let adapter = instance
@@ -96,10 +85,8 @@ impl Renderer {
         buffer: Handle<wgpu::Buffer>,
         data: &[T],
         registry: &ResourceRegistry,
-    ) -> Result<(), BufferWriteError> {
-        let buffer_ref = registry
-            .get(buffer)
-            .ok_or(BufferWriteError::BufferNotFound)?;
+    ) -> std::result::Result<(), BufferError> {
+        let buffer_ref = registry.get(buffer).ok_or(BufferError::NotFound)?;
         self.queue
             .write_buffer(buffer_ref, 0, bytemuck::cast_slice(data));
         Ok(())
@@ -110,22 +97,17 @@ impl Renderer {
         surface: wgpu::Surface<'static>,
         width: u32,
         height: u32,
-    ) -> Result<SurfaceWrapper, RendererError> {
+    ) -> std::result::Result<SurfaceWrapper, RendererError> {
         // Validate width and height are non-zero
         if width == 0 || height == 0 {
-            return Err(RendererError::SurfaceConfigurationError(format!(
-                "Invalid surface dimensions: {}x{}",
-                width, height
-            )));
+            return Err(RendererError::InvalidDimensions { width, height });
         }
 
         let caps = surface.get_capabilities(&self.adapter);
 
         // Check if formats array is empty
         if caps.formats.is_empty() {
-            return Err(RendererError::SurfaceConfigurationError(
-                "No supported surface formats available".to_string(),
-            ));
+            return Err(RendererError::NoSupportedFormats);
         }
 
         let format = caps
@@ -137,16 +119,12 @@ impl Renderer {
 
         // Check if present_modes array is empty
         if caps.present_modes.is_empty() {
-            return Err(RendererError::SurfaceConfigurationError(
-                "No supported present modes available".to_string(),
-            ));
+            return Err(RendererError::NoSupportedPresentModes);
         }
 
         // Check if alpha_modes array is empty
         if caps.alpha_modes.is_empty() {
-            return Err(RendererError::SurfaceConfigurationError(
-                "No supported alpha modes available".to_string(),
-            ));
+            return Err(RendererError::NoSupportedAlphaModes);
         }
 
         let config = SurfaceConfiguration {
@@ -261,9 +239,7 @@ mod tests {
         let data = vec![TestData { value: 42.0 }];
         let result = renderer.write_buffer(fake_handle, &data, &registry);
         assert!(result.is_err());
-        match result.unwrap_err() {
-            BufferWriteError::BufferNotFound => {}
-        }
+        assert!(matches!(result.unwrap_err(), BufferError::NotFound));
     }
 
     #[test]

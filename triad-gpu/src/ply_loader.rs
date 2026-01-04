@@ -4,6 +4,7 @@
 //! types (GaussianPoint, TrianglePrimitive). The actual PLY parsing is handled by
 //! the `triad-data` crate.
 
+use crate::error::PlyError;
 use crate::{GaussianPoint, TrianglePrimitive};
 use glam::Vec3;
 use serde::Deserialize;
@@ -29,9 +30,7 @@ struct PlyFace {
 /// For Gaussian splatting, expects: x, y, z, scale_0/1/2, rot_0/1/2/3, red/green/blue, opacity
 /// For regular point clouds, only requires: x, y, z, red/green/blue
 #[tracing::instrument(skip_all, fields(path = %path))]
-pub fn load_gaussians_from_ply(
-    path: &str,
-) -> Result<Vec<GaussianPoint>, Box<dyn std::error::Error>> {
+pub fn load_gaussians_from_ply(path: &str) -> Result<Vec<GaussianPoint>, PlyError> {
     debug!("Loading PLY file: {}", path);
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -43,7 +42,9 @@ pub fn load_gaussians_from_ply(
     // that would cause errors with the simple from_reader approach.
     let mut ply_reader = PlyReader::from_reader(reader).map_err(|e| {
         warn!("Failed to parse PLY header: {}", e);
-        format!("PLY parsing error: {}", e)
+        PlyError::HeaderParse {
+            message: e.to_string(),
+        }
     })?;
 
     let mut vertex_data: Vec<HashMap<String, JsonValue>> = Vec::new();
@@ -58,7 +59,10 @@ pub fn load_gaussians_from_ply(
                 debug!("Reading {} vertices", element_count);
                 vertex_data = ply_reader.next_element().map_err(|e| {
                     warn!("Failed to parse vertex element: {}", e);
-                    format!("PLY vertex parsing error: {}", e)
+                    PlyError::ElementParse {
+                        element: "vertex".to_string(),
+                        message: e.to_string(),
+                    }
                 })?;
             }
             _ => {
@@ -70,7 +74,10 @@ pub fn load_gaussians_from_ply(
                 let _: Vec<HashMap<String, JsonValue>> =
                     ply_reader.next_element().map_err(|e| {
                         warn!("Failed to skip element '{}': {}", element_name, e);
-                        format!("PLY parsing error for '{}': {}", element_name, e)
+                        PlyError::ElementParse {
+                            element: element_name.clone(),
+                            message: e.to_string(),
+                        }
                     })?;
             }
         }
@@ -149,12 +156,18 @@ pub fn load_gaussians_from_ply(
 
     for (i, vertex) in vertex_data.iter().enumerate() {
         // Extract position (required)
-        let x = get_f32(vertex.get("x"))
-            .ok_or_else(|| format!("Missing 'x' coordinate in PLY file at vertex {}", i))?;
-        let y = get_f32(vertex.get("y"))
-            .ok_or_else(|| format!("Missing 'y' coordinate in PLY file at vertex {}", i))?;
-        let z = get_f32(vertex.get("z"))
-            .ok_or_else(|| format!("Missing 'z' coordinate in PLY file at vertex {}", i))?;
+        let x = get_f32(vertex.get("x")).ok_or(PlyError::MissingProperty {
+            property: "x",
+            vertex_index: i,
+        })?;
+        let y = get_f32(vertex.get("y")).ok_or(PlyError::MissingProperty {
+            property: "y",
+            vertex_index: i,
+        })?;
+        let z = get_f32(vertex.get("z")).ok_or(PlyError::MissingProperty {
+            property: "z",
+            vertex_index: i,
+        })?;
         let position = Vec3::new(x, y, z);
 
         // Parse optional per-axis scale for anisotropic Gaussians.
@@ -298,17 +311,17 @@ pub fn load_gaussians_from_ply(
 /// Returns raw vertex data that can be used for triangulation.
 /// This is a convenience wrapper around `triad_data::load_vertices_from_ply`.
 #[tracing::instrument(skip_all, fields(path = %path))]
-pub fn load_vertices_from_ply(path: &str) -> Result<Vec<PlyVertex>, Box<dyn std::error::Error>> {
-    triad_data::load_vertices_from_ply(path)
+pub fn load_vertices_from_ply(path: &str) -> Result<Vec<PlyVertex>, PlyError> {
+    triad_data::load_vertices_from_ply(path).map_err(|e| PlyError::HeaderParse {
+        message: e.to_string(),
+    })
 }
 
 /// Load triangles from a PLY file that contains face data.
 /// Returns triangles built from vertex positions with averaged vertex colors.
 /// Returns an error if the PLY file has no face data.
 #[tracing::instrument(skip_all, fields(path = %path))]
-pub fn load_triangles_from_ply(
-    path: &str,
-) -> Result<Vec<TrianglePrimitive>, Box<dyn std::error::Error>> {
+pub fn load_triangles_from_ply(path: &str) -> Result<Vec<TrianglePrimitive>, PlyError> {
     debug!("Loading PLY triangles from: {}", path);
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -316,7 +329,9 @@ pub fn load_triangles_from_ply(
     // Use PlyReader to handle each element type explicitly.
     let mut ply_reader = PlyReader::from_reader(reader).map_err(|e| {
         warn!("Failed to parse PLY header: {}", e);
-        format!("PLY parsing error: {}", e)
+        PlyError::HeaderParse {
+            message: e.to_string(),
+        }
     })?;
 
     let mut vertex_data: Vec<HashMap<String, JsonValue>> = Vec::new();
@@ -332,14 +347,20 @@ pub fn load_triangles_from_ply(
                 debug!("Reading {} vertices", element_count);
                 vertex_data = ply_reader.next_element().map_err(|e| {
                     warn!("Failed to parse vertex element: {}", e);
-                    format!("PLY vertex parsing error: {}", e)
+                    PlyError::ElementParse {
+                        element: "vertex".to_string(),
+                        message: e.to_string(),
+                    }
                 })?;
             }
             "face" => {
                 debug!("Reading {} faces", element_count);
                 face_data = ply_reader.next_element().map_err(|e| {
                     warn!("Failed to parse face element: {}", e);
-                    format!("PLY face parsing error: {}", e)
+                    PlyError::ElementParse {
+                        element: "face".to_string(),
+                        message: e.to_string(),
+                    }
                 })?;
             }
             _ => {
@@ -351,7 +372,10 @@ pub fn load_triangles_from_ply(
                 let _: Vec<HashMap<String, JsonValue>> =
                     ply_reader.next_element().map_err(|e| {
                         warn!("Failed to skip element '{}': {}", element_name, e);
-                        format!("PLY parsing error for '{}': {}", element_name, e)
+                        PlyError::ElementParse {
+                            element: element_name.clone(),
+                            message: e.to_string(),
+                        }
                     })?;
             }
         }
@@ -364,7 +388,7 @@ pub fn load_triangles_from_ply(
     );
 
     if face_data.is_empty() {
-        return Err("PLY file contains no face data. Use triangulation for point clouds.".into());
+        return Err(PlyError::NoFaceData);
     }
 
     // Parse vertices first
@@ -388,9 +412,18 @@ pub fn load_triangles_from_ply(
     let mut vertices = Vec::with_capacity(vertex_data.len());
 
     for (i, vertex) in vertex_data.iter().enumerate() {
-        let x = get_f32(vertex.get("x")).ok_or_else(|| format!("Missing 'x' at vertex {}", i))?;
-        let y = get_f32(vertex.get("y")).ok_or_else(|| format!("Missing 'y' at vertex {}", i))?;
-        let z = get_f32(vertex.get("z")).ok_or_else(|| format!("Missing 'z' at vertex {}", i))?;
+        let x = get_f32(vertex.get("x")).ok_or(PlyError::MissingProperty {
+            property: "x",
+            vertex_index: i,
+        })?;
+        let y = get_f32(vertex.get("y")).ok_or(PlyError::MissingProperty {
+            property: "y",
+            vertex_index: i,
+        })?;
+        let z = get_f32(vertex.get("z")).ok_or(PlyError::MissingProperty {
+            property: "z",
+            vertex_index: i,
+        })?;
 
         let color = if let (Some(r), Some(g), Some(b)) = (
             get_u8(vertex.get("red")),
@@ -473,6 +506,8 @@ pub fn load_triangles_from_ply(
 
 /// Check if a PLY file contains face data without fully parsing it.
 /// This is a convenience wrapper around `triad_data::ply_has_faces`.
-pub fn ply_has_faces(path: &str) -> Result<bool, Box<dyn std::error::Error>> {
-    triad_data::ply_has_faces(path)
+pub fn ply_has_faces(path: &str) -> Result<bool, PlyError> {
+    triad_data::ply_has_faces(path).map_err(|e| PlyError::HeaderParse {
+        message: e.to_string(),
+    })
 }

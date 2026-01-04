@@ -157,7 +157,7 @@ pub fn create_point_resources(
         .with_pod_data(&points)
         .usage(BufferUsage::Storage { read_only: true })
         .build(registry)
-        .map_err(|e| RendererManagerError::BufferBuildError(e.to_string()))?;
+        ?;
 
     let (bind_group_layout, bind_group) = create_layer_bind_group(
         renderer,
@@ -222,7 +222,7 @@ pub fn create_triangle_resources(
     } else if let Some(ply_path) = ply_path {
         let ply_path_str = ply_path
             .to_str()
-            .ok_or_else(|| RendererManagerError::ResourceError(format!("Invalid PLY path: {:?}", ply_path)))?;
+            .ok_or_else(|| RendererManagerError::Resource(format!("Invalid PLY path: {:?}", ply_path)))?;
         if ply_loader::ply_has_faces(ply_path_str).unwrap_or(false) {
             tracing::info!("Using face data from PLY");
             ply_loader::load_triangles_from_ply(ply_path_str)?
@@ -269,7 +269,7 @@ pub fn create_triangle_resources(
         .with_pod_data(&triangles)
         .usage(BufferUsage::Storage { read_only: true })
         .build(registry)
-        .map_err(|e| RendererManagerError::BufferBuildError(e.to_string()))?;
+        ?;
 
     let mut indices = Vec::with_capacity(triangles.len() * 3);
     for i in 0..triangles.len() as u32 {
@@ -284,7 +284,7 @@ pub fn create_triangle_resources(
         .with_pod_data(&indices)
         .usage(BufferUsage::Index)
         .build(registry)
-        .map_err(|e| RendererManagerError::BufferBuildError(e.to_string()))?;
+        ?;
 
     let (bind_group_layout, bind_group) = create_layer_bind_group(
         renderer,
@@ -348,7 +348,7 @@ pub fn create_gaussian_resources(
     let mut gaussians = if let Some(ply_path) = ply_path {
         let ply_path_str = ply_path
             .to_str()
-            .ok_or_else(|| RendererManagerError::ResourceError(format!("Invalid PLY path: {:?}", ply_path)))?;
+            .ok_or_else(|| RendererManagerError::Resource(format!("Invalid PLY path: {:?}", ply_path)))?;
         ply_loader::load_gaussians_from_ply(ply_path_str)?
     } else {
         Vec::new()
@@ -370,7 +370,7 @@ pub fn create_gaussian_resources(
         .with_pod_data(&gaussians)
         .usage(BufferUsage::Storage { read_only: true })
         .build(registry)
-        .map_err(|e| RendererManagerError::BufferBuildError(e.to_string()))?;
+        ?;
 
     // Create sort buffer using builder
     let sort_data_size = gaussians.len() * std::mem::size_of::<(f32, u32)>();
@@ -380,7 +380,7 @@ pub fn create_gaussian_resources(
         .size(sort_data_size as u64)
         .usage(BufferUsage::Storage { read_only: false })
         .build(registry)
-        .map_err(|e| RendererManagerError::BufferBuildError(e.to_string()))?;
+        ?;
 
     // Create compute bind group layout and bind group manually (builder has borrow issues)
     let device = renderer.device();
@@ -487,7 +487,7 @@ pub fn create_gaussian_resources(
         .with_pod_data(&indices)
         .usage(BufferUsage::Index)
         .build(registry)
-        .map_err(|e| RendererManagerError::BufferBuildError(e.to_string()))?;
+        ?;
 
     // Create render pipeline
     let (bind_group_layout, bind_group) = create_layer_bind_group(

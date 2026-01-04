@@ -1,3 +1,4 @@
+use crate::error::PipelineError;
 use crate::frame_graph::resource::Handle;
 use crate::resource_registry::ResourceRegistry;
 
@@ -80,16 +81,16 @@ impl<'a> RenderPipelineBuilder<'a> {
     pub fn build(
         self,
         registry: &mut ResourceRegistry,
-    ) -> Result<Handle<wgpu::RenderPipeline>, PipelineBuildError> {
+    ) -> Result<Handle<wgpu::RenderPipeline>, PipelineError> {
         let vertex_handle = self
             .vertex_shader
-            .ok_or(PipelineBuildError::MissingVertexShader)?;
+            .ok_or(PipelineError::MissingVertexShader)?;
         let vertex_shader = registry
             .get(vertex_handle)
-            .ok_or(PipelineBuildError::ShaderNotFound)?;
+            .ok_or(PipelineError::ShaderNotFound)?;
 
         let fragment_shader = if let Some(h) = self.fragment_shader {
-            Some(registry.get(h).ok_or(PipelineBuildError::ShaderNotFound)?)
+            Some(registry.get(h).ok_or(PipelineError::ShaderNotFound)?)
         } else {
             None
         };
@@ -144,14 +145,6 @@ impl<'a> RenderPipelineBuilder<'a> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum PipelineBuildError {
-    #[error("Vertex shader is required")]
-    MissingVertexShader,
-    #[error("Shader module not found in registry")]
-    ShaderNotFound,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,14 +187,13 @@ mod tests {
         let (device, _queue) = create_test_device().block_on();
         let mut registry = ResourceRegistry::default();
 
-        let result = RenderPipelineBuilder::new(&device)
-            .build(&mut registry);
+        let result = RenderPipelineBuilder::new(&device).build(&mut registry);
 
         assert!(result.is_err());
-        match result.unwrap_err() {
-            PipelineBuildError::MissingVertexShader => {}
-            _ => panic!("Expected MissingVertexShader error"),
-        }
+        assert!(matches!(
+            result.unwrap_err(),
+            PipelineError::MissingVertexShader
+        ));
     }
 
     #[test]
@@ -255,10 +247,7 @@ mod tests {
             .build(&mut registry);
 
         assert!(result.is_err());
-        match result.unwrap_err() {
-            PipelineBuildError::ShaderNotFound => {}
-            _ => panic!("Expected ShaderNotFound error"),
-        }
+        assert!(matches!(result.unwrap_err(), PipelineError::ShaderNotFound));
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod execution;
 pub mod pass;
 pub mod resource;
 
+use crate::error::FrameGraphError;
 use crate::frame_graph::pass::PassNode;
 use crate::frame_graph::resource::{ResourceInfo, ResourceState};
 use crate::resource_registry::ResourceRegistry;
@@ -250,12 +251,6 @@ impl ExecutableFrameGraph {
     pub fn execution_order(&self) -> &[usize] {
         &self.execution_order
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum FrameGraphError {
-    #[error("Circular dependency detected in frame graph")]
-    CircularDependency,
 }
 
 #[cfg(test)]

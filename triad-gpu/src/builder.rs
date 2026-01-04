@@ -3,9 +3,9 @@
 //! These builders provide a simpler, more ergonomic API compared to
 //! directly using wgpu descriptors.
 
+use crate::error::{BindGroupError, BufferError};
 use crate::frame_graph::resource::Handle;
 use crate::resource_registry::ResourceRegistry;
-use bytemuck;
 
 /// Buffer usage flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +91,7 @@ impl<'a> BufferBuilder<'a> {
     pub fn build(
         self,
         registry: &mut ResourceRegistry,
-    ) -> Result<Handle<wgpu::Buffer>, BufferBuildError> {
+    ) -> Result<Handle<wgpu::Buffer>, BufferError> {
         use wgpu::util::DeviceExt;
 
         let buffer = if let Some(data) = self.data {
@@ -111,17 +111,11 @@ impl<'a> BufferBuilder<'a> {
                 mapped_at_creation: false,
             })
         } else {
-            return Err(BufferBuildError::MissingSizeOrData);
+            return Err(BufferError::MissingSizeOrData);
         };
 
         Ok(registry.insert(buffer))
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum BufferBuildError {
-    #[error("Buffer must have either size or data")]
-    MissingSizeOrData,
 }
 
 /// Binding type for bind groups
@@ -290,9 +284,9 @@ impl<'a> BindGroupBuilder<'a> {
     pub fn build(
         self,
         registry: &mut ResourceRegistry,
-    ) -> Result<(Handle<wgpu::BindGroupLayout>, Handle<wgpu::BindGroup>), BindGroupBuildError> {
+    ) -> Result<(Handle<wgpu::BindGroupLayout>, Handle<wgpu::BindGroup>), BindGroupError> {
         if self.entries.is_empty() {
-            return Err(BindGroupBuildError::NoEntries);
+            return Err(BindGroupError::NoEntries);
         }
 
         // Create bind group layout
@@ -327,7 +321,7 @@ impl<'a> BindGroupBuilder<'a> {
             let buffer = self
                 .registry
                 .get(*buffer_handle)
-                .ok_or(BindGroupBuildError::ResourceNotFound)?;
+                .ok_or(BindGroupError::ResourceNotFound { binding: *binding })?;
             bind_group_entries.push(wgpu::BindGroupEntry {
                 binding: *binding,
                 resource: buffer.as_entire_binding(),
@@ -339,7 +333,7 @@ impl<'a> BindGroupBuilder<'a> {
             let texture_view = self
                 .registry
                 .get(*texture_view_handle)
-                .ok_or(BindGroupBuildError::ResourceNotFound)?;
+                .ok_or(BindGroupError::ResourceNotFound { binding: *binding })?;
             bind_group_entries.push(wgpu::BindGroupEntry {
                 binding: *binding,
                 resource: wgpu::BindingResource::TextureView(texture_view),
@@ -351,7 +345,7 @@ impl<'a> BindGroupBuilder<'a> {
             let sampler = self
                 .registry
                 .get(*sampler_handle)
-                .ok_or(BindGroupBuildError::ResourceNotFound)?;
+                .ok_or(BindGroupError::ResourceNotFound { binding: *binding })?;
             bind_group_entries.push(wgpu::BindGroupEntry {
                 binding: *binding,
                 resource: wgpu::BindingResource::Sampler(sampler),
@@ -360,25 +354,13 @@ impl<'a> BindGroupBuilder<'a> {
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: self.label.as_deref(),
-            layout: registry
-                .get(layout_handle)
-                .ok_or(BindGroupBuildError::LayoutNotFound)?,
+            layout: registry.get(layout_handle).ok_or(BindGroupError::LayoutNotFound)?,
             entries: &bind_group_entries,
         });
         let bind_group_handle = registry.insert(bind_group);
 
         Ok((layout_handle, bind_group_handle))
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum BindGroupBuildError {
-    #[error("Resource not found in registry")]
-    ResourceNotFound,
-    #[error("No bindings added to bind group")]
-    NoEntries,
-    #[error("Bind group layout not found")]
-    LayoutNotFound,
 }
 
 #[cfg(test)]
@@ -487,9 +469,7 @@ mod tests {
             .build(&mut registry);
 
         assert!(result.is_err());
-        match result.unwrap_err() {
-            BufferBuildError::MissingSizeOrData => {}
-        }
+        assert!(matches!(result.unwrap_err(), BufferError::MissingSizeOrData));
     }
 
     #[test]
@@ -521,10 +501,7 @@ mod tests {
         let result = BindGroupBuilder::new(&device, &registry).build(&mut registry_mut);
 
         assert!(result.is_err());
-        match result.unwrap_err() {
-            BindGroupBuildError::NoEntries => {}
-            _ => panic!("Expected NoEntries error"),
-        }
+        assert!(matches!(result.unwrap_err(), BindGroupError::NoEntries));
     }
 
     // Note: Tests for BindGroupBuilder with actual resources are skipped due to borrow checker
@@ -547,10 +524,10 @@ mod tests {
             .build(&mut registry_mut);
 
         assert!(result.is_err());
-        match result.unwrap_err() {
-            BindGroupBuildError::ResourceNotFound => {}
-            _ => panic!("Expected ResourceNotFound error"),
-        }
+        assert!(matches!(
+            result.unwrap_err(),
+            BindGroupError::ResourceNotFound { binding: 0 }
+        ));
     }
 
     #[test]

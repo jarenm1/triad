@@ -5,10 +5,11 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::error;
-use triad_gpu::{
-    CameraUniforms, ExecutableFrameGraph, FrameGraphError, Renderer, ResourceRegistry, SurfaceWrapper,
-};
 use triad_gpu::wgpu;
+use triad_gpu::{
+    CameraUniforms, ExecutableFrameGraph, FrameGraphError, Renderer, ResourceRegistry,
+    SurfaceWrapper,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -37,7 +38,16 @@ pub fn run_with_renderer_config<F, M>(
 ) -> Result<(), Box<dyn Error>>
 where
     F: FnOnce(&mut Controls),
-    M: FnOnce(RendererInitData, &Renderer, &mut ResourceRegistry, triad_gpu::wgpu::TextureFormat, u32, u32) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>> + Send + 'static,
+    M: FnOnce(
+            RendererInitData,
+            &Renderer,
+            &mut ResourceRegistry,
+            triad_gpu::wgpu::TextureFormat,
+            u32,
+            u32,
+        ) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>>
+        + Send
+        + 'static,
 {
     let event_loop = EventLoop::new().map_err(|e| format!("Failed to create event loop: {e}"))?;
     let mut controls = Controls::default();
@@ -62,15 +72,41 @@ struct App {
     title: String,
     init_data: Option<RendererInitData>,
     controls: Option<Controls>,
-    create_manager: Option<Box<dyn FnOnce(RendererInitData, &Renderer, &mut ResourceRegistry, wgpu::TextureFormat, u32, u32) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>> + Send>>,
+    create_manager: Option<
+        Box<
+            dyn FnOnce(
+                    RendererInitData,
+                    &Renderer,
+                    &mut ResourceRegistry,
+                    wgpu::TextureFormat,
+                    u32,
+                    u32,
+                ) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>>
+                + Send,
+        >,
+    >,
     state: Option<ViewerState>,
     error: Option<String>,
 }
 
 impl App {
-    fn new<M>(title: String, init_data: RendererInitData, controls: Controls, create_manager: M) -> Self
+    fn new<M>(
+        title: String,
+        init_data: RendererInitData,
+        controls: Controls,
+        create_manager: M,
+    ) -> Self
     where
-        M: FnOnce(RendererInitData, &Renderer, &mut ResourceRegistry, wgpu::TextureFormat, u32, u32) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>> + Send + 'static,
+        M: FnOnce(
+                RendererInitData,
+                &Renderer,
+                &mut ResourceRegistry,
+                wgpu::TextureFormat,
+                u32,
+                u32,
+            ) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>>
+            + Send
+            + 'static,
     {
         Self {
             title,
@@ -99,7 +135,10 @@ impl ApplicationHandler for App {
 
         let init_data = self.init_data.take().expect("init_data already consumed");
         let controls = self.controls.take().expect("controls already consumed");
-        let create_manager = self.create_manager.take().expect("create_manager already consumed");
+        let create_manager = self
+            .create_manager
+            .take()
+            .expect("create_manager already consumed");
 
         match ViewerState::new(event_loop, &self.title, init_data, controls, create_manager) {
             Ok(state) => self.state = Some(state),
@@ -186,12 +225,32 @@ struct ViewerState {
 
 /// Trait for renderer managers that can build frame graphs.
 pub trait RendererManager: Send + Sync {
-    fn update_camera(&self, queue: &wgpu::Queue, registry: &ResourceRegistry, camera: &CameraUniforms);
+    fn update_camera(
+        &self,
+        queue: &wgpu::Queue,
+        registry: &ResourceRegistry,
+        camera: &CameraUniforms,
+    );
     fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry);
     fn check_pending_ply(&mut self) -> Option<std::path::PathBuf>;
-    fn load_ply(&mut self, renderer: &Renderer, registry: &mut ResourceRegistry, ply_path: &std::path::PathBuf) -> Result<(), Box<dyn Error>>;
-    fn build_frame_graph(&mut self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<triad_gpu::ExecutableFrameGraph, triad_gpu::FrameGraphError>;
-    fn resize_textures(&mut self, device: &wgpu::Device, registry: &mut ResourceRegistry, width: u32, height: u32) -> Result<(), Box<dyn Error>>;
+    fn load_ply(
+        &mut self,
+        renderer: &Renderer,
+        registry: &mut ResourceRegistry,
+        ply_path: &std::path::PathBuf,
+    ) -> Result<(), Box<dyn Error>>;
+    fn build_frame_graph(
+        &mut self,
+        final_view: Arc<wgpu::TextureView>,
+        depth_view: Option<Arc<wgpu::TextureView>>,
+    ) -> Result<triad_gpu::ExecutableFrameGraph, triad_gpu::FrameGraphError>;
+    fn resize_textures(
+        &mut self,
+        device: &wgpu::Device,
+        registry: &mut ResourceRegistry,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Box<dyn Error>>;
     fn set_layer_opacity(&mut self, layer: u8, opacity: f32);
     fn get_layer_opacity(&self, layer: u8) -> f32;
     fn set_layer_enabled(&mut self, layer: u8, enabled: bool);
@@ -200,12 +259,32 @@ pub trait RendererManager: Send + Sync {
 
 /// Trait object for renderer manager
 pub trait RendererManagerTrait: Send + Sync {
-    fn update_camera(&self, queue: &wgpu::Queue, registry: &ResourceRegistry, camera: &CameraUniforms);
+    fn update_camera(
+        &self,
+        queue: &wgpu::Queue,
+        registry: &ResourceRegistry,
+        camera: &CameraUniforms,
+    );
     fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry);
     fn check_pending_ply(&mut self) -> Option<std::path::PathBuf>;
-    fn load_ply(&mut self, renderer: &Renderer, registry: &mut ResourceRegistry, ply_path: &std::path::PathBuf) -> Result<(), Box<dyn Error>>;
-    fn build_frame_graph(&mut self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<triad_gpu::ExecutableFrameGraph, triad_gpu::FrameGraphError>;
-    fn resize_textures(&mut self, device: &wgpu::Device, registry: &mut ResourceRegistry, width: u32, height: u32) -> Result<(), Box<dyn Error>>;
+    fn load_ply(
+        &mut self,
+        renderer: &Renderer,
+        registry: &mut ResourceRegistry,
+        ply_path: &std::path::PathBuf,
+    ) -> Result<(), Box<dyn Error>>;
+    fn build_frame_graph(
+        &mut self,
+        final_view: Arc<wgpu::TextureView>,
+        depth_view: Option<Arc<wgpu::TextureView>>,
+    ) -> Result<triad_gpu::ExecutableFrameGraph, triad_gpu::FrameGraphError>;
+    fn resize_textures(
+        &mut self,
+        device: &wgpu::Device,
+        registry: &mut ResourceRegistry,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Box<dyn Error>>;
     fn set_layer_opacity(&mut self, layer: u8, opacity: f32);
     fn get_layer_opacity(&self, layer: u8) -> f32;
     fn set_layer_enabled(&mut self, layer: u8, enabled: bool);
@@ -213,7 +292,12 @@ pub trait RendererManagerTrait: Send + Sync {
 }
 
 impl<M: RendererManager> RendererManagerTrait for M {
-    fn update_camera(&self, queue: &wgpu::Queue, registry: &ResourceRegistry, camera: &CameraUniforms) {
+    fn update_camera(
+        &self,
+        queue: &wgpu::Queue,
+        registry: &ResourceRegistry,
+        camera: &CameraUniforms,
+    ) {
         RendererManager::update_camera(self, queue, registry, camera);
     }
     fn update_opacity_buffer(&self, queue: &wgpu::Queue, registry: &ResourceRegistry) {
@@ -222,13 +306,28 @@ impl<M: RendererManager> RendererManagerTrait for M {
     fn check_pending_ply(&mut self) -> Option<std::path::PathBuf> {
         RendererManager::check_pending_ply(self)
     }
-    fn load_ply(&mut self, renderer: &Renderer, registry: &mut ResourceRegistry, ply_path: &std::path::PathBuf) -> Result<(), Box<dyn Error>> {
+    fn load_ply(
+        &mut self,
+        renderer: &Renderer,
+        registry: &mut ResourceRegistry,
+        ply_path: &std::path::PathBuf,
+    ) -> Result<(), Box<dyn Error>> {
         RendererManager::load_ply(self, renderer, registry, ply_path)
     }
-    fn build_frame_graph(&mut self, final_view: Arc<wgpu::TextureView>, depth_view: Option<Arc<wgpu::TextureView>>) -> Result<ExecutableFrameGraph, FrameGraphError> {
+    fn build_frame_graph(
+        &mut self,
+        final_view: Arc<wgpu::TextureView>,
+        depth_view: Option<Arc<wgpu::TextureView>>,
+    ) -> Result<ExecutableFrameGraph, FrameGraphError> {
         RendererManager::build_frame_graph(self, final_view, depth_view)
     }
-    fn resize_textures(&mut self, device: &wgpu::Device, registry: &mut ResourceRegistry, width: u32, height: u32) -> Result<(), Box<dyn Error>> {
+    fn resize_textures(
+        &mut self,
+        device: &wgpu::Device,
+        registry: &mut ResourceRegistry,
+        width: u32,
+        height: u32,
+    ) -> Result<(), Box<dyn Error>> {
         RendererManager::resize_textures(self, device, registry, width, height)
     }
     fn set_layer_opacity(&mut self, layer: u8, opacity: f32) {
@@ -251,7 +350,17 @@ impl ViewerState {
         title: &str,
         init_data: RendererInitData,
         controls: Controls,
-        create_manager: Box<dyn FnOnce(RendererInitData, &Renderer, &mut ResourceRegistry, triad_gpu::wgpu::TextureFormat, u32, u32) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>> + Send>,
+        create_manager: Box<
+            dyn FnOnce(
+                    RendererInitData,
+                    &Renderer,
+                    &mut ResourceRegistry,
+                    triad_gpu::wgpu::TextureFormat,
+                    u32,
+                    u32,
+                ) -> Result<Box<dyn RendererManagerTrait>, Box<dyn Error>>
+                + Send,
+        >,
     ) -> Result<Self, Box<dyn Error>> {
         let window_attributes = Window::default_attributes()
             .with_title(title)
@@ -267,10 +376,7 @@ impl ViewerState {
         let mut registry = ResourceRegistry::default();
 
         // Initialize camera - just use default position (camera renders everything)
-        let camera = Camera::new(
-            Vec3::new(0.0, 0.0, 5.0),
-            Vec3::ZERO,
-        );
+        let camera = Camera::new(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO);
         let projection = Projection::new(
             size.width.max(1),
             size.height.max(1),
@@ -426,25 +532,19 @@ impl ViewerState {
         let uniforms = CameraUniforms::from_matrices(view, proj, self.camera.position());
 
         // Update camera
-        self.renderer_manager.update_camera(
-            self.renderer.queue(),
-            &self.registry,
-            &uniforms,
-        );
-        
+        self.renderer_manager
+            .update_camera(self.renderer.queue(), &self.registry, &uniforms);
+
         // Update opacity buffer
-        self.renderer_manager.update_opacity_buffer(
-            self.renderer.queue(),
-            &self.registry,
-        );
+        self.renderer_manager
+            .update_opacity_buffer(self.renderer.queue(), &self.registry);
 
         // Check for pending PLY reload
         if let Some(ply_path) = self.renderer_manager.check_pending_ply() {
-            if let Err(e) = self.renderer_manager.load_ply(
-                &self.renderer,
-                &mut self.registry,
-                &ply_path,
-            ) {
+            if let Err(e) =
+                self.renderer_manager
+                    .load_ply(&self.renderer, &mut self.registry, &ply_path)
+            {
                 error!("Failed to load PLY: {}", e);
             }
         }
@@ -453,7 +553,7 @@ impl ViewerState {
         let surface_view = Arc::new(
             surface_texture
                 .texture
-                .create_view(&triad_gpu::wgpu::TextureViewDescriptor::default())
+                .create_view(&triad_gpu::wgpu::TextureViewDescriptor::default()),
         );
 
         // Build and execute frame graph
@@ -461,11 +561,10 @@ impl ViewerState {
         let depth_view_arc = self.depth_texture.as_ref().map(|tex| {
             Arc::new(tex.create_view(&triad_gpu::wgpu::TextureViewDescriptor::default()))
         });
-        let mut frame_graph = self.renderer_manager.build_frame_graph(
-            surface_view.clone(),
-            depth_view_arc,
-        )?;
-        
+        let mut frame_graph = self
+            .renderer_manager
+            .build_frame_graph(surface_view.clone(), depth_view_arc)?;
+
         frame_graph.execute(
             self.renderer.device(),
             self.renderer.queue(),
@@ -476,7 +575,7 @@ impl ViewerState {
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             self.controls.run_ui(ctx);
-            
+
             // Add layer controls UI
             egui::Window::new("Layers").show(ctx, |ui| {
                 for layer_idx in 0..3 {
@@ -491,12 +590,13 @@ impl ViewerState {
                         if ui.checkbox(&mut enabled, layer_name).changed() {
                             self.renderer_manager.set_layer_enabled(layer_idx, enabled);
                         }
-                        
+
                         if enabled {
                             let mut opacity = self.renderer_manager.get_layer_opacity(layer_idx);
-                            ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0)
-                                .text("Opacity"));
-                            if (opacity - self.renderer_manager.get_layer_opacity(layer_idx)).abs() > 0.001 {
+                            ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0).text("Opacity"));
+                            if (opacity - self.renderer_manager.get_layer_opacity(layer_idx)).abs()
+                                > 0.001
+                            {
                                 self.renderer_manager.set_layer_opacity(layer_idx, opacity);
                             }
                         }
@@ -520,15 +620,20 @@ impl ViewerState {
             .tessellate(full_output.shapes, full_output.pixels_per_point);
 
         for (id, image_delta) in &full_output.textures_delta.set {
-            self.egui_renderer
-                .update_texture(self.renderer.device(), self.renderer.queue(), *id, image_delta);
+            self.egui_renderer.update_texture(
+                self.renderer.device(),
+                self.renderer.queue(),
+                *id,
+                image_delta,
+            );
         }
 
         // Create separate encoder for egui to work around lifetime requirements
-        let mut egui_encoder =
-            self.renderer.device().create_command_encoder(&triad_gpu::wgpu::CommandEncoderDescriptor {
+        let mut egui_encoder = self.renderer.device().create_command_encoder(
+            &triad_gpu::wgpu::CommandEncoderDescriptor {
                 label: Some("egui Encoder"),
-            });
+            },
+        );
 
         self.egui_renderer.update_buffers(
             self.renderer.device(),
