@@ -189,6 +189,8 @@ impl ExecutableFrameGraph {
         queue: &wgpu::Queue,
         resources: &ResourceRegistry,
     ) {
+        let _span = tracing::info_span!("frame_graph_execute").entered();
+
         let ctx = pass::PassContext {
             device,
             queue,
@@ -202,6 +204,7 @@ impl ExecutableFrameGraph {
         // Execute passes in dependency order and collect command buffers
         for &pass_idx in &self.execution_order {
             let pass = &self.passes[pass_idx];
+            let _pass_span = tracing::info_span!("pass", index = pass_idx).entered();
 
             // Track state transitions (wgpu handles barriers automatically based on usage flags,
             // but we track transitions for validation and documentation)
@@ -238,7 +241,10 @@ impl ExecutableFrameGraph {
         }
 
         // Submit all command buffers in a single batch for optimal performance
-        queue.submit(command_buffers);
+        {
+            let _submit_span = tracing::info_span!("queue_submit").entered();
+            queue.submit(command_buffers);
+        }
     }
 
     pub fn surface_count(&self) -> usize {

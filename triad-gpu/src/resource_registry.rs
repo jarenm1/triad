@@ -50,6 +50,51 @@ impl ResourceRegistry {
             .get_mut::<HashMap<Handle<T>, T>>()
             .and_then(|map| map.remove(&handle))
     }
+
+    /// Calculate total GPU memory usage from buffers
+    pub fn total_buffer_memory(&self) -> u64 {
+        self.storages
+            .get::<HashMap<Handle<wgpu::Buffer>, wgpu::Buffer>>()
+            .map(|map| map.values().map(|buffer| buffer.size()).sum())
+            .unwrap_or(0)
+    }
+
+    /// Calculate total texture memory usage (approximate)
+    pub fn total_texture_memory(&self) -> u64 {
+        self.storages
+            .get::<HashMap<Handle<wgpu::Texture>, wgpu::Texture>>()
+            .map(|map| {
+                map.values()
+                    .map(|texture| {
+                        let size = texture.size();
+                        let format = texture.format();
+                        let bytes_per_pixel = format.block_copy_size(None).unwrap_or(4);
+                        (size.width as u64)
+                            * (size.height as u64)
+                            * (size.depth_or_array_layers as u64)
+                            * (bytes_per_pixel as u64)
+                            * (texture.mip_level_count() as u64)
+                    })
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Get number of buffers in the registry
+    pub fn buffer_count(&self) -> usize {
+        self.storages
+            .get::<HashMap<Handle<wgpu::Buffer>, wgpu::Buffer>>()
+            .map(|map| map.len())
+            .unwrap_or(0)
+    }
+
+    /// Get number of textures in the registry
+    pub fn texture_count(&self) -> usize {
+        self.storages
+            .get::<HashMap<Handle<wgpu::Texture>, wgpu::Texture>>()
+            .map(|map| map.len())
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]

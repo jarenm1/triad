@@ -96,7 +96,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             initial_mode,
             point_size: 0.01,
         })
-        .with_mode_signal(mode_signal.clone());
+        .with_mode_signal(mode_signal.clone())
+        .with_logging(app::LoggingConfig {
+            level: "info".to_string(),
+            enable_tracy: true,
+        });
 
     // Set PLY path if provided
     if let Some(ply_path) = args.ply {

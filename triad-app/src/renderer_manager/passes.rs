@@ -44,6 +44,7 @@ impl Pass for GenericRenderPass {
     }
 
     fn execute(&self, ctx: &PassContext) -> wgpu::CommandBuffer {
+        let _span = tracing::info_span!("GenericRenderPass::execute").entered();
         let mut encoder = ctx.create_command_encoder(Some("Generic Render Encoder"));
 
         let pipeline = ctx
@@ -89,14 +90,17 @@ impl Pass for GenericRenderPass {
         render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
 
-        if self.uses_indices {
-            let index_buffer = ctx
-                .get_buffer(self.index_buffer.unwrap())
-                .expect("index buffer");
-            render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..self.index_count, 0, 0..1);
-        } else {
-            render_pass.draw(0..self.vertex_count, 0..1);
+        {
+            let _span = tracing::info_span!("draw_call").entered();
+            if self.uses_indices {
+                let index_buffer = ctx
+                    .get_buffer(self.index_buffer.unwrap())
+                    .expect("index buffer");
+                render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..self.index_count, 0, 0..1);
+            } else {
+                render_pass.draw(0..self.vertex_count, 0..1);
+            }
         }
 
         drop(render_pass);
@@ -131,6 +135,7 @@ impl Pass for GaussianSortPass {
     }
 
     fn execute(&self, ctx: &PassContext) -> wgpu::CommandBuffer {
+        let _span = tracing::info_span!("GaussianSortPass::execute").entered();
         let mut encoder = ctx.create_command_encoder(Some("Gaussian Sort Encoder"));
 
         let pipeline = ctx
@@ -187,6 +192,7 @@ impl Pass for LayerBlendPass {
     }
 
     fn execute(&self, ctx: &PassContext) -> wgpu::CommandBuffer {
+        let _span = tracing::info_span!("LayerBlendPass::execute").entered();
         let mut encoder = ctx.create_command_encoder(Some("Layer Blend Encoder"));
 
         let pipeline = ctx

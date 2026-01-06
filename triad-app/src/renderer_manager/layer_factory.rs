@@ -214,10 +214,13 @@ pub fn create_triangle_resources(
     texture: Handle<wgpu::Texture>,
     texture_view: Arc<wgpu::TextureView>,
 ) -> Result<LayerResources, RendererManagerError> {
+    let _span = tracing::info_span!("create_triangle_resources").entered();
     use triad_data::triangulation;
     use triad_gpu::ply_loader;
 
-    let mut triangles: Vec<TrianglePrimitive> = if vertices.is_empty() {
+    let mut triangles: Vec<TrianglePrimitive> = {
+        let _span = tracing::info_span!("load_or_triangulate").entered();
+        if vertices.is_empty() {
         Vec::new()
     } else if let Some(ply_path) = ply_path {
         let ply_path_str = ply_path
@@ -229,7 +232,10 @@ pub fn create_triangle_resources(
         } else {
             tracing::info!("Triangulating point cloud");
             let positions: Vec<Vec3> = vertices.iter().map(|v| v.position).collect();
-            let triangle_indices = triangulation::triangulate_points(&positions);
+            let triangle_indices = {
+                let _span = tracing::info_span!("triangulate_points").entered();
+                triangulation::triangulate_points(&positions)
+            };
 
             triangle_indices
                 .iter()
@@ -251,6 +257,7 @@ pub fn create_triangle_resources(
         }
     } else {
         Vec::new()
+    }
     };
 
     if triangles.is_empty() {
@@ -263,13 +270,16 @@ pub fn create_triangle_resources(
         ));
     }
 
-    let triangle_buffer = renderer
-        .create_buffer()
-        .label("Triangle Buffer")
-        .with_pod_data(&triangles)
-        .usage(BufferUsage::Storage { read_only: true })
-        .build(registry)
-        .map_err(|e| RendererManagerError::BufferBuildError(e.to_string()))?;
+    let triangle_buffer = {
+        let _span = tracing::info_span!("create_triangle_buffer").entered();
+        renderer
+            .create_buffer()
+            .label("Triangle Buffer")
+            .with_pod_data(&triangles)
+            .usage(BufferUsage::Storage { read_only: true })
+            .build(registry)
+            .map_err(|e| RendererManagerError::BufferBuildError(e.to_string()))?
+    };
 
     let mut indices = Vec::with_capacity(triangles.len() * 3);
     for i in 0..triangles.len() as u32 {
@@ -278,21 +288,27 @@ pub fn create_triangle_resources(
         indices.push(base + 1);
         indices.push(base + 2);
     }
-    let index_buffer = renderer
-        .create_buffer()
-        .label("Triangle Index Buffer")
-        .with_pod_data(&indices)
-        .usage(BufferUsage::Index)
-        .build(registry)
-        .map_err(|e| RendererManagerError::BufferBuildError(e.to_string()))?;
+    let index_buffer = {
+        let _span = tracing::info_span!("create_index_buffer").entered();
+        renderer
+            .create_buffer()
+            .label("Triangle Index Buffer")
+            .with_pod_data(&indices)
+            .usage(BufferUsage::Index)
+            .build(registry)
+            .map_err(|e| RendererManagerError::BufferBuildError(e.to_string()))?
+    };
 
-    let (bind_group_layout, bind_group) = create_layer_bind_group(
-        renderer,
-        registry,
-        "Triangle",
-        triangle_buffer,
-        camera_buffer,
-    )?;
+    let (bind_group_layout, bind_group) = {
+        let _span = tracing::info_span!("create_bind_group").entered();
+        create_layer_bind_group(
+            renderer,
+            registry,
+            "Triangle",
+            triangle_buffer,
+            camera_buffer,
+        )?
+    };
 
     let config = LayerConfig {
         label: "Triangle",
@@ -302,13 +318,16 @@ pub fn create_triangle_resources(
         blend_state: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
     };
 
-    let pipeline = create_layer_pipeline(
-        renderer.device(),
-        registry,
-        &config,
-        surface_format,
-        bind_group_layout,
-    )?;
+    let pipeline = {
+        let _span = tracing::info_span!("create_pipeline").entered();
+        create_layer_pipeline(
+            renderer.device(),
+            registry,
+            &config,
+            surface_format,
+            bind_group_layout,
+        )?
+    };
 
     Ok(LayerResources::new(
         pipeline,

@@ -17,7 +17,9 @@ serde-ply = "0.2"
 serde_json = "1.0"
 triad-data = { path = "../triad-data" }
 tracing-tracy = { version = "0.11", optional = true }
+wgpu-profiler = "0.19"
 
 [features]
 default = []
 tracy = ["tracing-tracy"]
+profiling = []

@@ -182,6 +182,60 @@ struct ViewerState {
     egui_ctx: egui::Context,
     egui_winit: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    // Performance metrics
+    perf_metrics: PerformanceMetrics,
+}
+
+/// Performance tracking for FPS and frame times
+struct PerformanceMetrics {
+    frame_times: Vec<f32>,
+    max_samples: usize,
+    total_frames: u64,
+}
+
+impl PerformanceMetrics {
+    fn new() -> Self {
+        Self {
+            frame_times: Vec::with_capacity(120),
+            max_samples: 120,
+            total_frames: 0,
+        }
+    }
+
+    fn add_frame_time(&mut self, dt: f32) {
+        if self.frame_times.len() >= self.max_samples {
+            self.frame_times.remove(0);
+        }
+        self.frame_times.push(dt);
+        self.total_frames += 1;
+    }
+
+    fn fps(&self) -> f32 {
+        if self.frame_times.is_empty() {
+            return 0.0;
+        }
+        let avg = self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32;
+        if avg > 0.0 {
+            1.0 / avg
+        } else {
+            0.0
+        }
+    }
+
+    fn avg_frame_time_ms(&self) -> f32 {
+        if self.frame_times.is_empty() {
+            return 0.0;
+        }
+        (self.frame_times.iter().sum::<f32>() / self.frame_times.len() as f32) * 1000.0
+    }
+
+    fn min_frame_time_ms(&self) -> f32 {
+        self.frame_times.iter().copied().fold(f32::INFINITY, f32::min) * 1000.0
+    }
+
+    fn max_frame_time_ms(&self) -> f32 {
+        self.frame_times.iter().copied().fold(0.0, f32::max) * 1000.0
+    }
 }
 
 /// Trait for renderer managers that can build frame graphs.
@@ -328,6 +382,7 @@ impl ViewerState {
             egui_ctx,
             egui_winit,
             egui_renderer,
+            perf_metrics: PerformanceMetrics::new(),
         })
     }
 
@@ -419,6 +474,9 @@ impl ViewerState {
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
 
+        // Track frame time for FPS calculation
+        self.perf_metrics.add_frame_time(dt);
+
         self.controls.update(dt, &mut self.camera);
 
         let view = self.camera.view_matrix();
@@ -476,7 +534,33 @@ impl ViewerState {
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             self.controls.run_ui(ctx);
-            
+
+            // Add performance metrics UI
+            egui::Window::new("Performance").show(ctx, |ui| {
+                ui.heading("Frame Stats");
+                ui.label(format!("FPS: {:.1}", self.perf_metrics.fps()));
+                ui.label(format!("Frame Time (avg): {:.2} ms", self.perf_metrics.avg_frame_time_ms()));
+                ui.label(format!("Frame Time (min): {:.2} ms", self.perf_metrics.min_frame_time_ms()));
+                ui.label(format!("Frame Time (max): {:.2} ms", self.perf_metrics.max_frame_time_ms()));
+                ui.label(format!("Total Frames: {}", self.perf_metrics.total_frames));
+
+                ui.separator();
+                ui.heading("GPU Memory");
+                let buffer_mem = self.registry.total_buffer_memory();
+                let texture_mem = self.registry.total_texture_memory();
+                let total_mem = buffer_mem + texture_mem;
+                ui.label(format!("Buffers: {:.2} MB ({} count)", buffer_mem as f64 / (1024.0 * 1024.0), self.registry.buffer_count()));
+                ui.label(format!("Textures: {:.2} MB ({} count)", texture_mem as f64 / (1024.0 * 1024.0), self.registry.texture_count()));
+                ui.label(format!("Total: {:.2} MB", total_mem as f64 / (1024.0 * 1024.0)));
+
+                ui.separator();
+                ui.heading("GPU Info");
+                let adapter_info = self.renderer.adapter_info();
+                ui.label(format!("Device: {}", adapter_info.name));
+                ui.label(format!("Backend: {:?}", adapter_info.backend));
+                ui.label(format!("Driver: {}", adapter_info.driver));
+            });
+
             // Add layer controls UI
             egui::Window::new("Layers").show(ctx, |ui| {
                 for layer_idx in 0..3 {
@@ -491,7 +575,7 @@ impl ViewerState {
                         if ui.checkbox(&mut enabled, layer_name).changed() {
                             self.renderer_manager.set_layer_enabled(layer_idx, enabled);
                         }
-                        
+
                         if enabled {
                             let mut opacity = self.renderer_manager.get_layer_opacity(layer_idx);
                             ui.add(egui::Slider::new(&mut opacity, 0.0..=1.0)

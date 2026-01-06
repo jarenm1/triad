@@ -16,7 +16,9 @@ egui = { workspace = true }
 egui-wgpu = { workspace = true }
 egui-winit = { workspace = true }
 thiserror = "1.0"
+wgpu-profiler = "0.19"
 
 [features]
 default = []
-tracy = ["tracing-tracy"]
+tracy = ["tracing-tracy", "triad-gpu/tracy"]
+profiling = ["triad-gpu/profiling"]

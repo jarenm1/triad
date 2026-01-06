@@ -80,8 +80,14 @@ impl Renderer {
         &self.instance
     }
 
+    /// Get adapter information for performance monitoring
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        self.adapter.get_info()
+    }
+
     /// Create a buffer builder for constructing GPU buffers
     pub fn create_buffer(&self) -> BufferBuilder<'_> {
+        let _span = tracing::debug_span!("create_buffer").entered();
         BufferBuilder::new(&self.device)
     }
 
@@ -97,6 +103,7 @@ impl Renderer {
         data: &[T],
         registry: &ResourceRegistry,
     ) -> Result<(), BufferWriteError> {
+        let _span = tracing::debug_span!("write_buffer", size = data.len()).entered();
         let buffer_ref = registry
             .get(buffer)
             .ok_or(BufferWriteError::BufferNotFound)?;
