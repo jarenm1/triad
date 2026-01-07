@@ -21,4 +21,8 @@ bytemuck = { workspace = true }
 clap = { version = "4.4", features = ["derive"] }
 rfd = "0.14"
 thiserror = "1.0"
+tracing-tracy = { version = "0.11", optional = true }
 
+[features]
+default = []
+tracy = ["tracing-tracy", "triad-window/tracy", "triad-gpu/tracy"]

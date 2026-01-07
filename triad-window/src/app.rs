@@ -4,7 +4,7 @@ use glam::Vec3;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::error;
+use tracing::{debug_span, error, instrument};
 use triad_gpu::wgpu;
 use triad_gpu::{
     CameraUniforms, ExecutableFrameGraph, FrameGraphError, Renderer, ResourceRegistry,
@@ -19,6 +19,9 @@ use winit::window::{Window, WindowId};
 
 // Re-export egui for use by applications
 pub use egui;
+
+// FPS tracking configuration
+const FPS_HISTORY_SIZE: usize = 60;
 
 /// Error type for rendering operations.
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +68,7 @@ pub struct RendererInitData {
     pub ply_path: Option<std::path::PathBuf>,
     pub initial_mode: u8, // 0=Points, 1=Gaussians, 2=Triangles
     pub point_size: f32,
+    pub present_mode: wgpu::PresentMode,
     pub ply_receiver: Option<std::sync::mpsc::Receiver<std::path::PathBuf>>,
 }
 
@@ -221,6 +225,17 @@ struct ViewerState {
     egui_ctx: egui::Context,
     egui_winit: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    // FPS tracking
+    fps_history: Vec<f32>,
+    fps_history_index: usize,
+    fps_display: f32,
+    // Present mode
+    current_present_mode: wgpu::PresentMode,
+    // Deferred reconfiguration (to avoid reconfiguring while surface texture is in use)
+    pending_present_mode: Option<wgpu::PresentMode>,
+    pending_resize: Option<PhysicalSize<u32>>,
+    // UI visibility toggle
+    show_ui: bool,
 }
 
 /// Trait for renderer managers that can build frame graphs.
@@ -364,7 +379,7 @@ impl ViewerState {
         let size = window.inner_size();
 
         let surface = renderer.instance().create_surface(window.clone())?;
-        let surface = renderer.create_surface(surface, size.width.max(1), size.height.max(1))?;
+        let surface = renderer.create_surface_with_mode(surface, size.width.max(1), size.height.max(1), init_data.present_mode)?;
 
         let mut registry = ResourceRegistry::default();
 
@@ -402,6 +417,9 @@ impl ViewerState {
             egui_wgpu::RendererOptions::default(),
         );
 
+        // Save present mode before moving init_data
+        let present_mode = init_data.present_mode;
+
         // Create renderer manager using factory function
         let renderer_manager = create_manager(
             init_data,
@@ -427,6 +445,13 @@ impl ViewerState {
             egui_ctx,
             egui_winit,
             egui_renderer,
+            fps_history: vec![60.0; FPS_HISTORY_SIZE],
+            fps_history_index: 0,
+            fps_display: 60.0,
+            current_present_mode: present_mode,
+            pending_present_mode: None,
+            pending_resize: None,
+            show_ui: true,
         })
     }
 
@@ -469,14 +494,24 @@ impl ViewerState {
             event:
                 KeyEvent {
                     state: ElementState::Pressed,
-                    physical_key: PhysicalKey::Code(KeyCode::Escape),
+                    physical_key: PhysicalKey::Code(key_code),
                     ..
                 },
             ..
         } = event
         {
-            event_loop.exit();
-            return true;
+            match key_code {
+                KeyCode::Escape => {
+                    event_loop.exit();
+                    return true;
+                }
+                KeyCode::F1 => {
+                    self.show_ui = !self.show_ui;
+                    tracing::info!("UI visibility: {}", self.show_ui);
+                    return true;
+                }
+                _ => {}
+            }
         }
 
         self.controls.handle_event(event)
@@ -486,6 +521,11 @@ impl ViewerState {
         if new_size.width == 0 || new_size.height == 0 {
             return;
         }
+        // Defer resize to avoid reconfiguring while surface texture is in use
+        self.pending_resize = Some(new_size);
+    }
+
+    fn apply_resize(&mut self, new_size: PhysicalSize<u32>) {
         let mut config = self.surface.config().clone();
         config.width = new_size.width;
         config.height = new_size.height;
@@ -513,53 +553,122 @@ impl ViewerState {
         self.depth_view = Some(Arc::new(view));
     }
 
+    fn set_present_mode(&mut self, present_mode: wgpu::PresentMode) {
+        if self.current_present_mode == present_mode {
+            return;
+        }
+        tracing::debug!("Requesting present mode change to {:?} (will apply next frame)", present_mode);
+        // Defer present mode change to avoid reconfiguring while surface texture is in use
+        self.pending_present_mode = Some(present_mode);
+    }
+
+    fn apply_present_mode(&mut self, present_mode: wgpu::PresentMode) {
+        tracing::info!("Changing present mode from {:?} to {:?}", self.current_present_mode, present_mode);
+        self.current_present_mode = present_mode;
+        let mut config = self.surface.config().clone();
+        config.present_mode = present_mode;
+        self.surface.reconfigure(self.renderer.device(), config);
+
+        // Verify the mode was applied
+        let actual_mode = self.surface.config().present_mode;
+        tracing::info!("Surface reconfigured - actual present mode: {:?}", actual_mode);
+        if actual_mode != present_mode {
+            tracing::warn!("Present mode mismatch! Requested {:?} but got {:?}", present_mode, actual_mode);
+        }
+    }
+
+    #[instrument(skip(self), name = "render")]
     fn render(&mut self) -> Result<(), RenderError> {
+        // Apply any pending reconfigurations from previous frame
+        // (must happen before acquiring surface texture)
+        if let Some(present_mode) = self.pending_present_mode.take() {
+            self.apply_present_mode(present_mode);
+        }
+        if let Some(new_size) = self.pending_resize.take() {
+            self.apply_resize(new_size);
+        }
+
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
 
-        self.controls.update(dt, &mut self.camera);
+        // Calculate and store FPS
+        let current_fps = if dt > 0.0 { 1.0 / dt } else { 0.0 };
+        self.fps_history[self.fps_history_index] = current_fps;
+        self.fps_history_index = (self.fps_history_index + 1) % FPS_HISTORY_SIZE;
 
-        let view = self.camera.view_matrix();
-        let proj = self.projection.matrix();
-        let uniforms = CameraUniforms::from_matrices(view, proj, self.camera.position());
+        // Calculate rolling average for display
+        self.fps_display = self.fps_history.iter().sum::<f32>() / FPS_HISTORY_SIZE as f32;
 
-        // Update camera
-        self.renderer_manager
-            .update_camera(self.renderer.queue(), &self.registry, &uniforms);
+        // Camera and controls update
+        {
+            let _span = debug_span!("camera_update").entered();
+            self.controls.update(dt, &mut self.camera);
 
-        // Update opacity buffer
-        self.renderer_manager
-            .update_opacity_buffer(self.renderer.queue(), &self.registry);
+            let view = self.camera.view_matrix();
+            let proj = self.projection.matrix();
+            let uniforms = CameraUniforms::from_matrices(view, proj, self.camera.position());
+
+            // Update camera
+            self.renderer_manager
+                .update_camera(self.renderer.queue(), &self.registry, &uniforms);
+
+            // Update opacity buffer
+            self.renderer_manager
+                .update_opacity_buffer(self.renderer.queue(), &self.registry);
+        }
 
         // Check for pending PLY requests and start background loading (non-blocking)
-        self.renderer_manager.check_and_start_ply_loading();
+        {
+            let _span = debug_span!("ply_check_and_start").entered();
+            self.renderer_manager.check_and_start_ply_loading();
+        }
 
         // Check for completed background loading and apply to GPU (fast)
-        self.renderer_manager
-            .apply_parsed_ply_data(&self.renderer, &mut self.registry);
+        {
+            let _span = debug_span!("ply_apply_parsed").entered();
+            self.renderer_manager
+                .apply_parsed_ply_data(&self.renderer, &mut self.registry);
+        }
 
-        let surface_texture = self.surface.get_current_texture()?;
-        let surface_view = Arc::new(
-            surface_texture
-                .texture
-                .create_view(&triad_gpu::wgpu::TextureViewDescriptor::default()),
-        );
+        // Surface texture acquisition
+        let (surface_texture, surface_view) = {
+            let _span = debug_span!("surface_acquire").entered();
+            let surface_texture = self.surface.get_current_texture()?;
+            let surface_view = Arc::new(
+                surface_texture
+                    .texture
+                    .create_view(&triad_gpu::wgpu::TextureViewDescriptor::default()),
+            );
+            (surface_texture, surface_view)
+        };
 
-        // Build and execute frame graph using cached depth view
-        let mut frame_graph = self
-            .renderer_manager
-            .build_frame_graph(surface_view.clone(), self.depth_view.clone())?;
+        // Build frame graph using cached depth view
+        let mut frame_graph = {
+            let _span = debug_span!("frame_graph_build").entered();
+            self.renderer_manager
+                .build_frame_graph(surface_view.clone(), self.depth_view.clone())?
+        };
 
-        frame_graph.execute(
-            self.renderer.device(),
-            self.renderer.queue(),
-            &self.registry,
-        );
+        // Execute frame graph (collect command buffers without submitting)
+        let mut command_buffers = {
+            let _span = debug_span!("frame_graph_execute").entered();
+            frame_graph.execute_no_submit(
+                self.renderer.device(),
+                self.renderer.queue(),
+                &self.registry,
+            )
+        };
 
-        // Run egui frame
-        let raw_input = self.egui_winit.take_egui_input(&self.window);
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+        // Run egui frame (skip if UI is hidden for performance testing)
+        let (full_output, new_present_mode) = if self.show_ui {
+            let _span = debug_span!("egui_run").entered();
+            let raw_input = self.egui_winit.take_egui_input(&self.window);
+            let mut new_mode = None;
+            let output = self.egui_ctx.run(raw_input, |ctx| {
+            // Set reactive mode - only repaint on input events
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+
             self.controls.run_ui(ctx);
 
             // Add layer controls UI
@@ -589,62 +698,170 @@ impl ViewerState {
                     });
                 }
             });
-        });
+
+            // FPS counter and present mode window
+            egui::Window::new("Performance")
+                .default_pos(egui::pos2(10.0, 10.0))
+                .resizable(false)
+                .collapsible(false)
+                .title_bar(false)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("FPS: {:.1}", self.fps_display))
+                                .size(16.0)
+                                .color(if self.fps_display >= 50.0 {
+                                    egui::Color32::from_rgb(100, 255, 100)  // Green for good FPS
+                                } else if self.fps_display >= 30.0 {
+                                    egui::Color32::from_rgb(255, 255, 100)  // Yellow for medium
+                                } else {
+                                    egui::Color32::from_rgb(255, 100, 100)  // Red for low FPS
+                                })
+                        );
+                    });
+
+                    // Show frame time as well
+                    ui.horizontal(|ui| {
+                        let frame_time_ms = 1000.0 / self.fps_display.max(0.01);
+                        ui.label(
+                            egui::RichText::new(format!("{:.2}ms", frame_time_ms))
+                                .size(12.0)
+                                .color(egui::Color32::GRAY)
+                        );
+                    });
+
+                    ui.separator();
+
+                    // Present mode selector
+                    ui.horizontal(|ui| {
+                        ui.label("VSync:");
+
+                        if ui.selectable_label(
+                            matches!(self.current_present_mode, wgpu::PresentMode::AutoVsync | wgpu::PresentMode::Fifo),
+                            "On"
+                        ).clicked() {
+                            new_mode = Some(wgpu::PresentMode::AutoVsync);
+                        }
+
+                        if ui.selectable_label(
+                            matches!(self.current_present_mode, wgpu::PresentMode::Immediate | wgpu::PresentMode::AutoNoVsync),
+                            "Off"
+                        ).clicked() {
+                            new_mode = Some(wgpu::PresentMode::Immediate);
+                        }
+
+                        if ui.selectable_label(
+                            matches!(self.current_present_mode, wgpu::PresentMode::Mailbox),
+                            "Mailbox"
+                        ).clicked() {
+                            new_mode = Some(wgpu::PresentMode::Mailbox);
+                        }
+                    });
+                });
+            });
+            (output, Some(new_mode))
+        } else {
+            // UI hidden - create minimal egui frame
+            let raw_input = self.egui_winit.take_egui_input(&self.window);
+            let output = self.egui_ctx.run(raw_input, |_ctx| {});
+            (output, None)
+        };
+
+        let new_present_mode = new_present_mode.flatten();
+
+        // Request present mode change (will be applied next frame)
+        if let Some(mode) = new_present_mode {
+            self.set_present_mode(mode);
+        }
 
         // Handle egui platform output (clipboard, cursor, etc.)
         self.egui_winit
             .handle_platform_output(&self.window, full_output.platform_output);
 
         // Render egui
-        let screen_descriptor = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [self.surface.config().width, self.surface.config().height],
-            pixels_per_point: self.window.scale_factor() as f32,
+        let (screen_descriptor, tris) = {
+            let _span = debug_span!("egui_tessellate").entered();
+            let screen_descriptor = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.surface.config().width, self.surface.config().height],
+                pixels_per_point: self.window.scale_factor() as f32,
+            };
+
+            let tris = self
+                .egui_ctx
+                .tessellate(full_output.shapes, full_output.pixels_per_point);
+
+            (screen_descriptor, tris)
         };
 
-        let tris = self
-            .egui_ctx
-            .tessellate(full_output.shapes, full_output.pixels_per_point);
+        {
+            let _span = debug_span!("egui_render").entered();
 
-        for (id, image_delta) in &full_output.textures_delta.set {
-            self.egui_renderer.update_texture(
-                self.renderer.device(),
-                self.renderer.queue(),
-                *id,
-                image_delta,
-            );
+            {
+                let _span = debug_span!("egui_texture_update").entered();
+                for (id, image_delta) in &full_output.textures_delta.set {
+                    self.egui_renderer.update_texture(
+                        self.renderer.device(),
+                        self.renderer.queue(),
+                        *id,
+                        image_delta,
+                    );
+                }
+            }
+
+            // Create separate encoder for egui to work around lifetime requirements
+            let mut egui_encoder = {
+                let _span = debug_span!("egui_encoder_create").entered();
+                self.renderer.device().create_command_encoder(
+                    &triad_gpu::wgpu::CommandEncoderDescriptor {
+                        label: Some("egui Encoder"),
+                    })
+            };
+
+            {
+                let _span = debug_span!("egui_update_buffers").entered();
+                self.egui_renderer.update_buffers(
+                    self.renderer.device(),
+                    self.renderer.queue(),
+                    &mut egui_encoder,
+                    &tris,
+                    &screen_descriptor,
+                );
+            }
+
+            // Render egui - the render_pass must be dropped before encoder.finish()
+            {
+                let _span = debug_span!("egui_render_pass").entered();
+                render_egui(
+                    &self.egui_renderer,
+                    &mut egui_encoder,
+                    &surface_view,
+                    &tris,
+                    &screen_descriptor,
+                );
+            }
+
+            // Free textures that are no longer needed
+            {
+                let _span = debug_span!("egui_texture_free").entered();
+                for id in &full_output.textures_delta.free {
+                    self.egui_renderer.free_texture(id);
+                }
+            }
+
+            // Add egui command buffer to the batch
+            command_buffers.push(egui_encoder.finish());
+
+            // Submit all command buffers in a single batch (frame graph + egui)
+            {
+                let _span = debug_span!("queue_submit_all", count = command_buffers.len()).entered();
+                self.renderer.queue().submit(command_buffers);
+            }
+
+            {
+                let _span = debug_span!("surface_present").entered();
+                surface_texture.present();
+            }
         }
-
-        // Create separate encoder for egui to work around lifetime requirements
-        let mut egui_encoder = self.renderer.device().create_command_encoder(
-            &triad_gpu::wgpu::CommandEncoderDescriptor {
-                label: Some("egui Encoder"),
-            },
-        );
-
-        self.egui_renderer.update_buffers(
-            self.renderer.device(),
-            self.renderer.queue(),
-            &mut egui_encoder,
-            &tris,
-            &screen_descriptor,
-        );
-
-        // Render egui - the render_pass must be dropped before encoder.finish()
-        render_egui(
-            &self.egui_renderer,
-            &mut egui_encoder,
-            &surface_view,
-            &tris,
-            &screen_descriptor,
-        );
-
-        // Free textures that are no longer needed
-        for id in &full_output.textures_delta.free {
-            self.egui_renderer.free_texture(id);
-        }
-
-        self.renderer.queue().submit(Some(egui_encoder.finish()));
-        surface_texture.present();
         Ok(())
     }
 }

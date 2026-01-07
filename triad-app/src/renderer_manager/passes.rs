@@ -1,6 +1,7 @@
 //! Frame graph passes for rendering layers.
 
 use std::sync::Arc;
+use tracing::debug_span;
 use triad_gpu::{Handle, Pass, PassContext, wgpu};
 
 /// Generic render pass that renders to a texture view.
@@ -44,6 +45,12 @@ impl Pass for GenericRenderPass {
     }
 
     fn execute(&self, ctx: &PassContext) -> wgpu::CommandBuffer {
+        let _span = debug_span!("generic_render_pass",
+            uses_indices = self.uses_indices,
+            vertex_count = self.vertex_count,
+            index_count = self.index_count
+        ).entered();
+
         let mut encoder = ctx.create_command_encoder(Some("Generic Render Encoder"));
 
         let pipeline = ctx
@@ -131,6 +138,12 @@ impl Pass for GaussianSortPass {
     }
 
     fn execute(&self, ctx: &PassContext) -> wgpu::CommandBuffer {
+        let workgroup_count = (self.gaussian_count + 63) / 64;
+        let _span = debug_span!("gaussian_sort_pass",
+            gaussian_count = self.gaussian_count,
+            workgroup_count = workgroup_count
+        ).entered();
+
         let mut encoder = ctx.create_command_encoder(Some("Gaussian Sort Encoder"));
 
         let pipeline = ctx
@@ -149,7 +162,6 @@ impl Pass for GaussianSortPass {
         compute_pass.set_bind_group(0, bind_group, &[]);
 
         // Dispatch one workgroup per 64 gaussians (workgroup_size is 64)
-        let workgroup_count = (self.gaussian_count + 63) / 64;
         compute_pass.dispatch_workgroups(workgroup_count, 1, 1);
 
         drop(compute_pass);
@@ -187,6 +199,8 @@ impl Pass for LayerBlendPass {
     }
 
     fn execute(&self, ctx: &PassContext) -> wgpu::CommandBuffer {
+        let _span = debug_span!("layer_blend_pass").entered();
+
         let mut encoder = ctx.create_command_encoder(Some("Layer Blend Encoder"));
 
         let pipeline = ctx

@@ -7,10 +7,8 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use triad_window::{
-    CameraControl, Controls, FrameUpdate, InputState, KeyCode, MouseButton, PhysicalKey, egui,
-    run_with_renderer_config,
-};
+use triad_window::{Controls, egui, run_with_renderer_config};
+use triad_gpu::wgpu;
 
 /// Thread-safe signal for mode switching.
 pub type ModeSignal = Arc<AtomicU8>;
@@ -39,6 +37,7 @@ pub fn write_mode(signal: &ModeSignal, mode: LayerMode) {
 pub struct RendererConfig {
     pub initial_mode: LayerMode,
     pub point_size: f32,
+    pub present_mode: wgpu::PresentMode,
 }
 
 impl Default for RendererConfig {
@@ -46,6 +45,7 @@ impl Default for RendererConfig {
         Self {
             initial_mode: LayerMode::Points,
             point_size: 0.01,
+            present_mode: wgpu::PresentMode::AutoVsync, // Default to vsync
         }
     }
 }
@@ -75,7 +75,7 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".to_string(),
-            enable_tracy: false,
+            enable_tracy: true,
         }
     }
 }
@@ -206,6 +206,7 @@ impl AppBuilder {
             ply_path: self.ply_path,
             initial_mode: config.initial_mode,
             point_size: config.point_size,
+            present_mode: config.present_mode,
             ply_receiver: self.ply_receiver.take().map(|r| {
                 // Wrap the receiver in Arc<Mutex<>> for thread safety
                 Arc::new(Mutex::new(r))
@@ -224,10 +225,10 @@ impl AppBuilder {
                 LayerMode::Triangles => 2,
             },
             point_size: init_data.point_size,
+            present_mode: init_data.present_mode,
             ply_receiver: init_data.ply_receiver.and_then(|r| {
                 // Unwrap from Arc<Mutex<>> to get the receiver
-                Arc::try_unwrap(r).ok()
-                    .and_then(|m| m.into_inner().ok())
+                Arc::try_unwrap(r).ok().and_then(|m| m.into_inner().ok())
             }),
         };
 
@@ -263,7 +264,10 @@ impl AppBuilder {
                         _ => LayerMode::Points,
                     },
                     point_size: window_init_data.point_size,
-                    ply_receiver: window_init_data.ply_receiver.map(|r| Arc::new(Mutex::new(r))),
+                    present_mode: window_init_data.present_mode,
+                    ply_receiver: window_init_data
+                        .ply_receiver
+                        .map(|r| Arc::new(Mutex::new(r))),
                 };
 
                 // Create the renderer manager

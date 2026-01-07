@@ -4,6 +4,7 @@ use crate::layers::LayerMode;
 use crate::renderer_manager::layer_resources::LayerResources;
 use crate::renderer_manager::passes::{GaussianSortPass, GenericRenderPass, LayerBlendPass};
 use std::sync::Arc;
+use tracing::{debug_span, instrument};
 use triad_gpu::{ExecutableFrameGraph, FrameGraph, FrameGraphError, Handle, PassBuilder, wgpu};
 
 /// Add a Gaussian sort compute pass to the frame graph.
@@ -155,6 +156,10 @@ pub fn build_frame_graph(
 
 /// Build a complete frame graph with all enabled layers, optionally using cached execution order.
 /// This is the internal version that supports caching.
+#[instrument(skip_all, name = "build_frame_graph", fields(
+    enabled_layers = ?enabled_layers,
+    has_cache = cached_execution_order.is_some()
+))]
 pub(crate) fn build_frame_graph_with_cache(
     camera_buffer: Handle<wgpu::Buffer>,
     enabled_layers: &[bool; 3],
@@ -172,6 +177,7 @@ pub(crate) fn build_frame_graph_with_cache(
     depth_view: Option<Arc<wgpu::TextureView>>,
     cached_execution_order: Option<&[usize]>,
 ) -> Result<ExecutableFrameGraph, FrameGraphError> {
+    let _span = debug_span!("fg_construct").entered();
     let mut frame_graph = FrameGraph::default();
 
     // Register shared camera buffer
@@ -189,6 +195,8 @@ pub(crate) fn build_frame_graph_with_cache(
         if !enabled_layers[layer_idx] {
             continue;
         }
+
+        let _layer_span = debug_span!("add_layer", layer = layer_idx).entered();
 
         let resources = match layer_mode {
             LayerMode::Points => point_resources,
@@ -251,5 +259,8 @@ pub(crate) fn build_frame_graph_with_cache(
         );
     }
 
-    frame_graph.build_with_cached_order(cached_execution_order)
+    {
+        let _span = debug_span!("fg_build", use_cache = cached_execution_order.is_some()).entered();
+        frame_graph.build_with_cached_order(cached_execution_order)
+    }
 }

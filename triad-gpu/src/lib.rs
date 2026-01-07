@@ -182,6 +182,52 @@ impl Renderer {
         surface.configure(&self.device, &config);
         Ok(SurfaceWrapper::new(surface, config))
     }
+
+    pub fn create_surface_with_mode(
+        &self,
+        surface: wgpu::Surface<'static>,
+        width: u32,
+        height: u32,
+        present_mode: wgpu::PresentMode,
+    ) -> std::result::Result<SurfaceWrapper, RendererError> {
+        // Validate width and height are non-zero
+        if width == 0 || height == 0 {
+            return Err(RendererError::InvalidDimensions { width, height });
+        }
+
+        let caps = surface.get_capabilities(&self.adapter);
+
+        // Check if formats array is empty
+        if caps.formats.is_empty() {
+            return Err(RendererError::NoSupportedFormats);
+        }
+
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+
+        // Check if alpha_modes array is empty
+        if caps.alpha_modes.is_empty() {
+            return Err(RendererError::NoSupportedAlphaModes);
+        }
+
+        let config = SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width,
+            height,
+            present_mode,
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+
+        surface.configure(&self.device, &config);
+        Ok(SurfaceWrapper::new(surface, config))
+    }
 }
 
 #[cfg(test)]

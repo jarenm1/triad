@@ -95,6 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_renderer_config(RendererConfig {
             initial_mode,
             point_size: 0.01,
+            present_mode: triad_gpu::wgpu::PresentMode::AutoVsync,
         })
         .with_mode_signal(mode_signal.clone());
 

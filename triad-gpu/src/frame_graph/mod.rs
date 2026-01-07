@@ -7,6 +7,7 @@ use crate::frame_graph::pass::PassNode;
 use crate::frame_graph::resource::{ResourceInfo, ResourceState};
 use crate::resource_registry::ResourceRegistry;
 use std::collections::HashMap;
+use tracing::{debug_span, instrument};
 
 pub use pass::{Pass, PassBuilder, PassContext};
 pub use resource::{Handle, HandleId, ResourceType};
@@ -182,8 +183,27 @@ impl ExecutableFrameGraph {
         transitions
     }
 
+    /// Execute the frame graph and return command buffers (without submitting)
+    /// This allows batching with other command buffers (e.g., UI) for a single submission
+    /// Note: Passes may use the queue for immediate operations, but final submission is deferred
+    #[instrument(skip(self, device, queue, resources), name = "fg_execute", fields(pass_count = self.execution_order.len()))]
+    pub fn execute_no_submit(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resources: &ResourceRegistry,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let ctx = pass::PassContext {
+            device,
+            queue,
+            resources,
+        };
+        self.execute_internal(&ctx, false)
+    }
+
     /// Execute the frame graph
     /// Collects command buffers from passes and submits them in optimal order
+    #[instrument(skip(self, device, queue, resources), name = "fg_execute", fields(pass_count = self.execution_order.len()))]
     pub fn execute(
         &mut self,
         device: &wgpu::Device,
@@ -195,6 +215,20 @@ impl ExecutableFrameGraph {
             queue,
             resources,
         };
+        let command_buffers = self.execute_internal(&ctx, true);
+
+        // Submit all command buffers in a single batch for optimal performance
+        {
+            let _span = debug_span!("queue_submit", count = command_buffers.len()).entered();
+            queue.submit(command_buffers);
+        }
+    }
+
+    fn execute_internal(
+        &mut self,
+        ctx: &pass::PassContext,
+        _submit: bool,
+    ) -> Vec<wgpu::CommandBuffer> {
         let mut command_buffers = Vec::new();
 
         // Track current runtime state of each resource
@@ -218,7 +252,10 @@ impl ExecutableFrameGraph {
             // or insert explicit barriers if needed in the future.
 
             // Execute the pass
-            let command_buffer = pass.pass().execute(&ctx);
+            let command_buffer = {
+                let _span = debug_span!("pass", name = pass.name(), idx = pass_idx).entered();
+                pass.pass().execute(&ctx)
+            };
             command_buffers.push(command_buffer);
 
             // Update current states after pass execution
@@ -238,8 +275,7 @@ impl ExecutableFrameGraph {
             }
         }
 
-        // Submit all command buffers in a single batch for optimal performance
-        queue.submit(command_buffers);
+        command_buffers
     }
 
     pub fn surface_count(&self) -> usize {

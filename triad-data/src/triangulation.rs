@@ -5,7 +5,7 @@
 
 use delaunator::{Point, triangulate};
 use glam::Vec3;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
 
 /// Perform 2D Delaunay triangulation on a set of 3D points.
 ///
@@ -13,6 +13,7 @@ use tracing::{debug, info, warn};
 /// original 3D positions for the resulting triangles.
 ///
 /// Returns a list of triangle index triplets `[i0, i1, i2]`.
+#[instrument(skip(positions), fields(point_count = positions.len()))]
 pub fn triangulate_points_xy(positions: &[Vec3]) -> Vec<[usize; 3]> {
     if positions.len() < 3 {
         warn!("Not enough points for triangulation (need at least 3)");
@@ -51,6 +52,7 @@ pub fn triangulate_points_xy(positions: &[Vec3]) -> Vec<[usize; 3]> {
 /// original 3D positions for the resulting triangles.
 ///
 /// Returns a list of triangle index triplets `[i0, i1, i2]`.
+#[instrument(skip(positions), fields(point_count = positions.len()))]
 pub fn triangulate_points_xz(positions: &[Vec3]) -> Vec<[usize; 3]> {
     if positions.len() < 3 {
         warn!("Not enough points for triangulation (need at least 3)");
@@ -124,6 +126,7 @@ pub fn best_projection_plane(positions: &[Vec3]) -> ProjectionPlane {
 /// Automatically selects the best projection plane based on point distribution.
 ///
 /// Returns a list of triangle index triplets `[i0, i1, i2]`.
+#[instrument(skip(positions), fields(point_count = positions.len()))]
 pub fn triangulate_points(positions: &[Vec3]) -> Vec<[usize; 3]> {
     if positions.len() < 3 {
         warn!("Not enough points for triangulation (need at least 3)");

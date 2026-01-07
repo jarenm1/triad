@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tracing::{error, info};
+use tracing::{debug_span, error, info, info_span};
 use triad_data::triangulation;
 use triad_gpu::{
     BufferUsage, CameraUniforms, ExecutableFrameGraph, FrameGraphError, GaussianPoint, Handle,
@@ -46,6 +46,7 @@ pub struct RendererInitData {
     pub ply_path: Option<PathBuf>,
     pub initial_mode: LayerMode,
     pub point_size: f32,
+    pub present_mode: wgpu::PresentMode,
     pub ply_receiver: Option<Arc<Mutex<mpsc::Receiver<PathBuf>>>>,
 }
 
@@ -55,6 +56,7 @@ impl RendererInitData {
             ply_path,
             initial_mode,
             point_size,
+            present_mode: wgpu::PresentMode::AutoVsync,
             ply_receiver: None,
         }
     }
@@ -674,6 +676,9 @@ impl RendererManager {
         self.loading_in_progress = true;
 
         thread::spawn(move || {
+            // Create a span for the entire background operation
+            let _thread_span = info_span!("ply_background_load", path = ?ply_path).entered();
+
             info!("Background: Starting PLY parse for {:?}", ply_path);
 
             let ply_path_str = match ply_path.to_str() {
@@ -685,27 +690,34 @@ impl RendererManager {
             };
 
             // Load vertices (used for points and triangulation)
-            let vertices = match ply_loader::load_vertices_from_ply(&ply_path_str) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("Failed to load vertices: {}", e);
-                    return;
+            let vertices = {
+                let _span = debug_span!("load_vertices").entered();
+                match ply_loader::load_vertices_from_ply(&ply_path_str) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!("Failed to load vertices: {}", e);
+                        return;
+                    }
                 }
             };
             info!("Background: Loaded {} vertices", vertices.len());
 
             // Convert to points
-            let points: Vec<PointPrimitive> = if vertices.is_empty() {
-                vec![PointPrimitive::new(Vec3::ZERO, point_size, Vec3::ZERO, 0.0)]
-            } else {
-                vertices
-                    .iter()
-                    .map(|v| PointPrimitive::new(v.position, point_size, v.color, v.opacity))
-                    .collect()
+            let points: Vec<PointPrimitive> = {
+                let _span = debug_span!("convert_to_points", count = vertices.len()).entered();
+                if vertices.is_empty() {
+                    vec![PointPrimitive::new(Vec3::ZERO, point_size, Vec3::ZERO, 0.0)]
+                } else {
+                    vertices
+                        .iter()
+                        .map(|v| PointPrimitive::new(v.position, point_size, v.color, v.opacity))
+                        .collect()
+                }
             };
 
             // Load gaussians
-            let gaussians: Vec<GaussianPoint> =
+            let gaussians: Vec<GaussianPoint> = {
+                let _span = debug_span!("load_gaussians").entered();
                 match ply_loader::load_gaussians_from_ply(&ply_path_str) {
                     Ok(g) if !g.is_empty() => g,
                     _ => vec![GaussianPoint::new(
@@ -715,12 +727,14 @@ impl RendererManager {
                         [0.0, 0.0, 0.0, 1.0],
                         Vec3::ONE,
                     )],
-                };
+                }
+            };
             info!("Background: Loaded {} gaussians", gaussians.len());
 
             // Load or generate triangles
             let triangles: Vec<TrianglePrimitive> =
                 if ply_loader::ply_has_faces(&ply_path_str).unwrap_or(false) {
+                    let _span = debug_span!("load_triangles_from_faces").entered();
                     match ply_loader::load_triangles_from_ply(&ply_path_str) {
                         Ok(t) if !t.is_empty() => t,
                         _ => vec![TrianglePrimitive::new(
@@ -733,6 +747,7 @@ impl RendererManager {
                     }
                 } else if !vertices.is_empty() {
                     info!("Background: Starting triangulation...");
+                    let _span = debug_span!("triangulate", vertex_count = vertices.len()).entered();
                     let positions: Vec<Vec3> = vertices.iter().map(|v| v.position).collect();
                     let triangle_indices = triangulation::triangulate_points(&positions);
                     info!(
@@ -818,29 +833,40 @@ impl RendererManager {
         registry: &mut ResourceRegistry,
         data: ParsedPlyData,
     ) -> Result<(), errors::RendererManagerError> {
+        let _span = debug_span!("apply_parsed_data",
+            point_count = data.points.len(),
+            gaussian_count = data.gaussians.len(),
+            triangle_count = data.triangles.len()
+        ).entered();
+
         // Update point buffer
-        let point_buffer = renderer
-            .create_buffer()
-            .label("Point Buffer")
-            .with_pod_data(&data.points)
-            .usage(BufferUsage::Storage { read_only: true })
-            .build(registry)?;
+        {
+            let _span = debug_span!("update_point_buffer").entered();
+            let point_buffer = renderer
+                .create_buffer()
+                .label("Point Buffer")
+                .with_pod_data(&data.points)
+                .usage(BufferUsage::Storage { read_only: true })
+                .build(registry)?;
 
-        let new_point_bind_group = update_layer_bind_group(
-            renderer,
-            registry,
-            "Point",
-            self.point_resources.bind_group_layout,
-            point_buffer,
-            self.camera_buffer,
-        )?;
+            let new_point_bind_group = update_layer_bind_group(
+                renderer,
+                registry,
+                "Point",
+                self.point_resources.bind_group_layout,
+                point_buffer,
+                self.camera_buffer,
+            )?;
 
-        self.point_resources.data_buffer = point_buffer;
-        self.point_resources.bind_group = new_point_bind_group;
-        self.point_resources.vertex_count = data.points.len() as u32 * 3;
+            self.point_resources.data_buffer = point_buffer;
+            self.point_resources.bind_group = new_point_bind_group;
+            self.point_resources.vertex_count = data.points.len() as u32 * 3;
+        }
 
         // Update gaussian buffer
-        let gaussian_buffer = renderer
+        {
+            let _span = debug_span!("update_gaussian_buffer").entered();
+            let gaussian_buffer = renderer
             .create_buffer()
             .label("Gaussian Buffer")
             .with_pod_data(&data.gaussians)
@@ -950,16 +976,19 @@ impl RendererManager {
             .usage(BufferUsage::Index)
             .build(registry)?;
 
-        self.gaussian_resources.data_buffer = gaussian_buffer;
-        self.gaussian_resources.index_buffer = Some(index_buffer);
-        self.gaussian_resources.index_count = data.gaussians.len() as u32 * 3;
-        self.gaussian_resources.bind_group = new_gaussian_bind_group;
+            self.gaussian_resources.data_buffer = gaussian_buffer;
+            self.gaussian_resources.index_buffer = Some(index_buffer);
+            self.gaussian_resources.index_count = data.gaussians.len() as u32 * 3;
+            self.gaussian_resources.bind_group = new_gaussian_bind_group;
 
-        self.gaussian_compute.sort_buffer = sort_buffer_handle;
-        self.gaussian_compute.sort_bind_group = compute_bind_group;
-        self.gaussian_compute.sort_bind_group_layout = compute_layout;
+            self.gaussian_compute.sort_buffer = sort_buffer_handle;
+            self.gaussian_compute.sort_bind_group = compute_bind_group;
+            self.gaussian_compute.sort_bind_group_layout = compute_layout;
+        }
 
         // Update triangle buffer
+        {
+            let _span = debug_span!("update_triangle_buffer").entered();
         let triangle_buffer = renderer
             .create_buffer()
             .label("Triangle Buffer")
@@ -990,10 +1019,11 @@ impl RendererManager {
             self.camera_buffer,
         )?;
 
-        self.triangle_resources.data_buffer = triangle_buffer;
-        self.triangle_resources.index_buffer = Some(tri_index_buffer);
-        self.triangle_resources.index_count = data.triangles.len() as u32 * 3;
-        self.triangle_resources.bind_group = new_triangle_bind_group;
+            self.triangle_resources.data_buffer = triangle_buffer;
+            self.triangle_resources.index_buffer = Some(tri_index_buffer);
+            self.triangle_resources.index_count = data.triangles.len() as u32 * 3;
+            self.triangle_resources.bind_group = new_triangle_bind_group;
+        }
 
         Ok(())
     }
