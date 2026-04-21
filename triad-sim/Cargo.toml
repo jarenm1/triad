@@ -1,0 +1,9 @@
+[package]
+name = "triad-sim"
+version = "0.1.0"
+edition = "2024"
+description = "Shared GPU-first simulation core for headless and windowed Triad runners"
+
+[dependencies]
+triad-gpu = { workspace = true }
+bytemuck = { workspace = true }
