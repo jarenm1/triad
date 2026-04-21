@@ -10,6 +10,13 @@ pub enum ColorLoadOp {
     Clear(wgpu::Color),
 }
 
+/// How depth is loaded at the start of a render pass attachment.
+#[derive(Debug, Clone, Copy)]
+pub enum DepthLoadOp {
+    Load,
+    Clear(f32),
+}
+
 #[derive(Debug, Clone)]
 pub enum RenderDraw {
     Direct {
@@ -17,6 +24,15 @@ pub enum RenderDraw {
         instances: std::ops::Range<u32>,
     },
     Indirect {
+        buffer: Handle<wgpu::Buffer>,
+        offset: u64,
+    },
+    DirectIndexed {
+        indices: std::ops::Range<u32>,
+        base_vertex: i32,
+        instances: std::ops::Range<u32>,
+    },
+    IndirectIndexed {
         buffer: Handle<wgpu::Buffer>,
         offset: u64,
     },
@@ -40,6 +56,41 @@ impl RenderDraw {
     pub fn indirect(buffer: Handle<wgpu::Buffer>, offset: u64) -> Self {
         Self::Indirect { buffer, offset }
     }
+
+    pub fn direct_indexed(
+        index_count: u32,
+        base_vertex: i32,
+        instance_count: u32,
+    ) -> Self {
+        Self::DirectIndexed {
+            indices: 0..index_count,
+            base_vertex,
+            instances: 0..instance_count,
+        }
+    }
+
+    pub fn direct_indexed_ranges(
+        indices: std::ops::Range<u32>,
+        base_vertex: i32,
+        instances: std::ops::Range<u32>,
+    ) -> Self {
+        Self::DirectIndexed {
+            indices,
+            base_vertex,
+            instances,
+        }
+    }
+
+    pub fn indirect_indexed(buffer: Handle<wgpu::Buffer>, offset: u64) -> Self {
+        Self::IndirectIndexed { buffer, offset }
+    }
+
+    fn is_indexed(&self) -> bool {
+        matches!(
+            self,
+            RenderDraw::DirectIndexed { .. } | RenderDraw::IndirectIndexed { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,11 +106,32 @@ struct ColorAttachment {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) enum DepthAttachmentView {
+    Static(Handle<wgpu::TextureView>),
+    FrameSlot(Handle<FrameTextureView>),
+}
+
+#[derive(Debug, Clone)]
+struct DepthStencilAttachment {
+    view: DepthAttachmentView,
+    depth_ops: wgpu::Operations<f32>,
+    stencil_ops: Option<wgpu::Operations<u32>>,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct VertexBufferBinding {
     slot: u32,
     buffer: Handle<wgpu::Buffer>,
     offset: u64,
     size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IndexBufferBinding {
+    buffer: Handle<wgpu::Buffer>,
+    offset: u64,
+    size: Option<u64>,
+    format: wgpu::IndexFormat,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -73,7 +145,9 @@ struct RenderDispatchPass {
     name: String,
     pipeline: Handle<wgpu::RenderPipeline>,
     color_attachments: Vec<ColorAttachment>,
+    depth_stencil: Option<DepthStencilAttachment>,
     vertex_buffers: Vec<VertexBufferBinding>,
+    index_buffer: Option<IndexBufferBinding>,
     bind_groups: Vec<BoundBindGroup>,
     draw: RenderDraw,
 }
@@ -136,11 +210,34 @@ impl Pass for RenderDispatchPass {
             }));
         }
 
+        let frame_depth_arc: Option<Arc<wgpu::TextureView>> =
+            self.depth_stencil.as_ref().and_then(|ds| {
+                if let DepthAttachmentView::FrameSlot(slot_h) = ds.view {
+                    let slot = ctx.resources.get(slot_h)?;
+                    slot.get()
+                } else {
+                    None
+                }
+            });
+
+        let depth_stencil_for_pass: Option<wgpu::RenderPassDepthStencilAttachment<'_>> =
+            self.depth_stencil.as_ref().and_then(|ds| {
+                let view: &wgpu::TextureView = match ds.view {
+                    DepthAttachmentView::Static(handle) => ctx.resources.get(handle)?,
+                    DepthAttachmentView::FrameSlot(_) => frame_depth_arc.as_ref()?.as_ref(),
+                };
+                Some(wgpu::RenderPassDepthStencilAttachment {
+                    view,
+                    depth_ops: Some(ds.depth_ops),
+                    stencil_ops: ds.stencil_ops,
+                })
+            });
+
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(&self.name),
                 color_attachments: &color_views,
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: depth_stencil_for_pass,
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
@@ -165,18 +262,42 @@ impl Pass for RenderDispatchPass {
                 pass.set_vertex_buffer(vertex_buffer.slot, slice);
             }
 
-            match self.draw {
+            if let Some(index_buffer) = self.index_buffer {
+                let buffer = ctx
+                    .get_buffer(index_buffer.buffer)
+                    .expect("index buffer handle missing from registry");
+                let slice = match index_buffer.size {
+                    Some(size) => buffer.slice(index_buffer.offset..index_buffer.offset + size),
+                    None => buffer.slice(index_buffer.offset..),
+                };
+                pass.set_index_buffer(slice, index_buffer.format);
+            }
+
+            match &self.draw {
                 RenderDraw::Direct {
-                    ref vertices,
-                    ref instances,
+                    vertices,
+                    instances,
                 } => {
                     pass.draw(vertices.clone(), instances.clone());
                 }
                 RenderDraw::Indirect { buffer, offset } => {
                     let args = ctx
-                        .get_buffer(buffer)
+                        .get_buffer(*buffer)
                         .expect("indirect draw buffer missing from registry");
-                    pass.draw_indirect(args, offset);
+                    pass.draw_indirect(args, *offset);
+                }
+                RenderDraw::DirectIndexed {
+                    indices,
+                    base_vertex,
+                    instances,
+                } => {
+                    pass.draw_indexed(indices.clone(), *base_vertex, instances.clone());
+                }
+                RenderDraw::IndirectIndexed { buffer, offset } => {
+                    let args = ctx
+                        .get_buffer(*buffer)
+                        .expect("indirect indexed draw buffer missing from registry");
+                    pass.draw_indexed_indirect(args, *offset);
                 }
             }
         }
@@ -191,7 +312,9 @@ pub struct RenderPassBuilder {
     writes: Vec<u64>,
     pipeline: Option<Handle<wgpu::RenderPipeline>>,
     color_attachments: Vec<ColorAttachment>,
+    depth_stencil: Option<DepthStencilAttachment>,
     vertex_buffers: Vec<VertexBufferBinding>,
+    index_buffer: Option<IndexBufferBinding>,
     bind_groups: Vec<BoundBindGroup>,
     draw: Option<RenderDraw>,
 }
@@ -204,7 +327,9 @@ impl RenderPassBuilder {
             writes: Vec::new(),
             pipeline: None,
             color_attachments: Vec::new(),
+            depth_stencil: None,
             vertex_buffers: Vec::new(),
+            index_buffer: None,
             bind_groups: Vec::new(),
             draw: None,
         }
@@ -265,6 +390,41 @@ impl RenderPassBuilder {
         self
     }
 
+    /// Binds an index buffer for [`Self::draw_indexed`](Self::draw_indexed) /
+    /// [`Self::draw_indexed_ranges`](Self::draw_indexed_ranges) /
+    /// [`Self::draw_indexed_indirect`](Self::draw_indexed_indirect).
+    pub fn with_index_buffer(
+        mut self,
+        buffer: Handle<wgpu::Buffer>,
+        format: wgpu::IndexFormat,
+    ) -> Self {
+        self.reads.push(buffer.id());
+        self.index_buffer = Some(IndexBufferBinding {
+            buffer,
+            offset: 0,
+            size: None,
+            format,
+        });
+        self
+    }
+
+    pub fn with_index_buffer_slice(
+        mut self,
+        buffer: Handle<wgpu::Buffer>,
+        format: wgpu::IndexFormat,
+        offset: u64,
+        size: u64,
+    ) -> Self {
+        self.reads.push(buffer.id());
+        self.index_buffer = Some(IndexBufferBinding {
+            buffer,
+            offset,
+            size: Some(size),
+            format,
+        });
+        self
+    }
+
     pub fn with_color_attachment(
         mut self,
         view: Handle<wgpu::TextureView>,
@@ -291,6 +451,57 @@ impl RenderPassBuilder {
         self
     }
 
+    /// Depth (and optional stencil) attachment. Stencil ops default to `None` (depth-only targets).
+    pub fn with_depth_stencil_attachment(
+        mut self,
+        view: Handle<wgpu::TextureView>,
+        depth_load: DepthLoadOp,
+        depth_store: wgpu::StoreOp,
+        stencil_ops: Option<wgpu::Operations<u32>>,
+    ) -> Self {
+        let id = view.id();
+        self.reads.push(id);
+        self.writes.push(id);
+        let depth_load_op = match depth_load {
+            DepthLoadOp::Load => wgpu::LoadOp::Load,
+            DepthLoadOp::Clear(v) => wgpu::LoadOp::Clear(v),
+        };
+        self.depth_stencil = Some(DepthStencilAttachment {
+            view: DepthAttachmentView::Static(view),
+            depth_ops: wgpu::Operations {
+                load: depth_load_op,
+                store: depth_store,
+            },
+            stencil_ops,
+        });
+        self
+    }
+
+    pub fn with_frame_depth_stencil_attachment(
+        mut self,
+        view: Handle<FrameTextureView>,
+        depth_load: DepthLoadOp,
+        depth_store: wgpu::StoreOp,
+        stencil_ops: Option<wgpu::Operations<u32>>,
+    ) -> Self {
+        let id = view.id();
+        self.reads.push(id);
+        self.writes.push(id);
+        let depth_load_op = match depth_load {
+            DepthLoadOp::Load => wgpu::LoadOp::Load,
+            DepthLoadOp::Clear(v) => wgpu::LoadOp::Clear(v),
+        };
+        self.depth_stencil = Some(DepthStencilAttachment {
+            view: DepthAttachmentView::FrameSlot(view),
+            depth_ops: wgpu::Operations {
+                load: depth_load_op,
+                store: depth_store,
+            },
+            stencil_ops,
+        });
+        self
+    }
+
     pub fn draw(mut self, vertex_count: u32, instance_count: u32) -> Self {
         self.draw = Some(RenderDraw::direct(vertex_count, instance_count));
         self
@@ -311,11 +522,52 @@ impl RenderPassBuilder {
         self
     }
 
+    pub fn draw_indexed(
+        mut self,
+        index_count: u32,
+        base_vertex: i32,
+        instance_count: u32,
+    ) -> Self {
+        self.draw = Some(RenderDraw::direct_indexed(
+            index_count,
+            base_vertex,
+            instance_count,
+        ));
+        self
+    }
+
+    pub fn draw_indexed_ranges(
+        mut self,
+        indices: std::ops::Range<u32>,
+        base_vertex: i32,
+        instances: std::ops::Range<u32>,
+    ) -> Self {
+        self.draw = Some(RenderDraw::direct_indexed_ranges(
+            indices,
+            base_vertex,
+            instances,
+        ));
+        self
+    }
+
+    pub fn draw_indexed_indirect(mut self, buffer: Handle<wgpu::Buffer>, offset: u64) -> Self {
+        self.reads.push(buffer.id());
+        self.draw = Some(RenderDraw::indirect_indexed(buffer, offset));
+        self
+    }
+
     pub fn build(self) -> Result<PassBuilder, RenderPassError> {
         let pipeline = self.pipeline.ok_or(RenderPassError::MissingPipeline)?;
-        let draw = self.draw.ok_or(RenderPassError::MissingDraw)?;
+        let draw = self.draw.as_ref().ok_or(RenderPassError::MissingDraw)?;
         if self.color_attachments.is_empty() {
             return Err(RenderPassError::MissingColorAttachment);
+        }
+
+        let indexed = draw.is_indexed();
+        match (&self.index_buffer, indexed) {
+            (None, true) => return Err(RenderPassError::MissingIndexBuffer),
+            (Some(_), false) => return Err(RenderPassError::UnexpectedIndexBuffer),
+            _ => {}
         }
 
         let mut builder = PassBuilder::new(self.name.clone());
@@ -330,9 +582,11 @@ impl RenderPassBuilder {
             name: self.name,
             pipeline,
             color_attachments: self.color_attachments,
+            depth_stencil: self.depth_stencil,
             vertex_buffers: self.vertex_buffers,
+            index_buffer: self.index_buffer,
             bind_groups: self.bind_groups,
-            draw,
+            draw: self.draw.expect("draw checked above"),
         })))
     }
 }
@@ -379,5 +633,37 @@ mod tests {
             .expect("builder should require a draw");
 
         assert!(matches!(err, RenderPassError::MissingDraw));
+    }
+
+    #[test]
+    fn test_indexed_draw_requires_index_buffer() {
+        let pipeline = Handle::<wgpu::RenderPipeline>::next();
+        let view = Handle::<wgpu::TextureView>::next();
+        let err = RenderPassBuilder::new("render")
+            .with_pipeline(pipeline)
+            .with_color_attachment(view, ColorLoadOp::Load)
+            .draw_indexed(6, 0, 1)
+            .build()
+            .err()
+            .expect("indexed draw should require index buffer");
+
+        assert!(matches!(err, RenderPassError::MissingIndexBuffer));
+    }
+
+    #[test]
+    fn test_vertex_draw_rejects_index_buffer() {
+        let pipeline = Handle::<wgpu::RenderPipeline>::next();
+        let color = Handle::<wgpu::TextureView>::next();
+        let index_buf = Handle::<wgpu::Buffer>::next();
+        let err = RenderPassBuilder::new("render")
+            .with_pipeline(pipeline)
+            .with_color_attachment(color, ColorLoadOp::Load)
+            .with_index_buffer(index_buf, wgpu::IndexFormat::Uint32)
+            .draw(3, 1)
+            .build()
+            .err()
+            .expect("vertex draw should not allow index buffer");
+
+        assert!(matches!(err, RenderPassError::UnexpectedIndexBuffer));
     }
 }

@@ -196,6 +196,14 @@ pub enum RenderPassError {
     /// Render pass requires a draw configuration.
     #[error("render pass requires a draw configuration")]
     MissingDraw,
+
+    /// Indexed draw requires `with_index_buffer` before `build`.
+    #[error("indexed draw requires an index buffer")]
+    MissingIndexBuffer,
+
+    /// Non-indexed draw must not set an index buffer.
+    #[error("non-indexed draw cannot use an index buffer")]
+    UnexpectedIndexBuffer,
 }
 
 /// Errors that occur during frame graph operations.

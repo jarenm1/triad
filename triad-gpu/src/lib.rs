@@ -43,7 +43,7 @@ pub use frame_graph::{
 pub use frame_slot::{FrameBufferHandle, FrameTextureView};
 pub use indirect::{DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectArgs};
 pub use pipeline::RenderPipelineBuilder;
-pub use render::{ColorLoadOp, RenderDraw, RenderPassBuilder};
+pub use render::{ColorLoadOp, DepthLoadOp, RenderDraw, RenderPassBuilder};
 pub use resource_registry::ResourceRegistry;
 pub use surface::SurfaceWrapper;
 pub use spatial_grid::{
