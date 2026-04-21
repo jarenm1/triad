@@ -636,7 +636,7 @@ impl ViewerState {
                         });
 
                         ui.horizontal(|ui| {
-                            ui.label("VSync:");
+                            ui.label("Present:");
 
                             if ui
                                 .selectable_label(
@@ -644,7 +644,7 @@ impl ViewerState {
                                         self.current_present_mode,
                                         wgpu::PresentMode::AutoVsync
                                     ),
-                                    "On",
+                                    "Auto vsync",
                                 )
                                 .clicked()
                             {
@@ -669,6 +669,19 @@ impl ViewerState {
                                 .clicked()
                             {
                                 new_mode = Some(wgpu::PresentMode::Mailbox);
+                            }
+
+                            if ui
+                                .selectable_label(
+                                    matches!(
+                                        self.current_present_mode,
+                                        wgpu::PresentMode::AutoNoVsync
+                                    ),
+                                    "Auto no vsync",
+                                )
+                                .clicked()
+                            {
+                                new_mode = Some(wgpu::PresentMode::AutoNoVsync);
                             }
                         });
                     });
