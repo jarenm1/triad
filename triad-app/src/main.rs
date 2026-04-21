@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use tracing::{error, info};
 use triad_gpu::{
-    BindingType, BufferUsage, ComputePassBuilder, CopyPassBuilder, DispatchIndirectArgs,
+    BindingType, BufferUsage, ComputePassBuilder, CopyPassBuilder, DepthLoadOp, DispatchIndirectArgs,
     DrawIndirectArgs, ExecutableFrameGraph, FrameBufferHandle, FrameGraph, FrameGraphError,
     FrameTextureView, Handle, Pass, PassBuilder, PassContext, RenderPassBuilder, Renderer,
     ResourceRegistry, ShaderStage,
@@ -13,7 +13,9 @@ use triad_gpu::{
 };
 use triad_window::{CameraUniforms, RendererManager, WindowConfig, egui, run_with_renderer_config};
 
-const PARTICLE_COUNT: usize = 131_072;
+const DEFAULT_PARTICLE_COUNT: usize = 131_072;
+const MIN_PARTICLE_COUNT: usize = 4_096;
+const MAX_PARTICLE_COUNT: usize = 8_388_608;
 const WORKGROUP_SIZE: u32 = 64;
 const PARTICLE_SPEED_SCALE: f32 = 6.0;
 
@@ -50,6 +52,24 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     grid_positions[i] = vec4<f32>(p.x, p.y, 0.0, 0.0);
 }
 "#;
+
+fn particle_count_from_env() -> usize {
+    let raw = std::env::var("TRIAD_PARTICLE_COUNT")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok());
+    let n = raw.unwrap_or(DEFAULT_PARTICLE_COUNT);
+    let n = n.clamp(MIN_PARTICLE_COUNT, MAX_PARTICLE_COUNT);
+    if raw.is_some_and(|r| r != n) {
+        tracing::warn!(
+            requested = raw,
+            clamped = n,
+            min = MIN_PARTICLE_COUNT,
+            max = MAX_PARTICLE_COUNT,
+            "TRIAD_PARTICLE_COUNT clamped for safety"
+        );
+    }
+    n
+}
 const READBACK_INTERVAL_FRAMES: u64 = 15;
 const READBACK_RING_SIZE: usize = 3;
 const READBACK_VALIDATE_INTERVAL_FRAMES: u64 = 240;
@@ -204,8 +224,11 @@ fn vs_main(@builtin(instance_index) instance_index: u32) -> VertexOutput {
     let particle_id = visible.ids[instance_index];
     let particle = particles.particles[particle_id];
 
+    let n = max(arrayLength(&particles.particles), 1u);
+    let z = 0.05 + 0.9 * (f32(particle_id) / f32(n));
+
     var out: VertexOutput;
-    out.position = vec4<f32>(particle.position, 0.0, 1.0);
+    out.position = vec4<f32>(particle.position, z, 1.0);
     return out;
 }
 
@@ -225,12 +248,12 @@ struct ParticleState {
 }
 
 impl ParticleState {
-    fn from_index(index: usize) -> Self {
+    fn from_index(index: usize, particle_count: usize) -> Self {
         let grid_width = 512usize;
         let x = (index % grid_width) as f32;
         let y = (index / grid_width) as f32;
         let px = (x / grid_width as f32) * 1.8 - 0.9;
-        let py = (y / ((PARTICLE_COUNT / grid_width).max(1) as f32)) * 1.8 - 0.9;
+        let py = (y / ((particle_count / grid_width).max(1) as f32)) * 1.8 - 0.9;
 
         let angle = (index as f32) * 0.017;
         let speed = 0.0006 + ((index % 11) as f32) * 0.00004;
@@ -261,6 +284,8 @@ struct DemoStats {
     gpu_visible_count_sync: u32,
     dt_ms: f32,
     speed_scale: f32,
+    /// Live UI control; applied to simulation each frame.
+    user_speed_scale: f32,
     update_cpu_ms: f32,
     graph_build_cpu_ms: f32,
     readback_cpu_ms: f32,
@@ -279,6 +304,7 @@ impl DemoStats {
             gpu_visible_count_sync: 0,
             dt_ms: 0.0,
             speed_scale: PARTICLE_SPEED_SCALE,
+            user_speed_scale: PARTICLE_SPEED_SCALE,
             update_cpu_ms: 0.0,
             graph_build_cpu_ms: 0.0,
             readback_cpu_ms: 0.0,
@@ -340,6 +366,7 @@ struct ParticleRendererManager {
     frame_index: u64,
     stats: Arc<Mutex<DemoStats>>,
     frame_target: Handle<FrameTextureView>,
+    depth_frame: Handle<FrameTextureView>,
     spatial_grid: Arc<SpatialGridGpu>,
     particles_to_grid_pipeline: Handle<wgpu::ComputePipeline>,
     particles_to_grid_bind_group: Handle<wgpu::BindGroup>,
@@ -352,11 +379,13 @@ impl ParticleRendererManager {
         registry: &mut ResourceRegistry,
         surface_format: wgpu::TextureFormat,
         stats: Arc<Mutex<DemoStats>>,
+        particle_count: usize,
     ) -> Result<Self, Box<dyn Error>> {
-        let particles: Vec<ParticleState> =
-            (0..PARTICLE_COUNT).map(ParticleState::from_index).collect();
+        let particles: Vec<ParticleState> = (0..particle_count)
+            .map(|i| ParticleState::from_index(i, particle_count))
+            .collect();
 
-        let dispatch_count = (PARTICLE_COUNT as u32).div_ceil(WORKGROUP_SIZE);
+        let dispatch_count = (particle_count as u32).div_ceil(WORKGROUP_SIZE);
 
         let particle_buffer = renderer
             .create_gpu_buffer::<ParticleState>()
@@ -366,7 +395,7 @@ impl ParticleRendererManager {
         let visible_ids = renderer
             .create_gpu_buffer::<u32>()
             .label("visible ids")
-            .capacity(PARTICLE_COUNT)
+            .capacity(particle_count)
             .build(registry)?;
         let dispatch_args = renderer
             .create_gpu_buffer::<DispatchIndirectArgs>()
@@ -406,6 +435,7 @@ impl ParticleRendererManager {
             .expect("frame buffer readback slot should exist")
             .set(readback_ring[0].handle);
         let frame_target = registry.insert(FrameTextureView::new());
+        let depth_frame = registry.insert(FrameTextureView::new());
         let sim_params_buffer = renderer
             .create_gpu_buffer::<SimParams>()
             .label("simulation params")
@@ -443,14 +473,14 @@ impl ParticleRendererManager {
             [-1.0, -1.0, 0.0],
             cell_size,
             SPATIAL_GRID_DIMS,
-            PARTICLE_COUNT as u32,
+            particle_count as u32,
         );
         let spatial_grid = Arc::new(SpatialGridGpu::new(
             renderer,
             registry,
             SpatialGridConfig {
                 params: grid_params,
-                max_entities: PARTICLE_COUNT as u32,
+                max_entities: particle_count as u32,
             },
         )?);
 
@@ -491,7 +521,7 @@ impl ParticleRendererManager {
             .with_compute_shader(particles_to_grid_shader)
             .with_layout(particles_to_grid_pl)
             .build(registry)?;
-        let particles_to_grid_dispatch_x = (PARTICLE_COUNT as u32).div_ceil(WORKGROUP_SIZE);
+        let particles_to_grid_dispatch_x = (particle_count as u32).div_ceil(WORKGROUP_SIZE);
 
         let (reset_layout, reset_bind_group) = renderer
             .create_bind_group()
@@ -637,6 +667,13 @@ impl ParticleRendererManager {
                 blend: Some(wgpu::BlendState::REPLACE),
                 write_mask: wgpu::ColorWrites::ALL,
             }))
+            .with_depth_stencil(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            })
             .build(registry)?;
 
         Ok(Self {
@@ -662,6 +699,7 @@ impl ParticleRendererManager {
             frame_index: 0,
             stats,
             frame_target,
+            depth_frame,
             spatial_grid,
             particles_to_grid_pipeline,
             particles_to_grid_bind_group,
@@ -684,9 +722,15 @@ impl RendererManager for ParticleRendererManager {
             .clamp(1.0 / 240.0, 1.0 / 10.0);
         self.last_update = now;
 
+        let speed_scale = self
+            .stats
+            .lock()
+            .map(|s| s.user_speed_scale)
+            .unwrap_or(PARTICLE_SPEED_SCALE);
+
         let params = [SimParams {
             dt_seconds,
-            speed_scale: PARTICLE_SPEED_SCALE,
+            speed_scale,
             _pad: [0.0; 2],
         }];
         renderer.write_buffer(self.sim_params_buffer, &params, registry)?;
@@ -808,12 +852,18 @@ impl RendererManager for ParticleRendererManager {
         &mut self,
         registry: &mut ResourceRegistry,
         final_view: Arc<wgpu::TextureView>,
-        _depth_view: Option<Arc<wgpu::TextureView>>,
+        depth_view: Option<Arc<wgpu::TextureView>>,
     ) -> Result<bool, Box<dyn Error>> {
         let slot = registry
             .get(self.frame_target)
             .expect("frame target slot should exist");
         slot.set(final_view);
+        if let Some(depth) = depth_view {
+            registry
+                .get(self.depth_frame)
+                .expect("depth frame slot should exist")
+                .set(depth);
+        }
         Ok(false)
     }
 
@@ -900,6 +950,12 @@ impl RendererManager for ParticleRendererManager {
                     a: 1.0,
                 }),
             )
+            .with_frame_depth_stencil_attachment(
+                self.depth_frame,
+                DepthLoadOp::Clear(1.0),
+                wgpu::StoreOp::Store,
+                None,
+            )
             .draw_indirect(self.draw_args, 0)
             .build()
             .expect("render pass should build");
@@ -953,6 +1009,8 @@ fn init_logging() {
 fn main() -> Result<(), Box<dyn Error>> {
     init_logging();
     info!("starting triad app");
+    let particle_count = particle_count_from_env();
+    info!(particle_count, "particle count (override with TRIAD_PARTICLE_COUNT)");
     info!(
         display = std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".to_string()),
         wayland = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_string()),
@@ -961,8 +1019,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     let stats = Arc::new(Mutex::new(DemoStats::new(
-        PARTICLE_COUNT,
-        (PARTICLE_COUNT as u32).div_ceil(WORKGROUP_SIZE),
+        particle_count,
+        (particle_count as u32).div_ceil(WORKGROUP_SIZE),
         total_cells(SPATIAL_GRID_DIMS),
     )));
     let ui_stats = Arc::clone(&stats);
@@ -976,44 +1034,56 @@ fn main() -> Result<(), Box<dyn Error>> {
         |controls| {
             let ui_stats = Arc::clone(&ui_stats);
             controls.on_ui(move |ctx| {
-                let snapshot = ui_stats.lock().ok().map(|stats| stats.clone());
+                let Ok(mut stats) = ui_stats.lock() else {
+                    return;
+                };
                 egui::Window::new("Triad")
                     .default_pos(egui::pos2(16.0, 96.0))
                     .resizable(false)
                     .show(ctx, |ui| {
                         ui.label("Compute-driven particle demo");
+                        ui.label(format!(
+                            "Stress: set TRIAD_PARTICLE_COUNT ({}..={})",
+                            MIN_PARTICLE_COUNT, MAX_PARTICLE_COUNT
+                        ));
                         ui.separator();
-                        if let Some(stats) = snapshot {
-                            ui.label(format!("Particles: {}", stats.particle_count));
-                            ui.label(format!("Workgroups: {}", stats.workgroup_count));
-                            ui.label(format!(
-                                "Spatial grid: {} cells ({}×{}×{})",
-                                stats.spatial_grid_cells,
-                                SPATIAL_GRID_DIMS[0],
-                                SPATIAL_GRID_DIMS[1],
-                                SPATIAL_GRID_DIMS[2]
-                            ));
-                            ui.label(format!("GPU visible count: {}", stats.gpu_visible_count));
-                            ui.label(format!(
-                                "GPU visible count sync: {}",
-                                stats.gpu_visible_count_sync
-                            ));
-                            ui.label(format!("Sim dt: {:.3} ms", stats.dt_ms));
-                            ui.label(format!("Speed scale: {:.2}", stats.speed_scale));
-                            ui.label(format!("Update CPU: {:.3} ms", stats.update_cpu_ms));
-                            ui.label(format!(
-                                "Graph build CPU: {:.3} ms",
-                                stats.graph_build_cpu_ms
-                            ));
-                            ui.label(format!("Readback CPU: {:.3} ms", stats.readback_cpu_ms));
-                            ui.label(format!(
-                                "Readback sync CPU: {:.3} ms",
-                                stats.readback_sync_cpu_ms
-                            ));
-                            ui.label(format!("Readback mismatch: {}", stats.readback_mismatch));
-                            ui.label(format!("Cached pass order len: {}", stats.cached_order_len));
-                        }
-                        ui.label("Frame: reset → simulate → to-grid → spatial rebuild → compact → draw");
+                        ui.label(format!("Particles: {}", stats.particle_count));
+                        ui.label(format!("Workgroups: {}", stats.workgroup_count));
+                        ui.label(format!(
+                            "Spatial grid: {} cells ({}×{}×{})",
+                            stats.spatial_grid_cells,
+                            SPATIAL_GRID_DIMS[0],
+                            SPATIAL_GRID_DIMS[1],
+                            SPATIAL_GRID_DIMS[2]
+                        ));
+                        ui.add(
+                            egui::Slider::new(&mut stats.user_speed_scale, 0.25..=24.0)
+                                .text("Speed scale"),
+                        );
+                        ui.label(format!("GPU visible count: {}", stats.gpu_visible_count));
+                        ui.label(format!(
+                            "GPU visible count sync: {}",
+                            stats.gpu_visible_count_sync
+                        ));
+                        ui.label(format!("Sim dt: {:.3} ms", stats.dt_ms));
+                        ui.label(format!("Speed scale (applied): {:.2}", stats.speed_scale));
+                        ui.label(format!("Update CPU: {:.3} ms", stats.update_cpu_ms));
+                        ui.label(format!(
+                            "Graph build CPU: {:.3} ms",
+                            stats.graph_build_cpu_ms
+                        ));
+                        ui.label(format!("Readback CPU: {:.3} ms", stats.readback_cpu_ms));
+                        ui.label(format!(
+                            "Readback sync CPU: {:.3} ms",
+                            stats.readback_sync_cpu_ms
+                        ));
+                        ui.label(format!("Readback mismatch: {}", stats.readback_mismatch));
+                        ui.label(format!("Cached pass order len: {}", stats.cached_order_len));
+                        ui.separator();
+                        ui.label(
+                            "Frame: reset → simulate → to-grid → spatial rebuild → compact → readback → draw",
+                        );
+                        ui.label("Depth: Less + Depth32Float (per-instance z from id).");
                         ui.label("Simulation is time-based; GPU resources are persistent.");
                     });
             });
@@ -1025,6 +1095,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 registry,
                 surface_format,
                 Arc::clone(&manager_stats),
+                particle_count,
             )?))
         },
     );
