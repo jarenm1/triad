@@ -7,7 +7,7 @@ use std::borrow::Cow;
 use std::marker::PhantomData;
 
 use crate::Renderer;
-use crate::error::{BindGroupError, BufferError, PipelineError, ShaderError};
+use crate::error::{BindGroupError, BufferError, PipelineError, ShaderError, TextureError};
 use crate::frame_graph::resource::Handle;
 use crate::resource_registry::ResourceRegistry;
 
@@ -200,6 +200,207 @@ impl<'a> ShaderModuleBuilder<'a> {
         };
 
         Ok(registry.insert(module))
+    }
+}
+
+/// Builder for creating persistent GPU textures.
+pub struct TextureBuilder<'a> {
+    device: &'a wgpu::Device,
+    label: Option<String>,
+    size: Option<wgpu::Extent3d>,
+    mip_level_count: u32,
+    sample_count: u32,
+    dimension: wgpu::TextureDimension,
+    format: Option<wgpu::TextureFormat>,
+    usage: wgpu::TextureUsages,
+    view_formats: Vec<wgpu::TextureFormat>,
+}
+
+impl<'a> TextureBuilder<'a> {
+    pub(crate) fn new(device: &'a wgpu::Device) -> Self {
+        Self {
+            device,
+            label: None,
+            size: None,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: None,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: Vec::new(),
+        }
+    }
+
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn size(mut self, size: wgpu::Extent3d) -> Self {
+        self.size = Some(size);
+        self
+    }
+
+    pub fn size_2d(mut self, width: u32, height: u32) -> Self {
+        self.size = Some(wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        });
+        self
+    }
+
+    pub fn mip_level_count(mut self, mip_level_count: u32) -> Self {
+        self.mip_level_count = mip_level_count;
+        self
+    }
+
+    pub fn sample_count(mut self, sample_count: u32) -> Self {
+        self.sample_count = sample_count;
+        self
+    }
+
+    pub fn dimension(mut self, dimension: wgpu::TextureDimension) -> Self {
+        self.dimension = dimension;
+        self
+    }
+
+    pub fn format(mut self, format: wgpu::TextureFormat) -> Self {
+        self.format = Some(format);
+        self
+    }
+
+    pub fn usage_flags(mut self, usage: wgpu::TextureUsages) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    pub fn add_usage(mut self, usage: wgpu::TextureUsages) -> Self {
+        self.usage |= usage;
+        self
+    }
+
+    pub fn view_formats(mut self, view_formats: impl Into<Vec<wgpu::TextureFormat>>) -> Self {
+        self.view_formats = view_formats.into();
+        self
+    }
+
+    pub fn build(
+        self,
+        registry: &mut ResourceRegistry,
+    ) -> Result<Handle<wgpu::Texture>, TextureError> {
+        let size = self.size.ok_or(TextureError::MissingSize)?;
+        let format = self.format.ok_or(TextureError::MissingFormat)?;
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: self.label.as_deref(),
+            size,
+            mip_level_count: self.mip_level_count,
+            sample_count: self.sample_count,
+            dimension: self.dimension,
+            format,
+            usage: self.usage,
+            view_formats: &self.view_formats,
+        });
+        Ok(registry.insert(texture))
+    }
+}
+
+/// Builder for creating persistent texture views from registered textures.
+pub struct TextureViewBuilder<'a> {
+    label: Option<String>,
+    texture: Handle<wgpu::Texture>,
+    format: Option<wgpu::TextureFormat>,
+    dimension: Option<wgpu::TextureViewDimension>,
+    usage: Option<wgpu::TextureUsages>,
+    aspect: wgpu::TextureAspect,
+    base_mip_level: u32,
+    mip_level_count: Option<u32>,
+    base_array_layer: u32,
+    array_layer_count: Option<u32>,
+    _marker: PhantomData<&'a wgpu::Texture>,
+}
+
+impl<'a> TextureViewBuilder<'a> {
+    pub(crate) fn new(texture: Handle<wgpu::Texture>) -> Self {
+        Self {
+            label: None,
+            texture,
+            format: None,
+            dimension: None,
+            usage: None,
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: None,
+            base_array_layer: 0,
+            array_layer_count: None,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn format(mut self, format: wgpu::TextureFormat) -> Self {
+        self.format = Some(format);
+        self
+    }
+
+    pub fn dimension(mut self, dimension: wgpu::TextureViewDimension) -> Self {
+        self.dimension = Some(dimension);
+        self
+    }
+
+    pub fn usage(mut self, usage: wgpu::TextureUsages) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+
+    pub fn aspect(mut self, aspect: wgpu::TextureAspect) -> Self {
+        self.aspect = aspect;
+        self
+    }
+
+    pub fn base_mip_level(mut self, base_mip_level: u32) -> Self {
+        self.base_mip_level = base_mip_level;
+        self
+    }
+
+    pub fn mip_level_count(mut self, mip_level_count: u32) -> Self {
+        self.mip_level_count = Some(mip_level_count);
+        self
+    }
+
+    pub fn base_array_layer(mut self, base_array_layer: u32) -> Self {
+        self.base_array_layer = base_array_layer;
+        self
+    }
+
+    pub fn array_layer_count(mut self, array_layer_count: u32) -> Self {
+        self.array_layer_count = Some(array_layer_count);
+        self
+    }
+
+    pub fn build(
+        self,
+        registry: &mut ResourceRegistry,
+    ) -> Result<Handle<wgpu::TextureView>, TextureError> {
+        let texture = registry
+            .get(self.texture)
+            .ok_or(TextureError::TextureNotFound)?;
+        let view = texture.create_view(&wgpu::TextureViewDescriptor {
+            label: self.label.as_deref(),
+            format: self.format,
+            dimension: self.dimension,
+            usage: self.usage,
+            aspect: self.aspect,
+            base_mip_level: self.base_mip_level,
+            mip_level_count: self.mip_level_count,
+            base_array_layer: self.base_array_layer,
+            array_layer_count: self.array_layer_count,
+        });
+        Ok(registry.insert(view))
     }
 }
 
@@ -644,6 +845,11 @@ pub enum BindingType {
         view_dimension: wgpu::TextureViewDimension,
         multisampled: bool,
     },
+    StorageTexture {
+        access: wgpu::StorageTextureAccess,
+        format: wgpu::TextureFormat,
+        view_dimension: wgpu::TextureViewDimension,
+    },
     Sampler {
         filtering: bool,
     },
@@ -675,6 +881,15 @@ impl BindingType {
                 sample_type: *sample_type,
                 view_dimension: *view_dimension,
                 multisampled: *multisampled,
+            },
+            BindingType::StorageTexture {
+                access,
+                format,
+                view_dimension,
+            } => wgpu::BindingType::StorageTexture {
+                access: *access,
+                format: *format,
+                view_dimension: *view_dimension,
             },
             BindingType::Sampler { filtering } => wgpu::BindingType::Sampler(if *filtering {
                 wgpu::SamplerBindingType::Filtering
@@ -799,9 +1014,13 @@ impl<'a> BindGroupBuilder<'a> {
         texture_view_handle: Handle<wgpu::TextureView>,
         binding_type: BindingType,
     ) -> Self {
+        let visibility = match binding_type {
+            BindingType::StorageTexture { .. } => ShaderStage::ComputeFragment,
+            _ => ShaderStage::All,
+        };
         self.entries.push(BindGroupLayoutEntry {
             binding,
-            visibility: ShaderStage::All,
+            visibility,
             binding_type,
         });
 
@@ -1161,6 +1380,93 @@ mod tests {
     }
 
     #[test]
+    fn test_texture_builder_requires_size() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let result = TextureBuilder::new(&device)
+            .format(wgpu::TextureFormat::Rgba8Unorm)
+            .build(&mut registry);
+
+        assert!(matches!(result, Err(TextureError::MissingSize)));
+    }
+
+    #[test]
+    fn test_texture_builder_requires_format() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let result = TextureBuilder::new(&device)
+            .size_2d(64, 64)
+            .build(&mut registry);
+
+        assert!(matches!(result, Err(TextureError::MissingFormat)));
+    }
+
+    #[test]
+    fn test_texture_builder_builds_texture() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let handle = TextureBuilder::new(&device)
+            .label("offscreen color")
+            .size_2d(128, 64)
+            .format(wgpu::TextureFormat::Rgba8Unorm)
+            .add_usage(wgpu::TextureUsages::RENDER_ATTACHMENT)
+            .build(&mut registry)
+            .expect("texture");
+
+        let texture = registry.get(handle).expect("texture in registry");
+        let size = texture.size();
+        assert_eq!(size.width, 128);
+        assert_eq!(size.height, 64);
+        assert_eq!(texture.format(), wgpu::TextureFormat::Rgba8Unorm);
+        assert!(
+            texture
+                .usage()
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+        );
+        assert!(
+            texture
+                .usage()
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+        );
+    }
+
+    #[test]
+    fn test_texture_view_builder_requires_texture() {
+        let mut registry = ResourceRegistry::default();
+        let fake_handle = crate::frame_graph::resource::Handle::<wgpu::Texture>::next();
+
+        let result = TextureViewBuilder::new(fake_handle).build(&mut registry);
+
+        assert!(matches!(result, Err(TextureError::TextureNotFound)));
+    }
+
+    #[test]
+    fn test_texture_view_builder_builds_view() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let texture = TextureBuilder::new(&device)
+            .size_2d(32, 32)
+            .format(wgpu::TextureFormat::Depth32Float)
+            .usage_flags(
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            )
+            .build(&mut registry)
+            .expect("texture");
+
+        let view = TextureViewBuilder::new(texture)
+            .label("depth view")
+            .aspect(wgpu::TextureAspect::DepthOnly)
+            .build(&mut registry)
+            .expect("texture view");
+
+        assert!(registry.get(view).is_some());
+    }
+
+    #[test]
     fn test_compute_pipeline_builder_missing_shader() {
         let (device, _queue) = create_test_device().block_on();
         let mut registry = ResourceRegistry::default();
@@ -1275,6 +1581,26 @@ mod tests {
                 assert_eq!(ty, wgpu::SamplerBindingType::Filtering);
             }
             _ => panic!("Expected Sampler binding type"),
+        }
+
+        // Test storage texture binding type
+        let storage_texture_ty = BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        }
+        .to_wgpu_binding_type();
+        match storage_texture_ty {
+            wgpu::BindingType::StorageTexture {
+                access,
+                format,
+                view_dimension,
+            } => {
+                assert_eq!(access, wgpu::StorageTextureAccess::WriteOnly);
+                assert_eq!(format, wgpu::TextureFormat::Rgba8Unorm);
+                assert_eq!(view_dimension, wgpu::TextureViewDimension::D2);
+            }
+            _ => panic!("Expected StorageTexture binding type"),
         }
     }
 }

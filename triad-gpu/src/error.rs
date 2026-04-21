@@ -19,6 +19,10 @@ pub enum GpuError {
     #[error(transparent)]
     Renderer(#[from] RendererError),
 
+    /// Error during texture operations
+    #[error(transparent)]
+    Texture(#[from] TextureError),
+
     /// Error during buffer operations
     #[error(transparent)]
     Buffer(#[from] BufferError),
@@ -87,6 +91,23 @@ pub enum RendererError {
     /// No supported alpha modes available
     #[error("no supported alpha modes available")]
     NoSupportedAlphaModes,
+}
+
+/// Errors that occur during buffer operations.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum TextureError {
+    /// Texture builder requires a size.
+    #[error("texture must have size specified")]
+    MissingSize,
+
+    /// Texture builder requires a format.
+    #[error("texture must have format specified")]
+    MissingFormat,
+
+    /// Texture handle not found in registry.
+    #[error("texture not found in registry")]
+    TextureNotFound,
 }
 
 /// Errors that occur during buffer operations.
@@ -266,6 +287,9 @@ mod tests {
 
         let err = ShaderError::MissingSource;
         assert_eq!(err.to_string(), "shader module must have source specified");
+
+        let err = TextureError::MissingSize;
+        assert_eq!(err.to_string(), "texture must have size specified");
     }
 
     #[test]
@@ -273,6 +297,13 @@ mod tests {
         let buffer_err = BufferError::NotFound;
         let gpu_err: GpuError = buffer_err.into();
         assert!(matches!(gpu_err, GpuError::Buffer(BufferError::NotFound)));
+
+        let texture_err = TextureError::MissingFormat;
+        let gpu_err: GpuError = texture_err.into();
+        assert!(matches!(
+            gpu_err,
+            GpuError::Texture(TextureError::MissingFormat)
+        ));
 
         let pipeline_err = PipelineError::MissingVertexShader;
         let gpu_err: GpuError = pipeline_err.into();

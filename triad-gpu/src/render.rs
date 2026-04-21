@@ -57,11 +57,7 @@ impl RenderDraw {
         Self::Indirect { buffer, offset }
     }
 
-    pub fn direct_indexed(
-        index_count: u32,
-        base_vertex: i32,
-        instance_count: u32,
-    ) -> Self {
+    pub fn direct_indexed(index_count: u32, base_vertex: i32, instance_count: u32) -> Self {
         Self::DirectIndexed {
             indices: 0..index_count,
             base_vertex,
@@ -95,7 +91,8 @@ impl RenderDraw {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ColorAttachmentView {
-    Static(Handle<wgpu::TextureView>),
+    StaticView(Handle<wgpu::TextureView>),
+    Texture(Handle<wgpu::Texture>),
     FrameSlot(Handle<FrameTextureView>),
 }
 
@@ -107,7 +104,8 @@ struct ColorAttachment {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum DepthAttachmentView {
-    Static(Handle<wgpu::TextureView>),
+    StaticView(Handle<wgpu::TextureView>),
+    Texture(Handle<wgpu::Texture>),
     FrameSlot(Handle<FrameTextureView>),
 }
 
@@ -153,8 +151,15 @@ struct RenderDispatchPass {
 }
 
 enum ResolvedColorView {
-    Static(Handle<wgpu::TextureView>),
+    StaticHandle(Handle<wgpu::TextureView>),
     Frame(Arc<wgpu::TextureView>),
+    Owned(wgpu::TextureView),
+}
+
+enum ResolvedDepthView {
+    StaticHandle(Handle<wgpu::TextureView>),
+    Frame(Arc<wgpu::TextureView>),
+    Owned(wgpu::TextureView),
 }
 
 impl Pass for RenderDispatchPass {
@@ -172,7 +177,15 @@ impl Pass for RenderDispatchPass {
             .color_attachments
             .iter()
             .map(|attachment| match attachment.view {
-                ColorAttachmentView::Static(handle) => ResolvedColorView::Static(handle),
+                ColorAttachmentView::StaticView(handle) => ResolvedColorView::StaticHandle(handle),
+                ColorAttachmentView::Texture(handle) => {
+                    let texture = ctx
+                        .get_texture(handle)
+                        .expect("color attachment texture missing from registry or transients");
+                    ResolvedColorView::Owned(
+                        texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                    )
+                }
                 ColorAttachmentView::FrameSlot(handle) => {
                     let slot = ctx
                         .resources
@@ -188,11 +201,12 @@ impl Pass for RenderDispatchPass {
         let mut color_views = Vec::with_capacity(self.color_attachments.len());
         for (attachment, resolved_view) in self.color_attachments.iter().zip(&resolved_views) {
             let view: &wgpu::TextureView = match resolved_view {
-                ResolvedColorView::Static(handle) => ctx
+                ResolvedColorView::StaticHandle(handle) => ctx
                     .resources
                     .get(*handle)
                     .expect("color attachment view missing from registry"),
                 ResolvedColorView::Frame(view) => view.as_ref(),
+                ResolvedColorView::Owned(view) => view,
             };
             let load = match attachment.load {
                 ColorLoadOp::Load => wgpu::LoadOp::Load,
@@ -210,21 +224,35 @@ impl Pass for RenderDispatchPass {
             }));
         }
 
-        let frame_depth_arc: Option<Arc<wgpu::TextureView>> =
-            self.depth_stencil.as_ref().and_then(|ds| {
-                if let DepthAttachmentView::FrameSlot(slot_h) = ds.view {
-                    let slot = ctx.resources.get(slot_h)?;
-                    slot.get()
-                } else {
-                    None
+        let resolved_depth_view: Option<ResolvedDepthView> =
+            self.depth_stencil.as_ref().map(|ds| match ds.view {
+                DepthAttachmentView::StaticView(handle) => ResolvedDepthView::StaticHandle(handle),
+                DepthAttachmentView::Texture(handle) => {
+                    let texture = ctx
+                        .get_texture(handle)
+                        .expect("depth attachment texture missing from registry or transients");
+                    ResolvedDepthView::Owned(
+                        texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                    )
+                }
+                DepthAttachmentView::FrameSlot(slot_h) => {
+                    let slot = ctx
+                        .resources
+                        .get(slot_h)
+                        .expect("frame texture view slot missing from registry");
+                    ResolvedDepthView::Frame(
+                        slot.get()
+                            .expect("frame texture view slot should be populated before execution"),
+                    )
                 }
             });
 
         let depth_stencil_for_pass: Option<wgpu::RenderPassDepthStencilAttachment<'_>> =
             self.depth_stencil.as_ref().and_then(|ds| {
-                let view: &wgpu::TextureView = match ds.view {
-                    DepthAttachmentView::Static(handle) => ctx.resources.get(handle)?,
-                    DepthAttachmentView::FrameSlot(_) => frame_depth_arc.as_ref()?.as_ref(),
+                let view: &wgpu::TextureView = match resolved_depth_view.as_ref()? {
+                    ResolvedDepthView::StaticHandle(handle) => ctx.resources.get(*handle)?,
+                    ResolvedDepthView::Frame(view) => view.as_ref(),
+                    ResolvedDepthView::Owned(view) => view,
                 };
                 Some(wgpu::RenderPassDepthStencilAttachment {
                     view,
@@ -432,7 +460,20 @@ impl RenderPassBuilder {
     ) -> Self {
         self.writes.push(view.id());
         self.color_attachments.push(ColorAttachment {
-            view: ColorAttachmentView::Static(view),
+            view: ColorAttachmentView::StaticView(view),
+            load,
+        });
+        self
+    }
+
+    pub fn with_color_texture_attachment(
+        mut self,
+        texture: Handle<wgpu::Texture>,
+        load: ColorLoadOp,
+    ) -> Self {
+        self.writes.push(texture.id());
+        self.color_attachments.push(ColorAttachment {
+            view: ColorAttachmentView::Texture(texture),
             load,
         });
         self
@@ -467,7 +508,35 @@ impl RenderPassBuilder {
             DepthLoadOp::Clear(v) => wgpu::LoadOp::Clear(v),
         };
         self.depth_stencil = Some(DepthStencilAttachment {
-            view: DepthAttachmentView::Static(view),
+            view: DepthAttachmentView::StaticView(view),
+            depth_ops: wgpu::Operations {
+                load: depth_load_op,
+                store: depth_store,
+            },
+            stencil_ops,
+        });
+        self
+    }
+
+    /// Depth (and optional stencil) attachment backed directly by a texture handle. A default
+    /// view is created at execution time, which lets transient textures participate without
+    /// pre-registering persistent texture views.
+    pub fn with_depth_stencil_texture(
+        mut self,
+        texture: Handle<wgpu::Texture>,
+        depth_load: DepthLoadOp,
+        depth_store: wgpu::StoreOp,
+        stencil_ops: Option<wgpu::Operations<u32>>,
+    ) -> Self {
+        let id = texture.id();
+        self.reads.push(id);
+        self.writes.push(id);
+        let depth_load_op = match depth_load {
+            DepthLoadOp::Load => wgpu::LoadOp::Load,
+            DepthLoadOp::Clear(v) => wgpu::LoadOp::Clear(v),
+        };
+        self.depth_stencil = Some(DepthStencilAttachment {
+            view: DepthAttachmentView::Texture(texture),
             depth_ops: wgpu::Operations {
                 load: depth_load_op,
                 store: depth_store,
@@ -522,12 +591,7 @@ impl RenderPassBuilder {
         self
     }
 
-    pub fn draw_indexed(
-        mut self,
-        index_count: u32,
-        base_vertex: i32,
-        instance_count: u32,
-    ) -> Self {
+    pub fn draw_indexed(mut self, index_count: u32, base_vertex: i32, instance_count: u32) -> Self {
         self.draw = Some(RenderDraw::direct_indexed(
             index_count,
             base_vertex,
@@ -619,6 +683,36 @@ mod tests {
             .expect("builder should require a color attachment");
 
         assert!(matches!(err, RenderPassError::MissingColorAttachment));
+    }
+
+    #[test]
+    fn test_render_pass_builder_accepts_texture_color_attachment() {
+        let pipeline = Handle::<wgpu::RenderPipeline>::next();
+        let texture = Handle::<wgpu::Texture>::next();
+
+        let pass = RenderPassBuilder::new("render")
+            .with_pipeline(pipeline)
+            .with_color_texture_attachment(texture, ColorLoadOp::Load)
+            .draw(3, 1)
+            .build();
+
+        assert!(pass.is_ok());
+    }
+
+    #[test]
+    fn test_render_pass_builder_accepts_texture_depth_attachment() {
+        let pipeline = Handle::<wgpu::RenderPipeline>::next();
+        let color = Handle::<wgpu::Texture>::next();
+        let depth = Handle::<wgpu::Texture>::next();
+
+        let pass = RenderPassBuilder::new("render")
+            .with_pipeline(pipeline)
+            .with_color_texture_attachment(color, ColorLoadOp::Load)
+            .with_depth_stencil_texture(depth, DepthLoadOp::Clear(1.0), wgpu::StoreOp::Store, None)
+            .draw(3, 1)
+            .build();
+
+        assert!(pass.is_ok());
     }
 
     #[test]

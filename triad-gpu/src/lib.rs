@@ -19,8 +19,8 @@ mod pipeline;
 mod reference_pipeline;
 mod render;
 mod resource_registry;
-mod surface;
 mod spatial_grid;
+mod surface;
 #[cfg(test)]
 mod test_util;
 mod type_map;
@@ -29,29 +29,30 @@ mod type_map;
 pub use error::{
     BindGroupError, BufferError, ComputePassError, CopyPassError, FrameGraphError, GpuError,
     PipelineError, ReadbackError, RenderPassError, RendererError, Result, ShaderError,
+    TextureError,
 };
 
 pub use builder::{
     BindGroupBuilder, BindingType, BufferBuilder, BufferUsage, ComputePipelineBuilder,
     DynamicBuffer, DynamicBufferBuilder, GpuBuffer, GpuBufferBuilder, ShaderModuleBuilder,
-    ShaderSource, ShaderStage,
+    ShaderSource, ShaderStage, TextureBuilder, TextureViewBuilder,
 };
 pub use compute::{ComputeDispatch, ComputePassBuilder};
 pub use copy::{BufferCopy, CopyPassBuilder};
 pub use frame_graph::{
     ExecutableFrameGraph, FrameGraph, Handle, Pass, PassBuilder, PassContext, ResourceType,
-    TransientBufferDesc,
+    TransientBufferDesc, TransientTextureDesc,
 };
 pub use frame_slot::{FrameBufferHandle, FrameTextureView};
 pub use indirect::{DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectArgs};
 pub use pipeline::RenderPipelineBuilder;
 pub use render::{ColorLoadOp, DepthLoadOp, RenderDraw, RenderPassBuilder};
 pub use resource_registry::ResourceRegistry;
-pub use surface::SurfaceWrapper;
 pub use spatial_grid::{
     EntityPosition, SpatialGridConfig, SpatialGridError, SpatialGridGpu, SpatialGridParams,
     SpatialGridResult, total_cells,
 };
+pub use surface::SurfaceWrapper;
 pub use wgpu;
 
 /// Prefer stable vsync-capable modes; only use [`wgpu::PresentMode::Immediate`] if nothing else is available.
@@ -148,6 +149,16 @@ impl Renderer {
     /// Create a bind group builder for constructing bind groups
     pub fn create_bind_group(&self) -> BindGroupBuilder<'_> {
         BindGroupBuilder::new(&self.device)
+    }
+
+    /// Create a texture builder for persistent GPU textures.
+    pub fn create_texture(&self) -> TextureBuilder<'_> {
+        TextureBuilder::new(&self.device)
+    }
+
+    /// Create a texture view builder for a registered texture handle.
+    pub fn create_texture_view(&self, texture: Handle<wgpu::Texture>) -> TextureViewBuilder<'_> {
+        TextureViewBuilder::new(texture)
     }
 
     /// Create a render pipeline builder.

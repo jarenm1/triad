@@ -120,6 +120,94 @@ impl TransientBufferDesc {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TransientTextureDesc {
+    label: Option<String>,
+    size: wgpu::Extent3d,
+    mip_level_count: u32,
+    sample_count: u32,
+    dimension: wgpu::TextureDimension,
+    format: wgpu::TextureFormat,
+    usage: wgpu::TextureUsages,
+    view_formats: Vec<wgpu::TextureFormat>,
+}
+
+impl TransientTextureDesc {
+    pub fn new(
+        size: wgpu::Extent3d,
+        format: wgpu::TextureFormat,
+        usage: wgpu::TextureUsages,
+    ) -> Self {
+        Self {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: Vec::new(),
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn with_mip_level_count(mut self, mip_level_count: u32) -> Self {
+        self.mip_level_count = mip_level_count;
+        self
+    }
+
+    pub fn with_sample_count(mut self, sample_count: u32) -> Self {
+        self.sample_count = sample_count;
+        self
+    }
+
+    pub fn with_dimension(mut self, dimension: wgpu::TextureDimension) -> Self {
+        self.dimension = dimension;
+        self
+    }
+
+    pub fn with_view_formats(mut self, view_formats: impl Into<Vec<wgpu::TextureFormat>>) -> Self {
+        self.view_formats = view_formats.into();
+        self
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    pub fn size(&self) -> wgpu::Extent3d {
+        self.size
+    }
+
+    pub fn mip_level_count(&self) -> u32 {
+        self.mip_level_count
+    }
+
+    pub fn sample_count(&self) -> u32 {
+        self.sample_count
+    }
+
+    pub fn dimension(&self) -> wgpu::TextureDimension {
+        self.dimension
+    }
+
+    pub fn format(&self) -> wgpu::TextureFormat {
+        self.format
+    }
+
+    pub fn usage(&self) -> wgpu::TextureUsages {
+        self.usage
+    }
+
+    pub fn view_formats(&self) -> &[wgpu::TextureFormat] {
+        &self.view_formats
+    }
+}
+
 /// Type-safe resource handle
 ///
 /// We manually implement Hash, Eq, PartialEq, Clone, Copy to avoid adding bounds on T.

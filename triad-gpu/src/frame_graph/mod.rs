@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use tracing::{debug_span, instrument};
 
 pub use pass::{Pass, PassBuilder, PassContext};
-pub use resource::{Handle, HandleId, ResourceType, TransientBufferDesc};
+pub use resource::{Handle, HandleId, ResourceType, TransientBufferDesc, TransientTextureDesc};
 
 pub type SurfaceId = u64;
 
@@ -19,6 +19,7 @@ pub struct FrameGraph {
     passes: Vec<PassNode>,
     resource_info: HashMap<HandleId, ResourceInfo>,
     transient_buffers: HashMap<HandleId, TransientBufferDesc>,
+    transient_textures: HashMap<HandleId, TransientTextureDesc>,
     surface_handles: Vec<SurfaceId>, // Surface handle IDs (surfaces tracked separately)
 }
 
@@ -48,6 +49,18 @@ impl FrameGraph {
             .entry(handle.id())
             .or_insert_with(ResourceInfo::new);
         self.transient_buffers.insert(handle.id(), desc);
+        handle
+    }
+
+    pub fn create_transient_texture(
+        &mut self,
+        desc: TransientTextureDesc,
+    ) -> Handle<wgpu::Texture> {
+        let handle = Handle::next();
+        self.resource_info
+            .entry(handle.id())
+            .or_insert_with(ResourceInfo::new);
+        self.transient_textures.insert(handle.id(), desc);
         handle
     }
 
@@ -129,6 +142,7 @@ impl FrameGraph {
             passes: self.passes,
             execution_order,
             transient_buffers: self.transient_buffers,
+            transient_textures: self.transient_textures,
             surface_handles: self.surface_handles,
         })
     }
@@ -139,6 +153,7 @@ pub struct ExecutableFrameGraph {
     passes: Vec<PassNode>,
     execution_order: Vec<usize>,
     transient_buffers: HashMap<HandleId, TransientBufferDesc>,
+    transient_textures: HashMap<HandleId, TransientTextureDesc>,
     surface_handles: Vec<u64>, // Surface handle IDs (surfaces tracked separately)
 }
 
@@ -183,11 +198,13 @@ impl ExecutableFrameGraph {
     ) -> Vec<wgpu::CommandBuffer> {
         let mut command_buffers = Vec::with_capacity(self.execution_order.len());
         let transient_buffers = self.create_transient_buffers(device);
+        let transient_textures = self.create_transient_textures(device);
         let ctx = pass::PassContext {
             device,
             queue,
             resources,
             transient_buffers: &transient_buffers,
+            transient_textures: &transient_textures,
         };
 
         // Track current runtime state of each resource
@@ -248,6 +265,24 @@ impl ExecutableFrameGraph {
         }
         buffers
     }
+
+    fn create_transient_textures(&self, device: &wgpu::Device) -> HashMap<HandleId, wgpu::Texture> {
+        let mut textures = HashMap::with_capacity(self.transient_textures.len());
+        for (&handle_id, desc) in &self.transient_textures {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: desc.label(),
+                size: desc.size(),
+                mip_level_count: desc.mip_level_count(),
+                sample_count: desc.sample_count(),
+                dimension: desc.dimension(),
+                format: desc.format(),
+                usage: desc.usage(),
+                view_formats: desc.view_formats(),
+            });
+            textures.insert(handle_id, texture);
+        }
+        textures
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +341,32 @@ mod tests {
             .expect("transient descriptor should be registered");
         assert_eq!(desc.size(), 256);
         assert_eq!(desc.label(), Some("transient_scratch"));
+    }
+
+    #[test]
+    fn test_frame_graph_transient_texture_registration() {
+        let mut frame_graph = FrameGraph::default();
+        let handle = frame_graph.create_transient_texture(
+            TransientTextureDesc::new(
+                wgpu::Extent3d {
+                    width: 64,
+                    height: 32,
+                    depth_or_array_layers: 1,
+                },
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            )
+            .with_label("transient_color"),
+        );
+
+        assert!(frame_graph.resource_info.contains_key(&handle.id()));
+        let desc = frame_graph
+            .transient_textures
+            .get(&handle.id())
+            .expect("transient texture descriptor should be registered");
+        assert_eq!(desc.size().width, 64);
+        assert_eq!(desc.size().height, 32);
+        assert_eq!(desc.label(), Some("transient_color"));
     }
 
     #[test]
@@ -582,6 +643,65 @@ mod tests {
             name: "TransientPass".to_string(),
             buffer: transient,
             expected_size: 128,
+        }));
+
+        frame_graph.add_pass(pass);
+        let mut executable = frame_graph.build().expect("frame graph should build");
+        let command_buffers =
+            executable.execute_no_submit(renderer.device(), renderer.queue(), &registry);
+
+        assert_eq!(command_buffers.len(), 1);
+    }
+
+    struct TransientTexturePass {
+        name: String,
+        texture: Handle<wgpu::Texture>,
+    }
+
+    impl Pass for TransientTexturePass {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn execute(&self, ctx: &PassContext) -> wgpu::CommandBuffer {
+            let texture = ctx
+                .get_texture(self.texture)
+                .expect("transient texture should be materialized during execution");
+            let _view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let encoder = ctx.create_command_encoder(Some(&self.name));
+            encoder.finish()
+        }
+    }
+
+    #[test]
+    fn test_frame_graph_executes_with_transient_texture() {
+        let renderer = match crate::Renderer::new().block_on() {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                eprintln!("skipping transient texture frame graph execution test: {err}");
+                return;
+            }
+        };
+        let registry = ResourceRegistry::default();
+        let mut frame_graph = FrameGraph::default();
+        let transient = frame_graph.create_transient_texture(
+            TransientTextureDesc::new(
+                wgpu::Extent3d {
+                    width: 32,
+                    height: 32,
+                    depth_or_array_layers: 1,
+                },
+                wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            )
+            .with_label("transient_tex_exec"),
+        );
+
+        let mut pass_builder = PassBuilder::new("TransientTexturePass");
+        pass_builder.write(transient);
+        let pass = pass_builder.with_pass(Box::new(TransientTexturePass {
+            name: "TransientTexturePass".to_string(),
+            texture: transient,
         }));
 
         frame_graph.add_pass(pass);

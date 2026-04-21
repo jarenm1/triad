@@ -9,6 +9,7 @@ pub struct PassContext<'a> {
     pub queue: &'a wgpu::Queue,
     pub resources: &'a ResourceRegistry,
     pub transient_buffers: &'a HashMap<u64, wgpu::Buffer>,
+    pub transient_textures: &'a HashMap<u64, wgpu::Texture>,
 }
 
 impl<'a> PassContext<'a> {
@@ -27,7 +28,9 @@ impl<'a> PassContext<'a> {
 
     /// Get a texture resource by handle
     pub fn get_texture(&self, handle: Handle<wgpu::Texture>) -> Option<&wgpu::Texture> {
-        self.resources.get(handle)
+        self.resources
+            .get(handle)
+            .or_else(|| self.transient_textures.get(&handle.id()))
     }
 
     /// Get a render pipeline by handle
