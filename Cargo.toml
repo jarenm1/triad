@@ -3,6 +3,7 @@ members = [
 "triad-gpu",
 "triad-window",
 "triad-app",
+"triad-cubes",
 ]
 resolver = "3"
 
