@@ -441,8 +441,17 @@ struct VisibleIds {
     ids: array<u32>,
 };
 
+/// width / height; maps simulation xy to NDC so one sim unit is isotropic in pixels (letterboxed).
+struct SimViewParams {
+    aspect: f32,
+    _pad0: f32,
+    _pad1: f32,
+    _pad2: f32,
+}
+
 @group(0) @binding(0) var<storage, read> particles: ParticleBuffer;
 @group(0) @binding(1) var<storage, read> visible: VisibleIds;
+@group(0) @binding(2) var<uniform> sim_view: SimViewParams;
 
 // Must match [`PARTICLE_RADIUS`] in Rust (same world units).
 const QUAD_HALF: f32 = 0.00875;
@@ -470,8 +479,16 @@ fn vs_main(
     let q = corners[vertex_index];
     let world = particle.position + q * QUAD_HALF;
 
+    let a = sim_view.aspect;
+    var ndc_xy: vec2<f32>;
+    if (a >= 1.0) {
+        ndc_xy = vec2<f32>(world.x / a, world.y);
+    } else {
+        ndc_xy = vec2<f32>(world.x, world.y * a);
+    }
+
     var out: VsOut;
-    out.clip_pos = vec4<f32>(world, z, 1.0);
+    out.clip_pos = vec4<f32>(ndc_xy, z, 1.0);
     out.corner = q;
     return out;
 }
@@ -523,6 +540,23 @@ struct SimParams {
     _reserved0: f32,
     particle_radius: f32,
     _reserved1: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct SimViewParams {
+    /// `viewport_width / viewport_height` — keeps simulation units isotropic on screen.
+    aspect: f32,
+    _pad: [f32; 3],
+}
+
+fn sim_view_params_from_viewport(viewport_w: u32, viewport_h: u32) -> SimViewParams {
+    let w = viewport_w.max(1) as f32;
+    let h = viewport_h.max(1) as f32;
+    SimViewParams {
+        aspect: w / h,
+        _pad: [0.0; 3],
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -638,6 +672,9 @@ struct ParticleRendererManager {
     collision_bind_group: Handle<wgpu::BindGroup>,
     /// When true, runs clear + max passes and copies stats for CPU readback (expensive at high N).
     grid_neighbor_validate: bool,
+    viewport_w: u32,
+    viewport_h: u32,
+    sim_view_buffer: Handle<wgpu::Buffer>,
 }
 
 impl ParticleRendererManager {
@@ -648,7 +685,11 @@ impl ParticleRendererManager {
         stats: Arc<Mutex<DemoStats>>,
         particle_count: usize,
         grid_neighbor_validate: bool,
+        viewport_w: u32,
+        viewport_h: u32,
     ) -> Result<Self, Box<dyn Error>> {
+        let viewport_w = viewport_w.max(1);
+        let viewport_h = viewport_h.max(1);
         let particles: Vec<ParticleState> = (0..particle_count)
             .map(|i| ParticleState::from_index(i, particle_count))
             .collect();
@@ -713,6 +754,12 @@ impl ParticleRendererManager {
                 particle_radius: PARTICLE_RADIUS,
                 _reserved1: 0.0,
             }])
+            .usage(BufferUsage::Uniform)
+            .build(registry)?;
+        let sim_view_buffer = renderer
+            .create_gpu_buffer::<SimViewParams>()
+            .label("sim view NDC (aspect)")
+            .with_data(&[sim_view_params_from_viewport(viewport_w, viewport_h)])
             .usage(BufferUsage::Uniform)
             .build(registry)?;
 
@@ -1009,6 +1056,12 @@ impl ParticleRendererManager {
                 visible_ids.handle(),
                 BindingType::StorageRead,
             )
+            .buffer_stage(
+                2,
+                ShaderStage::Vertex,
+                sim_view_buffer.handle(),
+                BindingType::Uniform,
+            )
             .build(registry)?;
 
         let reset_pipeline_layout =
@@ -1136,6 +1189,9 @@ impl ParticleRendererManager {
             collision_pipeline,
             collision_bind_group,
             grid_neighbor_validate,
+            viewport_w,
+            viewport_h,
+            sim_view_buffer: sim_view_buffer.handle(),
         })
     }
 }
@@ -1161,6 +1217,8 @@ impl RendererManager for ParticleRendererManager {
             _reserved1: 0.0,
         }];
         renderer.write_buffer(self.sim_params_buffer, &params, registry)?;
+        let sim_view = [sim_view_params_from_viewport(self.viewport_w, self.viewport_h)];
+        renderer.write_buffer(self.sim_view_buffer, &sim_view, registry)?;
 
         let mut gpu_visible_count = None;
         let mut gpu_visible_count_sync = None;
@@ -1476,9 +1534,11 @@ impl RendererManager for ParticleRendererManager {
         &mut self,
         _device: &wgpu::Device,
         _registry: &mut ResourceRegistry,
-        _width: u32,
-        _height: u32,
+        width: u32,
+        height: u32,
     ) -> Result<(), Box<dyn Error>> {
+        self.viewport_w = width.max(1);
+        self.viewport_h = height.max(1);
         Ok(())
     }
 }
@@ -1602,7 +1662,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     });
             });
         },
-        move |renderer, registry, surface_format, _width, _height| {
+        move |renderer, registry, surface_format, width, height| {
             info!(?surface_format, "creating particle renderer manager");
             Ok(Box::new(ParticleRendererManager::new(
                 renderer,
@@ -1611,6 +1671,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Arc::clone(&manager_stats),
                 particle_count,
                 grid_neighbor_validate,
+                width,
+                height,
             )?))
         },
     );
