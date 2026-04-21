@@ -54,6 +54,28 @@ pub use spatial_grid::{
 };
 pub use wgpu;
 
+/// Prefer stable vsync-capable modes; only use [`wgpu::PresentMode::Immediate`] if nothing else is available.
+#[must_use]
+fn pick_default_present_mode(modes: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    const ORDER: &[wgpu::PresentMode] = &[
+        wgpu::PresentMode::AutoVsync,
+        wgpu::PresentMode::Fifo,
+        wgpu::PresentMode::FifoRelaxed,
+        wgpu::PresentMode::Mailbox,
+        wgpu::PresentMode::AutoNoVsync,
+    ];
+    for &mode in ORDER {
+        if modes.contains(&mode) {
+            return mode;
+        }
+    }
+    modes
+        .iter()
+        .copied()
+        .find(|m| *m != wgpu::PresentMode::Immediate)
+        .unwrap_or(modes[0])
+}
+
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -277,6 +299,8 @@ impl Renderer {
             return Err(RendererError::NoSupportedPresentModes);
         }
 
+        let present_mode = pick_default_present_mode(&caps.present_modes);
+
         // Check if alpha_modes array is empty
         if caps.alpha_modes.is_empty() {
             return Err(RendererError::NoSupportedAlphaModes);
@@ -287,7 +311,7 @@ impl Renderer {
             format,
             width,
             height,
-            present_mode: caps.present_modes[0],
+            present_mode,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,

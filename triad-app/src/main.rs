@@ -13,11 +13,14 @@ use triad_gpu::{
 };
 use triad_window::{CameraUniforms, RendererManager, WindowConfig, egui, run_with_renderer_config};
 
-const DEFAULT_PARTICLE_COUNT: usize = 131_072;
-const MIN_PARTICLE_COUNT: usize = 4_096;
-const MAX_PARTICLE_COUNT: usize = 8_388_608;
+const DEFAULT_PARTICLE_COUNT: usize = 4_096;
+const MIN_PARTICLE_COUNT: usize = 256;
+const MAX_PARTICLE_COUNT: usize = 2_097_152;
 const WORKGROUP_SIZE: u32 = 64;
-const PARTICLE_SPEED_SCALE: f32 = 6.0;
+/// World-space disk radius: rendered circle and collision use the same value (xy domain ~[-1, 1]).
+const PARTICLE_RADIUS: f32 = 0.00875;
+/// Jacobi-style separation passes per frame (same spatial hash each pass).
+const COLLISION_ITERATIONS: u32 = 4;
 
 /// Uniform 2D grid over simulation xy ∈ [-1, 1]; single z slab. Keeps `total_cells` moderate for the scan.
 const SPATIAL_GRID_DIMS: [u32; 3] = [64, 64, 1];
@@ -114,6 +117,162 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
+/// 2D disk–disk response: full separation on the lower-index body per pair (`j > i`), elastic
+/// normal impulse on both bodies (lower index in the `j > i` loop, upper index in `j < i`).
+/// Runs after [`SpatialGridGpu`] rebuild; multiple dispatches per frame approximate Jacobi.
+const PARTICLE_COLLISION_SHADER: &str = r#"
+struct GridParams {
+    world_origin: vec3<f32>,
+    cell_size: f32,
+    grid_dims: vec3<u32>,
+    entity_count: u32,
+}
+
+struct SimParams {
+    dt_seconds: f32,
+    _reserved0: f32,
+    particle_radius: f32,
+    _reserved1: f32,
+}
+
+struct ParticleState {
+    position: vec2<f32>,
+    velocity: vec2<f32>,
+    alive: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+struct ParticleBuffer {
+    particles: array<ParticleState>,
+}
+
+@group(0) @binding(0) var<uniform> grid_params: GridParams;
+@group(0) @binding(1) var<uniform> sim_u: SimParams;
+@group(0) @binding(2) var<storage, read_write> particles: ParticleBuffer;
+@group(0) @binding(3) var<storage, read> cell_offsets: array<u32>;
+@group(0) @binding(4) var<storage, read> sorted_entity_ids: array<u32>;
+
+fn cell_index(world_pos: vec3<f32>) -> u32 {
+    let g = grid_params.grid_dims;
+    let o = grid_params.world_origin;
+    let inv = 1.0 / grid_params.cell_size;
+    let f = floor((world_pos - o) * inv);
+    let ix = clamp(i32(f.x), 0, i32(g.x) - 1);
+    let iy = clamp(i32(f.y), 0, i32(g.y) - 1);
+    let iz = clamp(i32(f.z), 0, i32(g.z) - 1);
+    let ux = u32(ix);
+    let uy = u32(iy);
+    let uz = u32(iz);
+    return ux + g.x * (uy + g.y * uz);
+}
+
+@compute @workgroup_size(64)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= grid_params.entity_count) {
+        return;
+    }
+    if (particles.particles[i].alive == 0u) {
+        return;
+    }
+
+    let r = sim_u.particle_radius;
+    let min_d = 2.0 * r;
+    var pi = particles.particles[i].position;
+    var vi = particles.particles[i].velocity;
+    let c = cell_index(vec3<f32>(pi.x, pi.y, 0.0));
+    let gx = grid_params.grid_dims.x;
+    let gy = grid_params.grid_dims.y;
+    let cx = c % gx;
+    let cy = (c / gx) % gy;
+
+    var delta = vec2<f32>(0.0, 0.0);
+
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+            let nx = i32(cx) + dx;
+            let ny = i32(cy) + dy;
+            if (nx < 0 || ny < 0 || nx >= i32(gx) || ny >= i32(gy)) {
+                continue;
+            }
+            let nc = u32(nx) + gx * u32(ny);
+            let start = cell_offsets[nc];
+            let end = cell_offsets[nc + 1u];
+            for (var k = start; k < end; k = k + 1u) {
+                let j = sorted_entity_ids[k];
+                if (j <= i) {
+                    continue;
+                }
+                if (particles.particles[j].alive == 0u) {
+                    continue;
+                }
+                let pj = particles.particles[j].position;
+                let vj = particles.particles[j].velocity;
+                var diff = pi - pj;
+                var dist = length(diff);
+                if (dist < min_d) {
+                    if (dist < 1e-8) {
+                        diff = vec2<f32>(1.0, 0.3) * r * 0.02;
+                        dist = length(diff);
+                    }
+                    let n = diff / dist;
+                    let vn = dot(vi - vj, n);
+                    if (vn < 0.0) {
+                        vi = vi - vn * n;
+                    }
+                    delta = delta + n * (min_d - dist);
+                }
+            }
+        }
+    }
+
+    for (var dy2: i32 = -1; dy2 <= 1; dy2 = dy2 + 1) {
+        for (var dx2: i32 = -1; dx2 <= 1; dx2 = dx2 + 1) {
+            let nx2 = i32(cx) + dx2;
+            let ny2 = i32(cy) + dy2;
+            if (nx2 < 0 || ny2 < 0 || nx2 >= i32(gx) || ny2 >= i32(gy)) {
+                continue;
+            }
+            let nc2 = u32(nx2) + gx * u32(ny2);
+            let start2 = cell_offsets[nc2];
+            let end2 = cell_offsets[nc2 + 1u];
+            for (var k2 = start2; k2 < end2; k2 = k2 + 1u) {
+                let j2 = sorted_entity_ids[k2];
+                if (j2 >= i) {
+                    continue;
+                }
+                if (particles.particles[j2].alive == 0u) {
+                    continue;
+                }
+                let pj2 = particles.particles[j2].position;
+                let vj2 = particles.particles[j2].velocity;
+                var diff2 = pi - pj2;
+                var dist2 = length(diff2);
+                if (dist2 < min_d) {
+                    if (dist2 < 1e-8) {
+                        diff2 = vec2<f32>(-0.7, 1.0) * r * 0.02;
+                        dist2 = length(diff2);
+                    }
+                    let n2 = diff2 / dist2;
+                    let vn2 = dot(vi - vj2, n2);
+                    if (vn2 < 0.0) {
+                        vi = vi - vn2 * n2;
+                    }
+                }
+            }
+        }
+    }
+
+    pi = pi + delta;
+    pi.x = clamp(pi.x, -0.999, 0.999);
+    pi.y = clamp(pi.y, -0.999, 0.999);
+    particles.particles[i].position = pi;
+    particles.particles[i].velocity = vi;
+}
+"#;
+
 const PARTICLES_TO_GRID_SHADER: &str = r#"
 struct ParticleState {
     position: vec2<f32>,
@@ -182,7 +341,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    draw_args.vertex_count = 1u;
+    draw_args.vertex_count = 6u;
     atomicStore(&draw_args.instance_count, 0u);
     draw_args.first_vertex = 0u;
     draw_args.first_instance = 0u;
@@ -205,8 +364,9 @@ struct ParticleBuffer {
 
 struct SimParams {
     dt_seconds: f32,
-    speed_scale: f32,
-    _pad0: vec2<f32>,
+    _reserved0: f32,
+    particle_radius: f32,
+    _reserved1: f32,
 };
 
 @group(0) @binding(0) var<storage, read_write> particles: ParticleBuffer;
@@ -224,7 +384,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    particle.position += particle.velocity * (sim_params.dt_seconds * sim_params.speed_scale);
+    // Constant-velocity motion: v is set at spawn only.
+    particle.position += particle.velocity * sim_params.dt_seconds;
 
     if (particle.position.x <= -0.98 || particle.position.x >= 0.98) {
         particle.velocity.x = -particle.velocity.x;
@@ -307,25 +468,43 @@ struct VisibleIds {
 @group(0) @binding(0) var<storage, read> particles: ParticleBuffer;
 @group(0) @binding(1) var<storage, read> visible: VisibleIds;
 
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
+// Must match [`PARTICLE_RADIUS`] in Rust (same world units).
+const QUAD_HALF: f32 = 0.00875;
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) corner: vec2<f32>,
 };
 
 @vertex
-fn vs_main(@builtin(instance_index) instance_index: u32) -> VertexOutput {
+fn vs_main(
+    @builtin(vertex_index) vertex_index: u32,
+    @builtin(instance_index) instance_index: u32,
+) -> VsOut {
     let particle_id = visible.ids[instance_index];
     let particle = particles.particles[particle_id];
 
     let n = max(arrayLength(&particles.particles), 1u);
     let z = 0.05 + 0.9 * (f32(particle_id) / f32(n));
 
-    var out: VertexOutput;
-    out.position = vec4<f32>(particle.position, z, 1.0);
+    let corners = array<vec2<f32>, 6>(
+        vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(1.0, 1.0),
+        vec2(-1.0, -1.0), vec2(1.0, 1.0), vec2(-1.0, 1.0)
+    );
+    let q = corners[vertex_index];
+    let world = particle.position + q * QUAD_HALF;
+
+    var out: VsOut;
+    out.clip_pos = vec4<f32>(world, z, 1.0);
+    out.corner = q;
     return out;
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
+fn fs_main(@location(0) corner: vec2<f32>) -> @location(0) vec4<f32> {
+    if (length(corner) > 1.0) {
+        discard;
+    }
     return vec4<f32>(0.95, 0.75, 0.2, 1.0);
 }
 "#;
@@ -341,14 +520,16 @@ struct ParticleState {
 
 impl ParticleState {
     fn from_index(index: usize, particle_count: usize) -> Self {
-        let grid_width = 512usize;
+        let grid_width = ((particle_count as f32).sqrt().ceil() as usize).clamp(16, 256);
         let x = (index % grid_width) as f32;
         let y = (index / grid_width) as f32;
+        let rows = (particle_count / grid_width).max(1);
         let px = (x / grid_width as f32) * 1.8 - 0.9;
-        let py = (y / ((particle_count / grid_width).max(1) as f32)) * 1.8 - 0.9;
+        let py = (y / rows as f32) * 1.8 - 0.9;
 
-        let angle = (index as f32) * 0.017;
-        let speed = 0.0006 + ((index % 11) as f32) * 0.00004;
+        // World units per second (−1..1 domain); no runtime speed multiplier — only integration `v * dt`.
+        let angle = (index as f32) * 2.583_005;
+        let speed = 0.28 + ((index % 19) as f32) * 0.035;
 
         Self {
             position: [px, py],
@@ -363,8 +544,9 @@ impl ParticleState {
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct SimParams {
     dt_seconds: f32,
-    speed_scale: f32,
-    _pad: [f32; 2],
+    _reserved0: f32,
+    particle_radius: f32,
+    _reserved1: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -375,9 +557,6 @@ struct DemoStats {
     gpu_visible_count: u32,
     gpu_visible_count_sync: u32,
     dt_ms: f32,
-    speed_scale: f32,
-    /// Live UI control; applied to simulation each frame.
-    user_speed_scale: f32,
     update_cpu_ms: f32,
     graph_build_cpu_ms: f32,
     readback_cpu_ms: f32,
@@ -398,8 +577,6 @@ impl DemoStats {
             gpu_visible_count: 0,
             gpu_visible_count_sync: 0,
             dt_ms: 0.0,
-            speed_scale: PARTICLE_SPEED_SCALE,
-            user_speed_scale: PARTICLE_SPEED_SCALE,
             update_cpu_ms: 0.0,
             graph_build_cpu_ms: 0.0,
             readback_cpu_ms: 0.0,
@@ -473,6 +650,8 @@ struct ParticleRendererManager {
     grid_neighbor_max_pipeline: Handle<wgpu::ComputePipeline>,
     clear_grid_neighbor_bind_group: Handle<wgpu::BindGroup>,
     grid_neighbor_max_bind_group: Handle<wgpu::BindGroup>,
+    collision_pipeline: Handle<wgpu::ComputePipeline>,
+    collision_bind_group: Handle<wgpu::BindGroup>,
 }
 
 impl ParticleRendererManager {
@@ -508,7 +687,7 @@ impl ParticleRendererManager {
         let draw_args = renderer
             .create_gpu_buffer::<DrawIndirectArgs>()
             .label("particle draw args")
-            .with_data(&[DrawIndirectArgs::new(1, 0, 0, 0)])
+            .with_data(&[DrawIndirectArgs::new(6, 0, 0, 0)])
             .usage(BufferUsage::Indirect)
             .add_usage(wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC)
             .build(registry)?;
@@ -543,8 +722,9 @@ impl ParticleRendererManager {
             .label("simulation params")
             .with_data(&[SimParams {
                 dt_seconds: 1.0 / 60.0,
-                speed_scale: PARTICLE_SPEED_SCALE,
-                _pad: [0.0; 2],
+                _reserved0: 0.0,
+                particle_radius: PARTICLE_RADIUS,
+                _reserved1: 0.0,
             }])
             .usage(BufferUsage::Uniform)
             .build(registry)?;
@@ -724,6 +904,61 @@ impl ParticleRendererManager {
             .with_layout(grid_neighbor_max_pl)
             .build(registry)?;
 
+        let collision_shader = renderer
+            .create_shader_module()
+            .label("particle collision")
+            .with_wgsl_source(PARTICLE_COLLISION_SHADER)
+            .build(registry)?;
+        let (collision_layout, collision_bind_group) = renderer
+            .create_bind_group()
+            .label("particle collision")
+            .buffer_stage(
+                0,
+                ShaderStage::Compute,
+                spatial_grid.params,
+                BindingType::Uniform,
+            )
+            .buffer_stage(
+                1,
+                ShaderStage::Compute,
+                sim_params_buffer.handle(),
+                BindingType::Uniform,
+            )
+            .buffer_stage(
+                2,
+                ShaderStage::Compute,
+                particle_buffer.handle(),
+                BindingType::StorageWrite,
+            )
+            .buffer_stage(
+                3,
+                ShaderStage::Compute,
+                spatial_grid.cell_offsets,
+                BindingType::StorageRead,
+            )
+            .buffer_stage(
+                4,
+                ShaderStage::Compute,
+                spatial_grid.sorted_entity_ids,
+                BindingType::StorageRead,
+            )
+            .build(registry)?;
+        let collision_pl = renderer
+            .device()
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("particle collision layout"),
+                bind_group_layouts: &[registry
+                    .get(collision_layout)
+                    .expect("collision layout")],
+                push_constant_ranges: &[],
+            });
+        let collision_pipeline = renderer
+            .create_compute_pipeline()
+            .with_label("particle collision")
+            .with_compute_shader(collision_shader)
+            .with_layout(collision_pl)
+            .build(registry)?;
+
         let (reset_layout, reset_bind_group) = renderer
             .create_bind_group()
             .label("reset draw args")
@@ -855,7 +1090,7 @@ impl ParticleRendererManager {
             .with_fragment_shader(render_shader)
             .with_layout(render_pipeline_layout)
             .with_primitive(wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::PointList,
+                topology: wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
@@ -911,6 +1146,8 @@ impl ParticleRendererManager {
             grid_neighbor_max_pipeline,
             clear_grid_neighbor_bind_group,
             grid_neighbor_max_bind_group,
+            collision_pipeline,
+            collision_bind_group,
         })
     }
 }
@@ -929,16 +1166,11 @@ impl RendererManager for ParticleRendererManager {
             .clamp(1.0 / 240.0, 1.0 / 10.0);
         self.last_update = now;
 
-        let speed_scale = self
-            .stats
-            .lock()
-            .map(|s| s.user_speed_scale)
-            .unwrap_or(PARTICLE_SPEED_SCALE);
-
         let params = [SimParams {
             dt_seconds,
-            speed_scale,
-            _pad: [0.0; 2],
+            _reserved0: 0.0,
+            particle_radius: PARTICLE_RADIUS,
+            _reserved1: 0.0,
         }];
         renderer.write_buffer(self.sim_params_buffer, &params, registry)?;
 
@@ -1038,7 +1270,6 @@ impl RendererManager for ParticleRendererManager {
 
         if let Ok(mut stats) = self.stats.lock() {
             stats.dt_ms = dt_seconds * 1000.0;
-            stats.speed_scale = params[0].speed_scale;
             stats.update_cpu_ms = update_start.elapsed().as_secs_f32() * 1000.0;
             if let Some(count) = gpu_visible_count {
                 stats.gpu_visible_count = count;
@@ -1134,6 +1365,24 @@ impl RendererManager for ParticleRendererManager {
             grid: Arc::clone(&self.spatial_grid),
         }));
 
+        let mut collision_passes: Vec<PassBuilder> = Vec::with_capacity(COLLISION_ITERATIONS as usize);
+        for iter in 0..COLLISION_ITERATIONS {
+            let p = ComputePassBuilder::new(format!("ParticleCollision_{iter}"))
+                .read(self.spatial_grid.params)
+                .read(self.sim_params_buffer)
+                .read_write(self.particle_buffer)
+                .read(self.spatial_grid.cell_offsets)
+                .read(self.spatial_grid.sorted_entity_ids)
+                .with_pipeline(self.collision_pipeline)
+                .with_bind_group(0, self.collision_bind_group)
+                .dispatch(self.particles_to_grid_dispatch_x, 1, 1)
+                .build()
+                .unwrap_or_else(|_| {
+                    panic!("collision pass {iter} should build");
+                });
+            collision_passes.push(p);
+        }
+
         let clear_grid_neighbor_pass = ComputePassBuilder::new("ClearGridNeighborStats")
             .read_write(self.grid_neighbor_stats)
             .with_pipeline(self.clear_grid_neighbor_pipeline)
@@ -1212,6 +1461,9 @@ impl RendererManager for ParticleRendererManager {
         graph.add_pass(simulate_pass);
         graph.add_pass(particles_to_grid_pass);
         graph.add_pass(spatial_grid_pass);
+        for p in collision_passes {
+            graph.add_pass(p);
+        }
         graph.add_pass(clear_grid_neighbor_pass);
         graph.add_pass(grid_neighbor_pass);
         graph.add_pass(compact_pass);
@@ -1278,12 +1530,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let result = run_with_renderer_config(
         "Triad",
         WindowConfig {
-            present_mode: wgpu::PresentMode::Mailbox,
+            present_mode: wgpu::PresentMode::Fifo,
         },
         |controls| {
             let ui_stats = Arc::clone(&ui_stats);
             controls.on_ui(move |ctx| {
-                let Ok(mut stats) = ui_stats.lock() else {
+                let Ok(stats) = ui_stats.lock() else {
                     return;
                 };
                 egui::Window::new("Triad")
@@ -1309,17 +1561,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                             "Grid max others (3×3 cells, excl. self): {}",
                             stats.grid_max_others_in_3x3
                         ));
-                        ui.add(
-                            egui::Slider::new(&mut stats.user_speed_scale, 0.25..=24.0)
-                                .text("Speed scale"),
-                        );
+                        ui.label(format!(
+                            "Disk radius (draw + collision): {:.4} world units; {} collision passes/frame",
+                            PARTICLE_RADIUS, COLLISION_ITERATIONS
+                        ));
+                        ui.label("Motion: x += v·dt; walls reflect v; disk contacts apply separation + normal impulse.");
                         ui.label(format!("GPU visible count: {}", stats.gpu_visible_count));
                         ui.label(format!(
                             "GPU visible count sync: {}",
                             stats.gpu_visible_count_sync
                         ));
                         ui.label(format!("Sim dt: {:.3} ms", stats.dt_ms));
-                        ui.label(format!("Speed scale (applied): {:.2}", stats.speed_scale));
                         ui.label(format!("Update CPU: {:.3} ms", stats.update_cpu_ms));
                         ui.label(format!(
                             "Graph build CPU: {:.3} ms",
@@ -1333,8 +1585,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                         ui.label(format!("Readback mismatch: {}", stats.readback_mismatch));
                         ui.label(format!("Cached pass order len: {}", stats.cached_order_len));
                         ui.separator();
+                        ui.label(format!(
+                            "Frame: reset → simulate → to-grid → spatial rebuild → collision×{} → grid-neighbor max → …",
+                            COLLISION_ITERATIONS
+                        ));
                         ui.label(
-                            "Frame: reset → simulate → to-grid → spatial rebuild → grid-neighbor max → compact → readback → draw",
+                            "… compact → readback → draw",
                         );
                         ui.label("Depth: Less + Depth32Float (per-instance z from id).");
                         ui.label("Simulation is time-based; GPU resources are persistent.");

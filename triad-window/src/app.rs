@@ -642,7 +642,7 @@ impl ViewerState {
                                 .selectable_label(
                                     matches!(
                                         self.current_present_mode,
-                                        wgpu::PresentMode::AutoVsync | wgpu::PresentMode::Fifo
+                                        wgpu::PresentMode::AutoVsync
                                     ),
                                     "On",
                                 )
@@ -653,16 +653,12 @@ impl ViewerState {
 
                             if ui
                                 .selectable_label(
-                                    matches!(
-                                        self.current_present_mode,
-                                        wgpu::PresentMode::Immediate
-                                            | wgpu::PresentMode::AutoNoVsync
-                                    ),
-                                    "Off",
+                                    matches!(self.current_present_mode, wgpu::PresentMode::Fifo),
+                                    "FIFO",
                                 )
                                 .clicked()
                             {
-                                new_mode = Some(wgpu::PresentMode::Immediate);
+                                new_mode = Some(wgpu::PresentMode::Fifo);
                             }
 
                             if ui
