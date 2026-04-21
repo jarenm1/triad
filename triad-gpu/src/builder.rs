@@ -560,6 +560,8 @@ pub struct ComputePipelineBuilder<'a> {
     compute_shader: Option<Handle<wgpu::ShaderModule>>,
     label: Option<String>,
     layout: Option<wgpu::PipelineLayout>,
+    /// Defaults to `cs_main` when unset.
+    entry_point: Option<String>,
 }
 
 impl<'a> ComputePipelineBuilder<'a> {
@@ -569,7 +571,14 @@ impl<'a> ComputePipelineBuilder<'a> {
             compute_shader: None,
             label: None,
             layout: None,
+            entry_point: None,
         }
+    }
+
+    /// Set the compute shader entry point (WGSL function name).
+    pub fn with_entry_point(mut self, name: impl Into<String>) -> Self {
+        self.entry_point = Some(name.into());
+        self
     }
 
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
@@ -607,13 +616,15 @@ impl<'a> ComputePipelineBuilder<'a> {
                 })
         });
 
+        let entry_point = self.entry_point.as_deref().unwrap_or("cs_main");
+
         let pipeline = self
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: self.label.as_deref(),
                 layout: Some(&pipeline_layout),
                 module: compute_shader,
-                entry_point: Some("cs_main"),
+                entry_point: Some(entry_point),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
             });

@@ -20,6 +20,7 @@ mod reference_pipeline;
 mod render;
 mod resource_registry;
 mod surface;
+mod spatial_grid;
 mod type_map;
 
 // Re-export all error types at crate root for convenience
@@ -45,6 +46,10 @@ pub use pipeline::RenderPipelineBuilder;
 pub use render::{ColorLoadOp, RenderDraw, RenderPassBuilder};
 pub use resource_registry::ResourceRegistry;
 pub use surface::SurfaceWrapper;
+pub use spatial_grid::{
+    EntityPosition, SpatialGridConfig, SpatialGridError, SpatialGridGpu, SpatialGridParams,
+    SpatialGridResult, total_cells,
+};
 pub use wgpu;
 
 pub struct Renderer {
