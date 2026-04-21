@@ -7,13 +7,49 @@ use tracing::{error, info};
 use triad_gpu::{
     BindingType, BufferUsage, ComputePassBuilder, CopyPassBuilder, DispatchIndirectArgs,
     DrawIndirectArgs, ExecutableFrameGraph, FrameBufferHandle, FrameGraph, FrameGraphError,
-    FrameTextureView, Handle, RenderPassBuilder, Renderer, ResourceRegistry, ShaderStage, wgpu,
+    FrameTextureView, Handle, Pass, PassBuilder, PassContext, RenderPassBuilder, Renderer,
+    ResourceRegistry, ShaderStage,
+    SpatialGridConfig, SpatialGridGpu, SpatialGridParams, total_cells, wgpu,
 };
 use triad_window::{CameraUniforms, RendererManager, WindowConfig, egui, run_with_renderer_config};
 
 const PARTICLE_COUNT: usize = 131_072;
 const WORKGROUP_SIZE: u32 = 64;
 const PARTICLE_SPEED_SCALE: f32 = 6.0;
+
+/// Uniform 2D grid over simulation xy ∈ [-1, 1]; single z slab. Keeps `total_cells` moderate for the scan.
+const SPATIAL_GRID_DIMS: [u32; 3] = [64, 64, 1];
+
+const PARTICLES_TO_GRID_SHADER: &str = r#"
+struct ParticleState {
+    position: vec2<f32>,
+    velocity: vec2<f32>,
+    alive: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+};
+
+struct ParticleBuffer {
+    particles: array<ParticleState>,
+};
+
+@group(0) @binding(0) var<storage, read> particles: ParticleBuffer;
+@group(0) @binding(1) var<storage, read_write> grid_positions: array<vec4<f32>>;
+
+@compute @workgroup_size(64)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= arrayLength(&grid_positions)) {
+        return;
+    }
+    if (i >= arrayLength(&particles.particles)) {
+        return;
+    }
+    let p = particles.particles[i].position;
+    grid_positions[i] = vec4<f32>(p.x, p.y, 0.0, 0.0);
+}
+"#;
 const READBACK_INTERVAL_FRAMES: u64 = 15;
 const READBACK_RING_SIZE: usize = 3;
 const READBACK_VALIDATE_INTERVAL_FRAMES: u64 = 240;
@@ -220,6 +256,7 @@ struct SimParams {
 struct DemoStats {
     particle_count: usize,
     workgroup_count: u32,
+    spatial_grid_cells: u32,
     gpu_visible_count: u32,
     gpu_visible_count_sync: u32,
     dt_ms: f32,
@@ -233,10 +270,11 @@ struct DemoStats {
 }
 
 impl DemoStats {
-    fn new(particle_count: usize, workgroup_count: u32) -> Self {
+    fn new(particle_count: usize, workgroup_count: u32, spatial_grid_cells: u32) -> Self {
         Self {
             particle_count,
             workgroup_count,
+            spatial_grid_cells,
             gpu_visible_count: 0,
             gpu_visible_count_sync: 0,
             dt_ms: 0.0,
@@ -248,6 +286,24 @@ impl DemoStats {
             readback_mismatch: false,
             cached_order_len: 0,
         }
+    }
+}
+
+/// Frame-graph pass that records [`SpatialGridGpu::encode_rebuild`] (many compute passes, one encoder).
+struct SpatialGridRebuildPass {
+    name: String,
+    grid: Arc<SpatialGridGpu>,
+}
+
+impl Pass for SpatialGridRebuildPass {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn execute(&self, ctx: &PassContext) -> wgpu::CommandBuffer {
+        let mut encoder = ctx.create_command_encoder(Some(&self.name));
+        self.grid.encode_rebuild(&mut encoder, ctx.resources);
+        encoder.finish()
     }
 }
 
@@ -284,6 +340,10 @@ struct ParticleRendererManager {
     frame_index: u64,
     stats: Arc<Mutex<DemoStats>>,
     frame_target: Handle<FrameTextureView>,
+    spatial_grid: Arc<SpatialGridGpu>,
+    particles_to_grid_pipeline: Handle<wgpu::ComputePipeline>,
+    particles_to_grid_bind_group: Handle<wgpu::BindGroup>,
+    particles_to_grid_dispatch_x: u32,
 }
 
 impl ParticleRendererManager {
@@ -377,6 +437,61 @@ impl ParticleRendererManager {
             .label("particle render")
             .with_wgsl_source(PARTICLE_RENDER_SHADER)
             .build(registry)?;
+
+        let cell_size = 2.0 / SPATIAL_GRID_DIMS[0] as f32;
+        let grid_params = SpatialGridParams::new(
+            [-1.0, -1.0, 0.0],
+            cell_size,
+            SPATIAL_GRID_DIMS,
+            PARTICLE_COUNT as u32,
+        );
+        let spatial_grid = Arc::new(SpatialGridGpu::new(
+            renderer,
+            registry,
+            SpatialGridConfig {
+                params: grid_params,
+                max_entities: PARTICLE_COUNT as u32,
+            },
+        )?);
+
+        let particles_to_grid_shader = renderer
+            .create_shader_module()
+            .label("particles to grid positions")
+            .with_wgsl_source(PARTICLES_TO_GRID_SHADER)
+            .build(registry)?;
+        let (particles_to_grid_layout, particles_to_grid_bind_group) = renderer
+            .create_bind_group()
+            .label("particles to grid positions")
+            .buffer_stage(
+                0,
+                ShaderStage::Compute,
+                particle_buffer.handle(),
+                BindingType::StorageRead,
+            )
+            .buffer_stage(
+                1,
+                ShaderStage::Compute,
+                spatial_grid.positions,
+                BindingType::StorageWrite,
+            )
+            .build(registry)?;
+        let particles_to_grid_pl =
+            renderer
+                .device()
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("particles to grid layout"),
+                    bind_group_layouts: &[registry
+                        .get(particles_to_grid_layout)
+                        .expect("particles_to_grid layout")],
+                    push_constant_ranges: &[],
+                });
+        let particles_to_grid_pipeline = renderer
+            .create_compute_pipeline()
+            .with_label("particles to grid pipeline")
+            .with_compute_shader(particles_to_grid_shader)
+            .with_layout(particles_to_grid_pl)
+            .build(registry)?;
+        let particles_to_grid_dispatch_x = (PARTICLE_COUNT as u32).div_ceil(WORKGROUP_SIZE);
 
         let (reset_layout, reset_bind_group) = renderer
             .create_bind_group()
@@ -547,6 +662,10 @@ impl ParticleRendererManager {
             frame_index: 0,
             stats,
             frame_target,
+            spatial_grid,
+            particles_to_grid_pipeline,
+            particles_to_grid_bind_group,
+            particles_to_grid_dispatch_x,
         })
     }
 }
@@ -717,6 +836,31 @@ impl RendererManager for ParticleRendererManager {
             .build()
             .expect("simulate pass should build");
 
+        let particles_to_grid_pass = ComputePassBuilder::new("ParticlesToGridPositions")
+            .read(self.particle_buffer)
+            .write(self.spatial_grid.positions)
+            .with_pipeline(self.particles_to_grid_pipeline)
+            .with_bind_group(0, self.particles_to_grid_bind_group)
+            .dispatch(self.particles_to_grid_dispatch_x, 1, 1)
+            .build()
+            .expect("particles to grid pass should build");
+
+        let mut spatial_grid_pb = PassBuilder::new("SpatialGridRebuild");
+        {
+            let g = &*self.spatial_grid;
+            spatial_grid_pb.read(g.params);
+            spatial_grid_pb.read(g.positions);
+            spatial_grid_pb.read_write(g.cell_atomics);
+            spatial_grid_pb.read_write(g.counts_linear);
+            spatial_grid_pb.read_write(g.cell_offsets);
+            spatial_grid_pb.read_write(g.write_heads);
+            spatial_grid_pb.read_write(g.sorted_entity_ids);
+        }
+        let spatial_grid_pass = spatial_grid_pb.with_pass(Box::new(SpatialGridRebuildPass {
+            name: "SpatialGridRebuild".to_string(),
+            grid: Arc::clone(&self.spatial_grid),
+        }));
+
         let compact_pass = ComputePassBuilder::new("CompactParticles")
             .read(self.dispatch_args)
             .read(self.particle_buffer)
@@ -763,6 +907,8 @@ impl RendererManager for ParticleRendererManager {
         let mut graph = FrameGraph::new();
         graph.add_pass(reset_pass);
         graph.add_pass(simulate_pass);
+        graph.add_pass(particles_to_grid_pass);
+        graph.add_pass(spatial_grid_pass);
         graph.add_pass(compact_pass);
         graph.add_pass(copy_readback_pass);
         graph.add_pass(render_pass);
@@ -817,6 +963,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let stats = Arc::new(Mutex::new(DemoStats::new(
         PARTICLE_COUNT,
         (PARTICLE_COUNT as u32).div_ceil(WORKGROUP_SIZE),
+        total_cells(SPATIAL_GRID_DIMS),
     )));
     let ui_stats = Arc::clone(&stats);
     let manager_stats = Arc::clone(&stats);
@@ -839,6 +986,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                         if let Some(stats) = snapshot {
                             ui.label(format!("Particles: {}", stats.particle_count));
                             ui.label(format!("Workgroups: {}", stats.workgroup_count));
+                            ui.label(format!(
+                                "Spatial grid: {} cells ({}×{}×{})",
+                                stats.spatial_grid_cells,
+                                SPATIAL_GRID_DIMS[0],
+                                SPATIAL_GRID_DIMS[1],
+                                SPATIAL_GRID_DIMS[2]
+                            ));
                             ui.label(format!("GPU visible count: {}", stats.gpu_visible_count));
                             ui.label(format!(
                                 "GPU visible count sync: {}",
@@ -859,7 +1013,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                             ui.label(format!("Readback mismatch: {}", stats.readback_mismatch));
                             ui.label(format!("Cached pass order len: {}", stats.cached_order_len));
                         }
-                        ui.label("Frame: reset args -> simulate -> compact -> indirect draw");
+                        ui.label("Frame: reset → simulate → to-grid → spatial rebuild → compact → draw");
                         ui.label("Simulation is time-based; GPU resources are persistent.");
                     });
             });

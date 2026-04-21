@@ -21,6 +21,8 @@ mod render;
 mod resource_registry;
 mod surface;
 mod spatial_grid;
+#[cfg(test)]
+mod test_util;
 mod type_map;
 
 // Re-export all error types at crate root for convenience
@@ -61,6 +63,9 @@ pub struct Renderer {
 
 impl Renderer {
     pub async fn new() -> std::result::Result<Self, RendererError> {
+        #[cfg(test)]
+        let _gpu_test_guard = crate::test_util::gpu_test_lock();
+
         let instance = Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
 
         let adapter = instance
@@ -80,6 +85,12 @@ impl Renderer {
             instance,
             adapter,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_device_queue(self) -> (wgpu::Device, wgpu::Queue) {
+        let Self { device, queue, .. } = self;
+        (device, queue)
     }
 
     /// Get a reference to the device

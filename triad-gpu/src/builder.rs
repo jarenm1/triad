@@ -692,6 +692,9 @@ pub enum ShaderStage {
     Fragment,
     Compute,
     VertexFragment,
+    /// Compute and fragment (excludes vertex). Use for read-write storage defaults: vertex
+    /// visibility on writable storage requires [`wgpu::Features::VERTEX_WRITABLE_STORAGE`].
+    ComputeFragment,
     All,
 }
 
@@ -703,6 +706,9 @@ impl ShaderStage {
             ShaderStage::Compute => wgpu::ShaderStages::COMPUTE,
             ShaderStage::VertexFragment => {
                 wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT
+            }
+            ShaderStage::ComputeFragment => {
+                wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT
             }
             ShaderStage::All => wgpu::ShaderStages::all(),
         }
@@ -752,9 +758,13 @@ impl<'a> BindGroupBuilder<'a> {
         buffer_handle: Handle<wgpu::Buffer>,
         binding_type: BindingType,
     ) -> Self {
+        let visibility = match binding_type {
+            BindingType::StorageWrite => ShaderStage::ComputeFragment,
+            _ => ShaderStage::All,
+        };
         self.entries.push(BindGroupLayoutEntry {
             binding,
-            visibility: ShaderStage::All,
+            visibility,
             binding_type,
         });
 
@@ -934,19 +944,8 @@ impl<'a> BindGroupBuilder<'a> {
 mod tests {
     use super::*;
     use crate::resource_registry::ResourceRegistry;
+    use crate::test_util::create_test_device;
     use pollster::FutureExt;
-
-    async fn create_test_device() -> (wgpu::Device, wgpu::Queue) {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .expect("Failed to get adapter");
-        adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await
-            .expect("Failed to get device")
-    }
 
     #[test]
     fn test_buffer_builder_with_data() {
@@ -1242,6 +1241,10 @@ mod tests {
                 .to_wgpu()
                 .contains(wgpu::ShaderStages::FRAGMENT)
         );
+        let cf = ShaderStage::ComputeFragment.to_wgpu();
+        assert!(cf.contains(wgpu::ShaderStages::COMPUTE));
+        assert!(cf.contains(wgpu::ShaderStages::FRAGMENT));
+        assert!(!cf.contains(wgpu::ShaderStages::VERTEX));
     }
 
     #[test]

@@ -255,19 +255,8 @@ mod tests {
     use super::*;
     use crate::frame_graph::pass::Pass;
     use crate::resource_registry::ResourceRegistry;
+    use crate::test_util::create_test_device;
     use pollster::FutureExt;
-
-    async fn create_test_device() -> (wgpu::Device, wgpu::Queue) {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::from_env_or_default());
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions::default())
-            .await
-            .expect("Failed to get adapter");
-        adapter
-            .request_device(&wgpu::DeviceDescriptor::default())
-            .await
-            .expect("Failed to get device")
-    }
 
     // Mock pass for testing
     struct MockPass {

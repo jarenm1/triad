@@ -2,7 +2,8 @@
 //! init per-cell write heads → scatter entity indices into cell-major order.
 //!
 //! Intended for broadphase / binning (neighbor queries, culling prep). The exclusive scan
-//! pass is **single-threaded** over cells — keep [`total_cells`] modest for frame-time work.
+//! uses a parallel Hillis–Steele inclusive pass (ping-pong buffers, one dispatch per
+//! `ceil(log2(cells))` stride) so cell count scales across the GPU.
 
 use crate::error::{BindGroupError, BufferError, PipelineError, ShaderError};
 use crate::frame_graph::Handle;
@@ -149,22 +150,56 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 "#;
 
-const WGSL_SCAN: &str = r#"
+/// Copy per-cell counts into the inclusive-scan working buffer (ping-pong chain start).
+const WGSL_SCAN_COPY: &str = r#"
 @group(0) @binding(1) var<storage, read> counts_for_scan: array<u32>;
-@group(0) @binding(2) var<storage, read_write> cell_offsets: array<u32>;
+@group(0) @binding(2) var<storage, read_write> scan_work: array<u32>;
 
-@compute @workgroup_size(1)
-fn cs_main() {
+@compute @workgroup_size(256)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
     let n = total_cells();
-    var sum = 0u;
-    var i = 0u;
-    loop {
-        if (i >= n) { break; }
-        cell_offsets[i] = sum;
-        sum = sum + counts_for_scan[i];
-        i = i + 1u;
+    if (i >= n) { return; }
+    scan_work[i] = counts_for_scan[i];
+}
+"#;
+
+fn wgsl_scan_inclusive_step(stride: u32) -> String {
+    format!(
+        r#"
+@group(0) @binding(1) var<storage, read> src_buf: array<u32>;
+@group(0) @binding(2) var<storage, read_write> dst_buf: array<u32>;
+
+@compute @workgroup_size(256)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {{
+    let i = gid.x;
+    let n = total_cells();
+    if (i >= n) {{ return; }}
+    if (i >= {stride}u) {{
+        dst_buf[i] = src_buf[i] + src_buf[i - {stride}u];
+    }} else {{
+        dst_buf[i] = src_buf[i];
+    }}
+}}
+"#
+    )
+}
+
+/// Exclusive cell offsets from inclusive prefix + raw counts; writes sentinel `cell_offsets[n]`.
+const WGSL_SCAN_EXCLUSIVE: &str = r#"
+@group(0) @binding(1) var<storage, read> counts_for_scan: array<u32>;
+@group(0) @binding(2) var<storage, read> inclusive: array<u32>;
+@group(0) @binding(3) var<storage, read_write> cell_offsets: array<u32>;
+
+@compute @workgroup_size(256)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    let n = total_cells();
+    if (i == 0u) {
+        cell_offsets[n] = inclusive[n - 1u];
     }
-    cell_offsets[n] = sum;
+    if (i >= n) { return; }
+    cell_offsets[i] = inclusive[i] - counts_for_scan[i];
 }
 "#;
 
@@ -204,6 +239,16 @@ fn concat_wgsl(prefix: &str, body: &str) -> String {
     s
 }
 
+/// Inclusive Hillis–Steele step count: `ceil(log2(n))`, `0` for `n <= 1`.
+#[inline]
+fn ceil_log2_u32(n: u32) -> u32 {
+    if n <= 1 {
+        0
+    } else {
+        u32::BITS - (n - 1).leading_zeros()
+    }
+}
+
 /// GPU resources and compute pipelines for one spatial grid configuration.
 pub struct SpatialGridGpu {
     pub params: Handle<wgpu::Buffer>,
@@ -222,9 +267,22 @@ pub struct SpatialGridGpu {
     pub bind_clear: Handle<wgpu::BindGroup>,
     pub bind_count: Handle<wgpu::BindGroup>,
     pub bind_linearize: Handle<wgpu::BindGroup>,
+    /// Bind group for the exclusive-scan **finalize** pass when inclusive results live in
+    /// `scan_scratch` (same layout as [`Self::bind_scan_finalize_from_temp`]).
     pub bind_scan: Handle<wgpu::BindGroup>,
     pub bind_init_heads: Handle<wgpu::BindGroup>,
     pub bind_scatter: Handle<wgpu::BindGroup>,
+    bind_scan_copy: Handle<wgpu::BindGroup>,
+    bind_scan_inc_scratch_to_temp: Handle<wgpu::BindGroup>,
+    bind_scan_inc_temp_to_scratch: Handle<wgpu::BindGroup>,
+    bind_scan_finalize_from_temp: Handle<wgpu::BindGroup>,
+    /// Ping-pong buffers for the inclusive scan (handles kept with the grid for lifetime clarity).
+    #[allow(dead_code)]
+    scan_scratch: Handle<wgpu::Buffer>,
+    #[allow(dead_code)]
+    scan_temp: Handle<wgpu::Buffer>,
+    pipeline_scan_copy: Handle<wgpu::ComputePipeline>,
+    pipeline_scan_inclusive_steps: Vec<Handle<wgpu::ComputePipeline>>,
     cells: u32,
     max_entities: u32,
 }
@@ -303,6 +361,20 @@ impl SpatialGridGpu {
             .add_usage(wgpu::BufferUsages::COPY_SRC)
             .build(registry)?;
 
+        let scan_scratch = renderer
+            .create_gpu_buffer::<u32>()
+            .label("spatial_grid scan_scratch")
+            .capacity(cells as usize)
+            .usage(BufferUsage::Storage { read_only: false })
+            .build(registry)?;
+
+        let scan_temp = renderer
+            .create_gpu_buffer::<u32>()
+            .label("spatial_grid scan_temp")
+            .capacity(cells as usize)
+            .usage(BufferUsage::Storage { read_only: false })
+            .build(registry)?;
+
         let shader_clear = ShaderModuleBuilder::new(device)
             .label("spatial_grid clear")
             .with_wgsl_source(concat_wgsl(WGSL_PARAMS, WGSL_CLEAR))
@@ -315,9 +387,14 @@ impl SpatialGridGpu {
             .label("spatial_grid linearize")
             .with_wgsl_source(concat_wgsl(WGSL_PARAMS, WGSL_LINEARIZE))
             .build(registry)?;
-        let shader_scan = ShaderModuleBuilder::new(device)
-            .label("spatial_grid scan")
-            .with_wgsl_source(concat_wgsl(WGSL_PARAMS, WGSL_SCAN))
+        let shader_scan_copy = ShaderModuleBuilder::new(device)
+            .label("spatial_grid scan copy")
+            .with_wgsl_source(concat_wgsl(WGSL_PARAMS, WGSL_SCAN_COPY))
+            .build(registry)?;
+
+        let shader_scan_exclusive = ShaderModuleBuilder::new(device)
+            .label("spatial_grid scan exclusive")
+            .with_wgsl_source(concat_wgsl(WGSL_PARAMS, WGSL_SCAN_EXCLUSIVE))
             .build(registry)?;
         let shader_init_heads = ShaderModuleBuilder::new(device)
             .label("spatial_grid init_heads")
@@ -423,8 +500,8 @@ impl SpatialGridGpu {
                 },
             ],
         });
-        let layout_scan = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("spatial_grid scan layout"),
+        let layout_scan_copy = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("spatial_grid scan copy layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -448,6 +525,86 @@ impl SpatialGridGpu {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let layout_scan_inc = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("spatial_grid scan inclusive step layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let layout_scan_finalize = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("spatial_grid scan finalize layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -554,9 +711,19 @@ impl SpatialGridGpu {
             bind_group_layouts: &[&layout_linearize],
             push_constant_ranges: &[],
         });
-        let pl_scan = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("spatial_grid scan pl"),
-            bind_group_layouts: &[&layout_scan],
+        let pl_scan_copy = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("spatial_grid scan copy pl"),
+            bind_group_layouts: &[&layout_scan_copy],
+            push_constant_ranges: &[],
+        });
+        let pl_scan_inc = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("spatial_grid scan inclusive pl"),
+            bind_group_layouts: &[&layout_scan_inc],
+            push_constant_ranges: &[],
+        });
+        let pl_scan_finalize = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("spatial_grid scan finalize pl"),
+            bind_group_layouts: &[&layout_scan_finalize],
             push_constant_ranges: &[],
         });
         let pl_init_heads = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -628,9 +795,9 @@ impl SpatialGridGpu {
         });
         let bind_linearize = registry.insert(bind_linearize);
 
-        let bind_scan = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("spatial_grid bind scan"),
-            layout: &layout_scan,
+        let bind_scan_copy = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("spatial_grid bind scan copy"),
+            layout: &layout_scan_copy,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -642,11 +809,101 @@ impl SpatialGridGpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
+                    resource: registry.get(scan_scratch.handle()).unwrap().as_entire_binding(),
+                },
+            ],
+        });
+        let bind_scan_copy = registry.insert(bind_scan_copy);
+
+        let bind_scan_inc_scratch_to_temp = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("spatial_grid bind scan inc scratch->temp"),
+            layout: &layout_scan_inc,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: registry.get(params_handle).unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: registry.get(scan_scratch.handle()).unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: registry.get(scan_temp.handle()).unwrap().as_entire_binding(),
+                },
+            ],
+        });
+        let bind_scan_inc_scratch_to_temp = registry.insert(bind_scan_inc_scratch_to_temp);
+
+        let bind_scan_inc_temp_to_scratch = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("spatial_grid bind scan inc temp->scratch"),
+            layout: &layout_scan_inc,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: registry.get(params_handle).unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: registry.get(scan_temp.handle()).unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: registry.get(scan_scratch.handle()).unwrap().as_entire_binding(),
+                },
+            ],
+        });
+        let bind_scan_inc_temp_to_scratch = registry.insert(bind_scan_inc_temp_to_scratch);
+
+        let bind_scan_finalize_from_scratch = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("spatial_grid bind scan finalize (inclusive in scratch)"),
+            layout: &layout_scan_finalize,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: registry.get(params_handle).unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: registry.get(counts_linear.handle()).unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: registry.get(scan_scratch.handle()).unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
                     resource: registry.get(cell_offsets.handle()).unwrap().as_entire_binding(),
                 },
             ],
         });
-        let bind_scan = registry.insert(bind_scan);
+        let bind_scan_finalize_from_scratch = registry.insert(bind_scan_finalize_from_scratch);
+
+        let bind_scan_finalize_from_temp = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("spatial_grid bind scan finalize (inclusive in temp)"),
+            layout: &layout_scan_finalize,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: registry.get(params_handle).unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: registry.get(counts_linear.handle()).unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: registry.get(scan_temp.handle()).unwrap().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: registry.get(cell_offsets.handle()).unwrap().as_entire_binding(),
+                },
+            ],
+        });
+        let bind_scan_finalize_from_temp = registry.insert(bind_scan_finalize_from_temp);
+
+        let bind_scan = bind_scan_finalize_from_scratch;
 
         let bind_init_heads = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("spatial_grid bind init_heads"),
@@ -713,10 +970,33 @@ impl SpatialGridGpu {
             .with_layout(pl_linearize)
             .build(registry)?;
 
+        let pipeline_scan_copy = ComputePipelineBuilder::new(device)
+            .with_label("spatial_grid scan copy")
+            .with_compute_shader(shader_scan_copy)
+            .with_layout(pl_scan_copy)
+            .build(registry)?;
+
+        let inclusive_passes = ceil_log2_u32(cells);
+        let mut pipeline_scan_inclusive_steps = Vec::with_capacity(inclusive_passes as usize);
+        for p in 0..inclusive_passes {
+            let stride = 1u32 << p;
+            let wgsl = concat_wgsl(WGSL_PARAMS, &wgsl_scan_inclusive_step(stride));
+            let sm = ShaderModuleBuilder::new(device)
+                .label(&format!("spatial_grid scan inclusive stride {stride}"))
+                .with_wgsl_source(wgsl)
+                .build(registry)?;
+            let pipe = ComputePipelineBuilder::new(device)
+                .with_label(&format!("spatial_grid scan inc {stride}"))
+                .with_compute_shader(sm)
+                .with_layout(pl_scan_inc.clone())
+                .build(registry)?;
+            pipeline_scan_inclusive_steps.push(pipe);
+        }
+
         let pipeline_scan = ComputePipelineBuilder::new(device)
-            .with_label("spatial_grid scan")
-            .with_compute_shader(shader_scan)
-            .with_layout(pl_scan)
+            .with_label("spatial_grid scan exclusive")
+            .with_compute_shader(shader_scan_exclusive)
+            .with_layout(pl_scan_finalize)
             .build(registry)?;
 
         let pipeline_init_heads = ComputePipelineBuilder::new(device)
@@ -751,6 +1031,14 @@ impl SpatialGridGpu {
             bind_scan,
             bind_init_heads,
             bind_scatter,
+            bind_scan_copy,
+            bind_scan_inc_scratch_to_temp,
+            bind_scan_inc_temp_to_scratch,
+            bind_scan_finalize_from_temp,
+            scan_scratch: scan_scratch.handle(),
+            scan_temp: scan_temp.handle(),
+            pipeline_scan_copy,
+            pipeline_scan_inclusive_steps,
             cells,
             max_entities: cfg.max_entities,
         })
@@ -781,6 +1069,7 @@ impl SpatialGridGpu {
         let p_clear = registry.get(self.pipeline_clear).expect("pipeline_clear");
         let p_count = registry.get(self.pipeline_count).expect("pipeline_count");
         let p_linearize = registry.get(self.pipeline_linearize).expect("pipeline_linearize");
+        let p_scan_copy = registry.get(self.pipeline_scan_copy).expect("pipeline_scan_copy");
         let p_scan = registry.get(self.pipeline_scan).expect("pipeline_scan");
         let p_init = registry.get(self.pipeline_init_heads).expect("pipeline_init_heads");
         let p_scatter = registry.get(self.pipeline_scatter).expect("pipeline_scatter");
@@ -788,7 +1077,11 @@ impl SpatialGridGpu {
         let g_clear = registry.get(self.bind_clear).expect("bind_clear");
         let g_count = registry.get(self.bind_count).expect("bind_count");
         let g_linearize = registry.get(self.bind_linearize).expect("bind_linearize");
-        let g_scan = registry.get(self.bind_scan).expect("bind_scan");
+        let g_scan_copy = registry.get(self.bind_scan_copy).expect("bind_scan_copy");
+        let g_scan_inc_s2t = registry.get(self.bind_scan_inc_scratch_to_temp).expect("bind_scan_inc_s2t");
+        let g_scan_inc_t2s = registry.get(self.bind_scan_inc_temp_to_scratch).expect("bind_scan_inc_t2s");
+        let g_scan_fin_scratch = registry.get(self.bind_scan).expect("bind_scan (finalize scratch)");
+        let g_scan_fin_temp = registry.get(self.bind_scan_finalize_from_temp).expect("bind_scan_fin_temp");
         let g_init = registry.get(self.bind_init_heads).expect("bind_init_heads");
         let g_scatter = registry.get(self.bind_scatter).expect("bind_scatter");
 
@@ -821,12 +1114,43 @@ impl SpatialGridGpu {
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("spatial_grid scan"),
+                label: Some("spatial_grid scan copy"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(p_scan_copy);
+            pass.set_bind_group(0, g_scan_copy, &[]);
+            pass.dispatch_workgroups(wg256, 1, 1);
+        }
+        let mut inclusive_in_scratch = true;
+        for pipe_h in &self.pipeline_scan_inclusive_steps {
+            let p_inc = registry.get(*pipe_h).expect("pipeline_scan_inclusive");
+            let g_inc = if inclusive_in_scratch {
+                g_scan_inc_s2t
+            } else {
+                g_scan_inc_t2s
+            };
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("spatial_grid scan inclusive"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(p_inc);
+            pass.set_bind_group(0, g_inc, &[]);
+            pass.dispatch_workgroups(wg256, 1, 1);
+            inclusive_in_scratch = !inclusive_in_scratch;
+        }
+        let g_scan_fin = if inclusive_in_scratch {
+            g_scan_fin_scratch
+        } else {
+            g_scan_fin_temp
+        };
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("spatial_grid scan exclusive"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(p_scan);
-            pass.set_bind_group(0, g_scan, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
+            pass.set_bind_group(0, g_scan_fin, &[]);
+            pass.dispatch_workgroups(wg256, 1, 1);
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
