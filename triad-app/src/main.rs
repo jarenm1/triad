@@ -22,6 +22,98 @@ const PARTICLE_SPEED_SCALE: f32 = 6.0;
 /// Uniform 2D grid over simulation xy ∈ [-1, 1]; single z slab. Keeps `total_cells` moderate for the scan.
 const SPATIAL_GRID_DIMS: [u32; 3] = [64, 64, 1];
 
+/// After [`SpatialGridGpu`] rebuild, compute max over particles of (others in same + 8 neighbor
+/// cells). Validates `counts_linear` and cell indexing against live positions.
+const CLEAR_GRID_NEIGHBOR_STATS_SHADER: &str = r#"
+struct GridNeighborStats {
+    max_others_in_3x3_cells: atomic<u32>,
+}
+
+@group(0) @binding(0) var<storage, read_write> stats: GridNeighborStats;
+
+@compute @workgroup_size(1)
+fn cs_main() {
+    atomicStore(&stats.max_others_in_3x3_cells, 0u);
+}
+"#;
+
+const GRID_NEIGHBOR_MAX_SHADER: &str = r#"
+struct Params {
+    world_origin: vec3<f32>,
+    cell_size: f32,
+    grid_dims: vec3<u32>,
+    entity_count: u32,
+}
+
+struct ParticleState {
+    position: vec2<f32>,
+    velocity: vec2<f32>,
+    alive: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+struct ParticleBuffer {
+    particles: array<ParticleState>,
+}
+
+struct GridNeighborStats {
+    max_others_in_3x3_cells: atomic<u32>,
+}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> particles: ParticleBuffer;
+@group(0) @binding(2) var<storage, read> counts_linear: array<u32>;
+@group(0) @binding(3) var<storage, read_write> stats: GridNeighborStats;
+
+fn cell_index(world_pos: vec3<f32>) -> u32 {
+    let g = params.grid_dims;
+    let o = params.world_origin;
+    let inv = 1.0 / params.cell_size;
+    let f = floor((world_pos - o) * inv);
+    let ix = clamp(i32(f.x), 0, i32(g.x) - 1);
+    let iy = clamp(i32(f.y), 0, i32(g.y) - 1);
+    let iz = clamp(i32(f.z), 0, i32(g.z) - 1);
+    let ux = u32(ix);
+    let uy = u32(iy);
+    let uz = u32(iz);
+    return ux + g.x * (uy + g.y * uz);
+}
+
+@compute @workgroup_size(64)
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x;
+    if (i >= params.entity_count) {
+        return;
+    }
+    if (particles.particles[i].alive == 0u) {
+        return;
+    }
+    let p = particles.particles[i].position;
+    let c = cell_index(vec3<f32>(p.x, p.y, 0.0));
+    let gx = params.grid_dims.x;
+    let gy = params.grid_dims.y;
+    let cx = c % gx;
+    let cy = (c / gx) % gy;
+
+    var tot: u32 = 0u;
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+            let nx = i32(cx) + dx;
+            let ny = i32(cy) + dy;
+            if (nx < 0 || ny < 0 || nx >= i32(gx) || ny >= i32(gy)) {
+                continue;
+            }
+            let nc = u32(nx) + gx * u32(ny);
+            tot = tot + counts_linear[nc];
+        }
+    }
+    let others = tot - 1u;
+    atomicMax(&stats.max_others_in_3x3_cells, others);
+}
+"#;
+
 const PARTICLES_TO_GRID_SHADER: &str = r#"
 struct ParticleState {
     position: vec2<f32>,
@@ -292,6 +384,9 @@ struct DemoStats {
     readback_sync_cpu_ms: f32,
     readback_mismatch: bool,
     cached_order_len: usize,
+    /// Max (over alive particles) of neighbors in the 3×3 cell block (same + 8 adjacent), excluding self.
+    /// Read back from GPU; validates spatial grid `counts_linear` against positions.
+    grid_max_others_in_3x3: u32,
 }
 
 impl DemoStats {
@@ -311,6 +406,7 @@ impl DemoStats {
             readback_sync_cpu_ms: 0.0,
             readback_mismatch: false,
             cached_order_len: 0,
+            grid_max_others_in_3x3: 0,
         }
     }
 }
@@ -371,6 +467,12 @@ struct ParticleRendererManager {
     particles_to_grid_pipeline: Handle<wgpu::ComputePipeline>,
     particles_to_grid_bind_group: Handle<wgpu::BindGroup>,
     particles_to_grid_dispatch_x: u32,
+    grid_neighbor_stats: Handle<wgpu::Buffer>,
+    grid_neighbor_readback: Handle<wgpu::Buffer>,
+    clear_grid_neighbor_pipeline: Handle<wgpu::ComputePipeline>,
+    grid_neighbor_max_pipeline: Handle<wgpu::ComputePipeline>,
+    clear_grid_neighbor_bind_group: Handle<wgpu::BindGroup>,
+    grid_neighbor_max_bind_group: Handle<wgpu::BindGroup>,
 }
 
 impl ParticleRendererManager {
@@ -522,6 +624,105 @@ impl ParticleRendererManager {
             .with_layout(particles_to_grid_pl)
             .build(registry)?;
         let particles_to_grid_dispatch_x = (particle_count as u32).div_ceil(WORKGROUP_SIZE);
+
+        let grid_neighbor_stats = renderer
+            .create_buffer()
+            .label("grid neighbor stats (atomic u32)")
+            .size(4)
+            .usage(BufferUsage::Storage { read_only: false })
+            .add_usage(wgpu::BufferUsages::COPY_SRC)
+            .build(registry)?;
+        let grid_neighbor_readback_buf = renderer
+            .create_gpu_buffer::<u32>()
+            .label("grid neighbor max readback")
+            .capacity(1)
+            .usage(BufferUsage::Readback)
+            .build(registry)?;
+        let grid_neighbor_readback = grid_neighbor_readback_buf.handle();
+
+        let clear_grid_neighbor_shader = renderer
+            .create_shader_module()
+            .label("clear grid neighbor stats")
+            .with_wgsl_source(CLEAR_GRID_NEIGHBOR_STATS_SHADER)
+            .build(registry)?;
+        let grid_neighbor_max_shader = renderer
+            .create_shader_module()
+            .label("grid neighbor max")
+            .with_wgsl_source(GRID_NEIGHBOR_MAX_SHADER)
+            .build(registry)?;
+
+        let (clear_grid_neighbor_layout, clear_grid_neighbor_bind_group) = renderer
+            .create_bind_group()
+            .label("clear grid neighbor stats")
+            .buffer_stage(
+                0,
+                ShaderStage::Compute,
+                grid_neighbor_stats,
+                BindingType::StorageWrite,
+            )
+            .build(registry)?;
+
+        let (grid_neighbor_max_layout, grid_neighbor_max_bind_group) = renderer
+            .create_bind_group()
+            .label("grid neighbor max")
+            .buffer_stage(
+                0,
+                ShaderStage::Compute,
+                spatial_grid.params,
+                BindingType::Uniform,
+            )
+            .buffer_stage(
+                1,
+                ShaderStage::Compute,
+                particle_buffer.handle(),
+                BindingType::StorageRead,
+            )
+            .buffer_stage(
+                2,
+                ShaderStage::Compute,
+                spatial_grid.counts_linear,
+                BindingType::StorageRead,
+            )
+            .buffer_stage(
+                3,
+                ShaderStage::Compute,
+                grid_neighbor_stats,
+                BindingType::StorageWrite,
+            )
+            .build(registry)?;
+
+        let clear_grid_neighbor_pl =
+            renderer
+                .device()
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("clear grid neighbor layout"),
+                    bind_group_layouts: &[registry
+                        .get(clear_grid_neighbor_layout)
+                        .expect("clear grid neighbor layout")],
+                    push_constant_ranges: &[],
+                });
+        let grid_neighbor_max_pl = renderer
+            .device()
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("grid neighbor max layout"),
+                bind_group_layouts: &[registry
+                    .get(grid_neighbor_max_layout)
+                    .expect("grid neighbor max layout")],
+                push_constant_ranges: &[],
+            });
+
+        let clear_grid_neighbor_pipeline = renderer
+            .create_compute_pipeline()
+            .with_label("clear grid neighbor stats")
+            .with_compute_shader(clear_grid_neighbor_shader)
+            .with_layout(clear_grid_neighbor_pl)
+            .build(registry)?;
+        let grid_neighbor_max_pipeline = renderer
+            .create_compute_pipeline()
+            .with_label("grid neighbor max")
+            .with_compute_shader(grid_neighbor_max_shader)
+            .with_layout(grid_neighbor_max_pl)
+            .build(registry)?;
 
         let (reset_layout, reset_bind_group) = renderer
             .create_bind_group()
@@ -704,6 +905,12 @@ impl ParticleRendererManager {
             particles_to_grid_pipeline,
             particles_to_grid_bind_group,
             particles_to_grid_dispatch_x,
+            grid_neighbor_stats,
+            grid_neighbor_readback,
+            clear_grid_neighbor_pipeline,
+            grid_neighbor_max_pipeline,
+            clear_grid_neighbor_bind_group,
+            grid_neighbor_max_bind_group,
         })
     }
 }
@@ -845,6 +1052,22 @@ impl RendererManager for ParticleRendererManager {
                 stats.readback_mismatch = mismatch;
             }
         }
+
+        if self.frame_index % 120 == 0 {
+            match renderer.read_buffer::<u32>(self.grid_neighbor_readback, registry) {
+                Ok(v) => {
+                    if let Some(m) = v.first() {
+                        if let Ok(mut stats) = self.stats.lock() {
+                            stats.grid_max_others_in_3x3 = *m;
+                        }
+                    }
+                }
+                Err(err) => {
+                    error!(error = %err, "grid neighbor max readback failed");
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -911,6 +1134,25 @@ impl RendererManager for ParticleRendererManager {
             grid: Arc::clone(&self.spatial_grid),
         }));
 
+        let clear_grid_neighbor_pass = ComputePassBuilder::new("ClearGridNeighborStats")
+            .read_write(self.grid_neighbor_stats)
+            .with_pipeline(self.clear_grid_neighbor_pipeline)
+            .with_bind_group(0, self.clear_grid_neighbor_bind_group)
+            .dispatch(1, 1, 1)
+            .build()
+            .expect("clear grid neighbor pass should build");
+
+        let grid_neighbor_pass = ComputePassBuilder::new("GridNeighborMax")
+            .read(self.spatial_grid.params)
+            .read(self.particle_buffer)
+            .read(self.spatial_grid.counts_linear)
+            .read_write(self.grid_neighbor_stats)
+            .with_pipeline(self.grid_neighbor_max_pipeline)
+            .with_bind_group(0, self.grid_neighbor_max_bind_group)
+            .dispatch(self.particles_to_grid_dispatch_x, 1, 1)
+            .build()
+            .expect("grid neighbor max pass should build");
+
         let compact_pass = ComputePassBuilder::new("CompactParticles")
             .read(self.dispatch_args)
             .read(self.particle_buffer)
@@ -932,6 +1174,11 @@ impl RendererManager for ParticleRendererManager {
                 self.draw_args,
                 self.draw_args_sync_readback,
                 std::mem::size_of::<DrawIndirectArgs>() as u64,
+            )
+            .copy_buffer(
+                self.grid_neighbor_stats,
+                self.grid_neighbor_readback,
+                4,
             )
             .build()
             .expect("copy readback pass should build");
@@ -965,6 +1212,8 @@ impl RendererManager for ParticleRendererManager {
         graph.add_pass(simulate_pass);
         graph.add_pass(particles_to_grid_pass);
         graph.add_pass(spatial_grid_pass);
+        graph.add_pass(clear_grid_neighbor_pass);
+        graph.add_pass(grid_neighbor_pass);
         graph.add_pass(compact_pass);
         graph.add_pass(copy_readback_pass);
         graph.add_pass(render_pass);
@@ -1056,6 +1305,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                             SPATIAL_GRID_DIMS[1],
                             SPATIAL_GRID_DIMS[2]
                         ));
+                        ui.label(format!(
+                            "Grid max others (3×3 cells, excl. self): {}",
+                            stats.grid_max_others_in_3x3
+                        ));
                         ui.add(
                             egui::Slider::new(&mut stats.user_speed_scale, 0.25..=24.0)
                                 .text("Speed scale"),
@@ -1081,7 +1334,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         ui.label(format!("Cached pass order len: {}", stats.cached_order_len));
                         ui.separator();
                         ui.label(
-                            "Frame: reset → simulate → to-grid → spatial rebuild → compact → readback → draw",
+                            "Frame: reset → simulate → to-grid → spatial rebuild → grid-neighbor max → compact → readback → draw",
                         );
                         ui.label("Depth: Less + Depth32Float (per-instance z from id).");
                         ui.label("Simulation is time-based; GPU resources are persistent.");
