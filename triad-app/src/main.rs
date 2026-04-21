@@ -20,7 +20,8 @@ const WORKGROUP_SIZE: u32 = 64;
 /// World-space disk radius: rendered circle and collision use the same value (xy domain ~[-1, 1]).
 const PARTICLE_RADIUS: f32 = 0.00875;
 /// Jacobi-style separation passes per frame (same spatial hash each pass).
-const COLLISION_ITERATIONS: u32 = 4;
+/// Lower this if GPU-bound; 2 is usually enough with the merged neighbor loop.
+const COLLISION_ITERATIONS: u32 = 2;
 
 /// Uniform 2D grid over simulation xy ∈ [-1, 1]; single z slab. Keeps `total_cells` moderate for the scan.
 const SPATIAL_GRID_DIMS: [u32; 3] = [64, 64, 1];
@@ -118,7 +119,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 "#;
 
 /// 2D disk–disk response: full separation on the lower-index body per pair (`j > i`), elastic
-/// normal impulse on both bodies (lower index in the `j > i` loop, upper index in `j < i`).
+/// normal impulse on both bodies (`j > i` gets position + velocity; `j < i` velocity only).
+/// Single 3×3 sweep (no duplicate neighbor iteration). Uses r² to skip `sqrt` when separated.
 /// Runs after [`SpatialGridGpu`] rebuild; multiple dispatches per frame approximate Jacobi.
 const PARTICLE_COLLISION_SHADER: &str = r#"
 struct GridParams {
@@ -180,6 +182,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let r = sim_u.particle_radius;
     let min_d = 2.0 * r;
+    let min_d_sq = min_d * min_d;
     var pi = particles.particles[i].position;
     var vi = particles.particles[i].velocity;
     let c = cell_index(vec3<f32>(pi.x, pi.y, 0.0));
@@ -202,7 +205,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let end = cell_offsets[nc + 1u];
             for (var k = start; k < end; k = k + 1u) {
                 let j = sorted_entity_ids[k];
-                if (j <= i) {
+                if (j == i) {
                     continue;
                 }
                 if (particles.particles[j].alive == 0u) {
@@ -211,55 +214,22 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 let pj = particles.particles[j].position;
                 let vj = particles.particles[j].velocity;
                 var diff = pi - pj;
-                var dist = length(diff);
-                if (dist < min_d) {
-                    if (dist < 1e-8) {
-                        diff = vec2<f32>(1.0, 0.3) * r * 0.02;
-                        dist = length(diff);
-                    }
-                    let n = diff / dist;
-                    let vn = dot(vi - vj, n);
-                    if (vn < 0.0) {
-                        vi = vi - vn * n;
-                    }
+                let dist_sq = dot(diff, diff);
+                if (dist_sq >= min_d_sq) {
+                    continue;
+                }
+                var dist = sqrt(dist_sq);
+                if (dist < 1e-8) {
+                    diff = vec2<f32>(1.0, 0.3) * r * 0.02;
+                    dist = length(diff);
+                }
+                let n = diff / dist;
+                let vn = dot(vi - vj, n);
+                if (vn < 0.0) {
+                    vi = vi - vn * n;
+                }
+                if (j > i) {
                     delta = delta + n * (min_d - dist);
-                }
-            }
-        }
-    }
-
-    for (var dy2: i32 = -1; dy2 <= 1; dy2 = dy2 + 1) {
-        for (var dx2: i32 = -1; dx2 <= 1; dx2 = dx2 + 1) {
-            let nx2 = i32(cx) + dx2;
-            let ny2 = i32(cy) + dy2;
-            if (nx2 < 0 || ny2 < 0 || nx2 >= i32(gx) || ny2 >= i32(gy)) {
-                continue;
-            }
-            let nc2 = u32(nx2) + gx * u32(ny2);
-            let start2 = cell_offsets[nc2];
-            let end2 = cell_offsets[nc2 + 1u];
-            for (var k2 = start2; k2 < end2; k2 = k2 + 1u) {
-                let j2 = sorted_entity_ids[k2];
-                if (j2 >= i) {
-                    continue;
-                }
-                if (particles.particles[j2].alive == 0u) {
-                    continue;
-                }
-                let pj2 = particles.particles[j2].position;
-                let vj2 = particles.particles[j2].velocity;
-                var diff2 = pi - pj2;
-                var dist2 = length(diff2);
-                if (dist2 < min_d) {
-                    if (dist2 < 1e-8) {
-                        diff2 = vec2<f32>(-0.7, 1.0) * r * 0.02;
-                        dist2 = length(diff2);
-                    }
-                    let n2 = diff2 / dist2;
-                    let vn2 = dot(vi - vj2, n2);
-                    if (vn2 < 0.0) {
-                        vi = vi - vn2 * n2;
-                    }
                 }
             }
         }
@@ -324,6 +294,12 @@ fn particle_count_from_env() -> usize {
 const READBACK_INTERVAL_FRAMES: u64 = 15;
 const READBACK_RING_SIZE: usize = 3;
 const READBACK_VALIDATE_INTERVAL_FRAMES: u64 = 240;
+
+fn grid_neighbor_validate_from_env() -> bool {
+    std::env::var("TRIAD_GRID_NEIGHBOR_VALIDATE")
+        .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 const RESET_DRAW_ARGS_SHADER: &str = r#"
 struct DrawArgs {
@@ -566,10 +542,17 @@ struct DemoStats {
     /// Max (over alive particles) of neighbors in the 3×3 cell block (same + 8 adjacent), excluding self.
     /// Read back from GPU; validates spatial grid `counts_linear` against positions.
     grid_max_others_in_3x3: u32,
+    /// When false, grid-neighbor GPU validation passes are skipped (default; better FPS at high N).
+    grid_neighbor_validate: bool,
 }
 
 impl DemoStats {
-    fn new(particle_count: usize, workgroup_count: u32, spatial_grid_cells: u32) -> Self {
+    fn new(
+        particle_count: usize,
+        workgroup_count: u32,
+        spatial_grid_cells: u32,
+        grid_neighbor_validate: bool,
+    ) -> Self {
         Self {
             particle_count,
             workgroup_count,
@@ -584,6 +567,7 @@ impl DemoStats {
             readback_mismatch: false,
             cached_order_len: 0,
             grid_max_others_in_3x3: 0,
+            grid_neighbor_validate,
         }
     }
 }
@@ -652,6 +636,8 @@ struct ParticleRendererManager {
     grid_neighbor_max_bind_group: Handle<wgpu::BindGroup>,
     collision_pipeline: Handle<wgpu::ComputePipeline>,
     collision_bind_group: Handle<wgpu::BindGroup>,
+    /// When true, runs clear + max passes and copies stats for CPU readback (expensive at high N).
+    grid_neighbor_validate: bool,
 }
 
 impl ParticleRendererManager {
@@ -661,6 +647,7 @@ impl ParticleRendererManager {
         surface_format: wgpu::TextureFormat,
         stats: Arc<Mutex<DemoStats>>,
         particle_count: usize,
+        grid_neighbor_validate: bool,
     ) -> Result<Self, Box<dyn Error>> {
         let particles: Vec<ParticleState> = (0..particle_count)
             .map(|i| ParticleState::from_index(i, particle_count))
@@ -1148,6 +1135,7 @@ impl ParticleRendererManager {
             grid_neighbor_max_bind_group,
             collision_pipeline,
             collision_bind_group,
+            grid_neighbor_validate,
         })
     }
 }
@@ -1284,7 +1272,7 @@ impl RendererManager for ParticleRendererManager {
             }
         }
 
-        if self.frame_index % 120 == 0 {
+        if self.grid_neighbor_validate && self.frame_index % 120 == 0 {
             match renderer.read_buffer::<u32>(self.grid_neighbor_readback, registry) {
                 Ok(v) => {
                     if let Some(m) = v.first() {
@@ -1413,7 +1401,7 @@ impl RendererManager for ParticleRendererManager {
             .build()
             .expect("compact pass should build");
 
-        let copy_readback_pass = CopyPassBuilder::new("CopyDrawArgsReadback")
+        let mut copy_readback = CopyPassBuilder::new("CopyDrawArgsReadback")
             .copy_buffer_to_frame_slot(
                 self.draw_args,
                 self.draw_args_readback_slot,
@@ -1423,12 +1411,15 @@ impl RendererManager for ParticleRendererManager {
                 self.draw_args,
                 self.draw_args_sync_readback,
                 std::mem::size_of::<DrawIndirectArgs>() as u64,
-            )
-            .copy_buffer(
+            );
+        if self.grid_neighbor_validate {
+            copy_readback = copy_readback.copy_buffer(
                 self.grid_neighbor_stats,
                 self.grid_neighbor_readback,
                 4,
-            )
+            );
+        }
+        let copy_readback_pass = copy_readback
             .build()
             .expect("copy readback pass should build");
 
@@ -1464,8 +1455,10 @@ impl RendererManager for ParticleRendererManager {
         for p in collision_passes {
             graph.add_pass(p);
         }
-        graph.add_pass(clear_grid_neighbor_pass);
-        graph.add_pass(grid_neighbor_pass);
+        if self.grid_neighbor_validate {
+            graph.add_pass(clear_grid_neighbor_pass);
+            graph.add_pass(grid_neighbor_pass);
+        }
         graph.add_pass(compact_pass);
         graph.add_pass(copy_readback_pass);
         graph.add_pass(render_pass);
@@ -1511,7 +1504,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     init_logging();
     info!("starting triad app");
     let particle_count = particle_count_from_env();
-    info!(particle_count, "particle count (override with TRIAD_PARTICLE_COUNT)");
+    let grid_neighbor_validate = grid_neighbor_validate_from_env();
+    info!(
+        particle_count,
+        grid_neighbor_validate,
+        "particle count (override with TRIAD_PARTICLE_COUNT); grid-neighbor GPU validate (TRIAD_GRID_NEIGHBOR_VALIDATE)"
+    );
     info!(
         display = std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".to_string()),
         wayland = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "<unset>".to_string()),
@@ -1523,6 +1521,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         particle_count,
         (particle_count as u32).div_ceil(WORKGROUP_SIZE),
         total_cells(SPATIAL_GRID_DIMS),
+        grid_neighbor_validate,
     )));
     let ui_stats = Arc::clone(&stats);
     let manager_stats = Arc::clone(&stats);
@@ -1557,10 +1556,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                             SPATIAL_GRID_DIMS[1],
                             SPATIAL_GRID_DIMS[2]
                         ));
-                        ui.label(format!(
-                            "Grid max others (3×3 cells, excl. self): {}",
-                            stats.grid_max_others_in_3x3
-                        ));
+                        if stats.grid_neighbor_validate {
+                            ui.label(format!(
+                                "Grid max others (3×3 cells, excl. self): {}",
+                                stats.grid_max_others_in_3x3
+                            ));
+                        } else {
+                            ui.label(
+                                "Grid max others (3×3): disabled (set TRIAD_GRID_NEIGHBOR_VALIDATE=1; costs GPU time)",
+                            );
+                        }
                         ui.label(format!(
                             "Disk radius (draw + collision): {:.4} world units; {} collision passes/frame",
                             PARTICLE_RADIUS, COLLISION_ITERATIONS
@@ -1605,6 +1610,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 surface_format,
                 Arc::clone(&manager_stats),
                 particle_count,
+                grid_neighbor_validate,
             )?))
         },
     );
