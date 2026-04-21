@@ -3,12 +3,13 @@
 //! These builders provide a simpler, more ergonomic API compared to
 //! directly using wgpu descriptors.
 
+use std::borrow::Cow;
 use std::marker::PhantomData;
 
-use crate::error::{BindGroupError, BufferError};
+use crate::Renderer;
+use crate::error::{BindGroupError, BufferError, PipelineError, ShaderError};
 use crate::frame_graph::resource::Handle;
 use crate::resource_registry::ResourceRegistry;
-use crate::Renderer;
 
 /// Buffer usage flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,12 @@ pub enum BufferUsage {
     CopySrc,
     /// Copy destination
     CopyDst,
+    /// Indirect draw/dispatch arguments
+    Indirect,
+    /// CPU-readable staging buffer
+    Readback,
+    /// CPU-writable staging buffer
+    Upload,
 }
 
 impl BufferUsage {
@@ -42,6 +49,9 @@ impl BufferUsage {
             }
             BufferUsage::CopySrc => wgpu::BufferUsages::COPY_SRC,
             BufferUsage::CopyDst => wgpu::BufferUsages::COPY_DST,
+            BufferUsage::Indirect => wgpu::BufferUsages::INDIRECT,
+            BufferUsage::Readback => wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            BufferUsage::Upload => wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::MAP_WRITE,
         }
     }
 }
@@ -52,7 +62,7 @@ pub struct BufferBuilder<'a> {
     label: Option<String>,
     size: Option<u64>,
     data: Option<&'a [u8]>,
-    usage: BufferUsage,
+    usage: wgpu::BufferUsages,
 }
 
 impl<'a> BufferBuilder<'a> {
@@ -62,7 +72,7 @@ impl<'a> BufferBuilder<'a> {
             label: None,
             size: None,
             data: None,
-            usage: BufferUsage::Vertex,
+            usage: BufferUsage::Vertex.to_wgpu(),
         }
     }
 
@@ -92,7 +102,19 @@ impl<'a> BufferBuilder<'a> {
 
     /// Set buffer usage
     pub fn usage(mut self, usage: BufferUsage) -> Self {
+        self.usage = usage.to_wgpu();
+        self
+    }
+
+    /// Replace the raw usage flags.
+    pub fn usage_flags(mut self, usage: wgpu::BufferUsages) -> Self {
         self.usage = usage;
+        self
+    }
+
+    /// Add an extra usage flag without replacing the existing set.
+    pub fn add_usage(mut self, usage: wgpu::BufferUsages) -> Self {
+        self.usage |= usage;
         self
     }
 
@@ -109,14 +131,14 @@ impl<'a> BufferBuilder<'a> {
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: self.label.as_deref(),
                     contents: data,
-                    usage: self.usage.to_wgpu(),
+                    usage: self.usage,
                 })
         } else if let Some(size) = self.size {
             // Create empty buffer
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: self.label.as_deref(),
                 size,
-                usage: self.usage.to_wgpu(),
+                usage: self.usage,
                 mapped_at_creation: false,
             })
         } else {
@@ -124,6 +146,203 @@ impl<'a> BufferBuilder<'a> {
         };
 
         Ok(registry.insert(buffer))
+    }
+}
+
+/// Supported shader source payloads.
+pub enum ShaderSource<'a> {
+    Wgsl(Cow<'a, str>),
+}
+
+/// Builder for creating shader modules from in-memory source.
+pub struct ShaderModuleBuilder<'a> {
+    device: &'a wgpu::Device,
+    label: Option<String>,
+    source: Option<ShaderSource<'a>>,
+}
+
+impl<'a> ShaderModuleBuilder<'a> {
+    pub(crate) fn new(device: &'a wgpu::Device) -> Self {
+        Self {
+            device,
+            label: None,
+            source: None,
+        }
+    }
+
+    /// Set the shader label.
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Set WGSL source code for this shader module.
+    pub fn with_wgsl_source(mut self, source: impl Into<Cow<'a, str>>) -> Self {
+        self.source = Some(ShaderSource::Wgsl(source.into()));
+        self
+    }
+
+    /// Build the shader module and register it in the registry.
+    pub fn build(
+        self,
+        registry: &mut ResourceRegistry,
+    ) -> Result<Handle<wgpu::ShaderModule>, ShaderError> {
+        let source = self.source.ok_or(ShaderError::MissingSource)?;
+
+        let module = match source {
+            ShaderSource::Wgsl(source) => {
+                self.device
+                    .create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: self.label.as_deref(),
+                        source: wgpu::ShaderSource::Wgsl(source),
+                    })
+            }
+        };
+
+        Ok(registry.insert(module))
+    }
+}
+
+/// Typed metadata for a GPU buffer owned by the registry.
+#[derive(Debug)]
+pub struct GpuBuffer<T: bytemuck::Pod> {
+    handle: Handle<wgpu::Buffer>,
+    len: usize,
+    capacity: usize,
+    usage: wgpu::BufferUsages,
+    _marker: PhantomData<T>,
+}
+
+impl<T: bytemuck::Pod> GpuBuffer<T> {
+    /// Returns the underlying buffer handle.
+    pub fn handle(&self) -> Handle<wgpu::Buffer> {
+        self.handle
+    }
+
+    /// Returns the current logical length in elements.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns the total allocated capacity in elements.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns true when the buffer contains no initialized elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the raw wgpu usage flags used to create the buffer.
+    pub fn usage(&self) -> wgpu::BufferUsages {
+        self.usage
+    }
+
+    /// Returns the allocated size in bytes.
+    pub fn size_bytes(&self) -> u64 {
+        (self.capacity * std::mem::size_of::<T>()) as u64
+    }
+}
+
+/// Builder for typed GPU buffers intended for storage, uniforms, indirect args, and readback.
+pub struct GpuBufferBuilder<'a, T: bytemuck::Pod> {
+    device: &'a wgpu::Device,
+    label: Option<String>,
+    capacity: Option<usize>,
+    initial_data: Option<&'a [T]>,
+    usage: wgpu::BufferUsages,
+    _marker: PhantomData<T>,
+}
+
+impl<'a, T: bytemuck::Pod> GpuBufferBuilder<'a, T> {
+    pub(crate) fn new(device: &'a wgpu::Device) -> Self {
+        Self {
+            device,
+            label: None,
+            capacity: None,
+            initial_data: None,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Set the buffer label.
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Set total element capacity.
+    pub fn capacity(mut self, capacity: usize) -> Self {
+        self.capacity = Some(capacity);
+        self
+    }
+
+    /// Initialize the buffer from a typed slice.
+    pub fn with_data(mut self, data: &'a [T]) -> Self {
+        self.initial_data = Some(data);
+        self
+    }
+
+    /// Replace the usage flags with a predefined usage class.
+    pub fn usage(mut self, usage: BufferUsage) -> Self {
+        self.usage = usage.to_wgpu();
+        self
+    }
+
+    /// Replace the raw usage flags.
+    pub fn usage_flags(mut self, usage: wgpu::BufferUsages) -> Self {
+        self.usage = usage;
+        self
+    }
+
+    /// Add an extra usage flag without replacing the existing set.
+    pub fn add_usage(mut self, usage: wgpu::BufferUsages) -> Self {
+        self.usage |= usage;
+        self
+    }
+
+    /// Build the typed buffer and register it.
+    pub fn build(self, registry: &mut ResourceRegistry) -> Result<GpuBuffer<T>, BufferError> {
+        use wgpu::util::DeviceExt;
+
+        let element_size = std::mem::size_of::<T>();
+
+        let (capacity, len) = match (self.capacity, self.initial_data) {
+            (Some(capacity), Some(data)) => (capacity.max(data.len()), data.len()),
+            (Some(capacity), None) => (capacity, 0),
+            (None, Some(data)) => (data.len(), data.len()),
+            (None, None) => return Err(BufferError::MissingSizeOrData),
+        };
+
+        let size_bytes = (capacity * element_size) as u64;
+        let buffer = if let Some(data) = self.initial_data {
+            let mut padded = bytemuck::cast_slice::<T, u8>(data).to_vec();
+            padded.resize(size_bytes as usize, 0);
+
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: self.label.as_deref(),
+                    contents: &padded,
+                    usage: self.usage,
+                })
+        } else {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: self.label.as_deref(),
+                size: size_bytes,
+                usage: self.usage,
+                mapped_at_creation: false,
+            })
+        };
+
+        Ok(GpuBuffer {
+            handle: registry.insert(buffer),
+            len,
+            capacity,
+            usage: self.usage,
+            _marker: PhantomData,
+        })
     }
 }
 
@@ -244,6 +463,7 @@ pub struct DynamicBufferBuilder<'a, T: bytemuck::Pod> {
     label: Option<String>,
     capacity: Option<usize>,
     initial_data: Option<&'a [T]>,
+    additional_usage: wgpu::BufferUsages,
     _marker: PhantomData<T>,
 }
 
@@ -254,6 +474,7 @@ impl<'a, T: bytemuck::Pod> DynamicBufferBuilder<'a, T> {
             label: None,
             capacity: None,
             initial_data: None,
+            additional_usage: wgpu::BufferUsages::empty(),
             _marker: PhantomData,
         }
     }
@@ -273,6 +494,12 @@ impl<'a, T: bytemuck::Pod> DynamicBufferBuilder<'a, T> {
     /// Initialize with data (capacity defaults to data.len() if not set)
     pub fn with_data(mut self, data: &'a [T]) -> Self {
         self.initial_data = Some(data);
+        self
+    }
+
+    /// Add extra usage flags on top of STORAGE | COPY_DST.
+    pub fn add_usage(mut self, usage: wgpu::BufferUsages) -> Self {
+        self.additional_usage |= usage;
         self
     }
 
@@ -300,13 +527,17 @@ impl<'a, T: bytemuck::Pod> DynamicBufferBuilder<'a, T> {
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: self.label.as_deref(),
                     contents: &padded,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    usage: wgpu::BufferUsages::STORAGE
+                        | wgpu::BufferUsages::COPY_DST
+                        | self.additional_usage,
                 })
         } else {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: self.label.as_deref(),
                 size: buffer_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | self.additional_usage,
                 mapped_at_creation: false,
             })
         };
@@ -320,6 +551,74 @@ impl<'a, T: bytemuck::Pod> DynamicBufferBuilder<'a, T> {
             element_size,
             _marker: PhantomData,
         })
+    }
+}
+
+/// Builder for creating compute pipelines.
+pub struct ComputePipelineBuilder<'a> {
+    device: &'a wgpu::Device,
+    compute_shader: Option<Handle<wgpu::ShaderModule>>,
+    label: Option<String>,
+    layout: Option<wgpu::PipelineLayout>,
+}
+
+impl<'a> ComputePipelineBuilder<'a> {
+    pub(crate) fn new(device: &'a wgpu::Device) -> Self {
+        Self {
+            device,
+            compute_shader: None,
+            label: None,
+            layout: None,
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn with_compute_shader(mut self, shader: Handle<wgpu::ShaderModule>) -> Self {
+        self.compute_shader = Some(shader);
+        self
+    }
+
+    pub fn with_layout(mut self, layout: wgpu::PipelineLayout) -> Self {
+        self.layout = Some(layout);
+        self
+    }
+
+    pub fn build(
+        self,
+        registry: &mut ResourceRegistry,
+    ) -> Result<Handle<wgpu::ComputePipeline>, PipelineError> {
+        let compute_handle = self
+            .compute_shader
+            .ok_or(PipelineError::MissingComputeShader)?;
+        let compute_shader = registry
+            .get(compute_handle)
+            .ok_or(PipelineError::ShaderNotFound)?;
+
+        let pipeline_layout = self.layout.unwrap_or_else(|| {
+            self.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None,
+                    bind_group_layouts: &[],
+                    push_constant_ranges: &[],
+                })
+        });
+
+        let pipeline = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: self.label.as_deref(),
+                layout: Some(&pipeline_layout),
+                module: compute_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+
+        Ok(registry.insert(pipeline))
     }
 }
 
@@ -409,7 +708,6 @@ struct BindGroupLayoutEntry {
 /// Builder for creating bind groups
 pub struct BindGroupBuilder<'a> {
     device: &'a wgpu::Device,
-    registry: &'a ResourceRegistry,
     label: Option<String>,
     entries: Vec<BindGroupLayoutEntry>,
     // Store handles instead of resources to avoid lifetime issues
@@ -419,10 +717,9 @@ pub struct BindGroupBuilder<'a> {
 }
 
 impl<'a> BindGroupBuilder<'a> {
-    pub(crate) fn new(device: &'a wgpu::Device, registry: &'a ResourceRegistry) -> Self {
+    pub(crate) fn new(device: &'a wgpu::Device) -> Self {
         Self {
             device,
-            registry,
             label: None,
             entries: Vec::new(),
             buffer_bindings: Vec::new(),
@@ -455,6 +752,25 @@ impl<'a> BindGroupBuilder<'a> {
         self
     }
 
+    /// Add a buffer binding with explicit shader-stage visibility.
+    pub fn buffer_stage(
+        mut self,
+        binding: u32,
+        visibility: ShaderStage,
+        buffer_handle: Handle<wgpu::Buffer>,
+        binding_type: BindingType,
+    ) -> Self {
+        self.entries.push(BindGroupLayoutEntry {
+            binding,
+            visibility,
+            binding_type,
+        });
+
+        self.buffer_bindings
+            .push((binding, buffer_handle, binding_type));
+        self
+    }
+
     /// Add a texture binding
     pub fn texture(
         mut self,
@@ -473,11 +789,47 @@ impl<'a> BindGroupBuilder<'a> {
         self
     }
 
+    /// Add a texture binding with explicit shader-stage visibility.
+    pub fn texture_stage(
+        mut self,
+        binding: u32,
+        visibility: ShaderStage,
+        texture_view_handle: Handle<wgpu::TextureView>,
+        binding_type: BindingType,
+    ) -> Self {
+        self.entries.push(BindGroupLayoutEntry {
+            binding,
+            visibility,
+            binding_type,
+        });
+
+        self.texture_bindings
+            .push((binding, texture_view_handle, binding_type));
+        self
+    }
+
     /// Add a sampler binding
     pub fn sampler(mut self, binding: u32, sampler_handle: Handle<wgpu::Sampler>) -> Self {
         self.entries.push(BindGroupLayoutEntry {
             binding,
             visibility: ShaderStage::All,
+            binding_type: BindingType::Sampler { filtering: true },
+        });
+
+        self.sampler_bindings.push((binding, sampler_handle));
+        self
+    }
+
+    /// Add a sampler binding with explicit shader-stage visibility.
+    pub fn sampler_stage(
+        mut self,
+        binding: u32,
+        visibility: ShaderStage,
+        sampler_handle: Handle<wgpu::Sampler>,
+    ) -> Self {
+        self.entries.push(BindGroupLayoutEntry {
+            binding,
+            visibility,
             binding_type: BindingType::Sampler { filtering: true },
         });
 
@@ -523,8 +875,7 @@ impl<'a> BindGroupBuilder<'a> {
 
         // Add buffer bindings
         for (binding, buffer_handle, _) in &self.buffer_bindings {
-            let buffer = self
-                .registry
+            let buffer = registry
                 .get(*buffer_handle)
                 .ok_or(BindGroupError::ResourceNotFound { binding: *binding })?;
             bind_group_entries.push(wgpu::BindGroupEntry {
@@ -535,8 +886,7 @@ impl<'a> BindGroupBuilder<'a> {
 
         // Add texture bindings
         for (binding, texture_view_handle, _) in &self.texture_bindings {
-            let texture_view = self
-                .registry
+            let texture_view = registry
                 .get(*texture_view_handle)
                 .ok_or(BindGroupError::ResourceNotFound { binding: *binding })?;
             bind_group_entries.push(wgpu::BindGroupEntry {
@@ -547,8 +897,7 @@ impl<'a> BindGroupBuilder<'a> {
 
         // Add sampler bindings
         for (binding, sampler_handle) in &self.sampler_bindings {
-            let sampler = self
-                .registry
+            let sampler = registry
                 .get(*sampler_handle)
                 .ok_or(BindGroupError::ResourceNotFound { binding: *binding })?;
             bind_group_entries.push(wgpu::BindGroupEntry {
@@ -559,7 +908,9 @@ impl<'a> BindGroupBuilder<'a> {
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: self.label.as_deref(),
-            layout: registry.get(layout_handle).ok_or(BindGroupError::LayoutNotFound)?,
+            layout: registry
+                .get(layout_handle)
+                .ok_or(BindGroupError::LayoutNotFound)?,
             entries: &bind_group_entries,
         });
         let bind_group_handle = registry.insert(bind_group);
@@ -674,7 +1025,10 @@ mod tests {
             .build(&mut registry);
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), BufferError::MissingSizeOrData));
+        assert!(matches!(
+            result.unwrap_err(),
+            BufferError::MissingSizeOrData
+        ));
     }
 
     #[test]
@@ -706,36 +1060,149 @@ mod tests {
                 .to_wgpu()
                 .contains(wgpu::BufferUsages::COPY_DST)
         );
+        assert_eq!(
+            BufferUsage::Indirect.to_wgpu(),
+            wgpu::BufferUsages::INDIRECT
+        );
+        assert_eq!(
+            BufferUsage::Readback.to_wgpu(),
+            wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ
+        );
+        assert_eq!(
+            BufferUsage::Upload.to_wgpu(),
+            wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::MAP_WRITE
+        );
+    }
+
+    #[test]
+    fn test_buffer_builder_usage_flags() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let handle = BufferBuilder::new(&device)
+            .size(16)
+            .usage_flags(wgpu::BufferUsages::STORAGE)
+            .add_usage(wgpu::BufferUsages::INDIRECT)
+            .build(&mut registry)
+            .expect("buffer");
+
+        let buffer = registry.get(handle).expect("stored buffer");
+        assert_eq!(
+            buffer.usage(),
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT
+        );
+    }
+
+    #[test]
+    fn test_typed_gpu_buffer_builder_with_data_and_capacity() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let data = [1u32, 2u32, 3u32];
+        let buffer = GpuBufferBuilder::new(&device)
+            .label("particles")
+            .with_data(&data)
+            .capacity(8)
+            .add_usage(wgpu::BufferUsages::INDIRECT)
+            .build(&mut registry)
+            .expect("typed buffer");
+
+        assert_eq!(buffer.len(), data.len());
+        assert_eq!(buffer.capacity(), 8);
+        assert_eq!(
+            buffer.usage(),
+            wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::INDIRECT
+        );
+
+        let raw = registry.get(buffer.handle()).expect("raw buffer");
+        assert_eq!(raw.size(), buffer.size_bytes());
+    }
+
+    #[test]
+    fn test_shader_module_builder_missing_source() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let result = ShaderModuleBuilder::new(&device).build(&mut registry);
+        assert!(matches!(result, Err(ShaderError::MissingSource)));
+    }
+
+    #[test]
+    fn test_shader_module_builder_with_wgsl() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let shader = ShaderModuleBuilder::new(&device)
+            .label("test_shader")
+            .with_wgsl_source(
+                r#"
+                @vertex
+                fn vs_main() -> @builtin(position) vec4<f32> {
+                    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+                }
+                "#,
+            )
+            .build(&mut registry)
+            .expect("shader module should build");
+
+        assert!(registry.get(shader).is_some());
+    }
+
+    #[test]
+    fn test_compute_pipeline_builder_missing_shader() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let result = ComputePipelineBuilder::new(&device).build(&mut registry);
+        assert!(matches!(result, Err(PipelineError::MissingComputeShader)));
+    }
+
+    #[test]
+    fn test_compute_pipeline_builder_with_shader() {
+        let (device, _queue) = create_test_device().block_on();
+        let mut registry = ResourceRegistry::default();
+
+        let compute_shader = ShaderModuleBuilder::new(&device)
+            .with_wgsl_source(
+                r#"
+                @compute @workgroup_size(1)
+                fn cs_main() {}
+                "#,
+            )
+            .build(&mut registry)
+            .expect("compute shader should build");
+
+        let pipeline = ComputePipelineBuilder::new(&device)
+            .with_label("compute")
+            .with_compute_shader(compute_shader)
+            .build(&mut registry)
+            .expect("compute pipeline should build");
+
+        assert!(registry.get(pipeline).is_some());
     }
 
     #[test]
     fn test_bind_group_builder_no_entries() {
         let (device, _queue) = create_test_device().block_on();
-        let registry = ResourceRegistry::default();
         let mut registry_mut = ResourceRegistry::default();
 
-        let result = BindGroupBuilder::new(&device, &registry).build(&mut registry_mut);
+        let result = BindGroupBuilder::new(&device).build(&mut registry_mut);
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BindGroupError::NoEntries));
     }
 
-    // Note: Tests for BindGroupBuilder with actual resources are skipped due to borrow checker
-    // limitations in the current API design. The builder needs both immutable (for reading)
-    // and mutable (for writing) access to the registry, which causes conflicts.
-    // The API works in practice when used correctly, but is difficult to test in isolation.
-    // These tests verify the error cases and type conversions instead.
-
     #[test]
     fn test_bind_group_builder_invalid_resource() {
         let (device, _queue) = create_test_device().block_on();
-        let registry = ResourceRegistry::default();
         let mut registry_mut = ResourceRegistry::default();
 
         // Create a handle that doesn't exist in the registry
         let fake_handle = crate::frame_graph::resource::Handle::<wgpu::Buffer>::next();
 
-        let result = BindGroupBuilder::new(&device, &registry)
+        let result = BindGroupBuilder::new(&device)
             .buffer(0, fake_handle, BindingType::Uniform)
             .build(&mut registry_mut);
 

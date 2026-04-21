@@ -75,6 +75,51 @@ impl Default for ResourceInfo {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TransientBufferDesc {
+    label: Option<String>,
+    size: u64,
+    usage: wgpu::BufferUsages,
+    mapped_at_creation: bool,
+}
+
+impl TransientBufferDesc {
+    pub fn new(size: u64, usage: wgpu::BufferUsages) -> Self {
+        Self {
+            label: None,
+            size,
+            usage,
+            mapped_at_creation: false,
+        }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    pub fn mapped_at_creation(mut self, mapped_at_creation: bool) -> Self {
+        self.mapped_at_creation = mapped_at_creation;
+        self
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn usage(&self) -> wgpu::BufferUsages {
+        self.usage
+    }
+
+    pub fn is_mapped_at_creation(&self) -> bool {
+        self.mapped_at_creation
+    }
+}
+
 /// Type-safe resource handle
 ///
 /// We manually implement Hash, Eq, PartialEq, Clone, Copy to avoid adding bounds on T.
@@ -151,3 +196,5 @@ impl ResourceType for wgpu::BindGroupLayout {}
 impl ResourceType for wgpu::RenderPipeline {}
 impl ResourceType for wgpu::ComputePipeline {}
 impl ResourceType for wgpu::ShaderModule {}
+impl ResourceType for crate::FrameTextureView {}
+impl ResourceType for crate::FrameBufferHandle {}

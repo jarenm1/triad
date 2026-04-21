@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use tracing::{debug_span, instrument};
 
 pub use pass::{Pass, PassBuilder, PassContext};
-pub use resource::{Handle, HandleId, ResourceType};
+pub use resource::{Handle, HandleId, ResourceType, TransientBufferDesc};
 
 pub type SurfaceId = u64;
 
@@ -18,6 +18,7 @@ pub type SurfaceId = u64;
 pub struct FrameGraph {
     passes: Vec<PassNode>,
     resource_info: HashMap<HandleId, ResourceInfo>,
+    transient_buffers: HashMap<HandleId, TransientBufferDesc>,
     surface_handles: Vec<SurfaceId>, // Surface handle IDs (surfaces tracked separately)
 }
 
@@ -30,11 +31,24 @@ impl FrameGraph {
 }
 
 impl FrameGraph {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn register_resource<T: ResourceType>(&mut self, handle: Handle<T>) -> &mut Self {
         self.resource_info
             .entry(handle.id())
             .or_insert_with(ResourceInfo::new);
         self
+    }
+
+    pub fn create_transient_buffer(&mut self, desc: TransientBufferDesc) -> Handle<wgpu::Buffer> {
+        let handle = Handle::next();
+        self.resource_info
+            .entry(handle.id())
+            .or_insert_with(ResourceInfo::new);
+        self.transient_buffers.insert(handle.id(), desc);
+        handle
     }
 
     pub fn add_pass(&mut self, builder: PassBuilder) -> &mut Self {
@@ -111,25 +125,10 @@ impl FrameGraph {
             }
         }
 
-        for (idx, &pass_idx) in execution_order.iter().enumerate() {
-            let pass = &self.passes[pass_idx];
-            for read_id in pass.reads() {
-                if let Some(info) = self.resource_info.get_mut(read_id) {
-                    info.set_first_used_pass(info.first_used_pass().min(idx));
-                    info.set_last_used_pass(info.last_used_pass().max(idx));
-                }
-            }
-            for write_id in pass.writes() {
-                if let Some(info) = self.resource_info.get_mut(write_id) {
-                    info.set_first_used_pass(info.first_used_pass().min(idx));
-                    info.set_last_used_pass(info.last_used_pass().max(idx));
-                }
-            }
-        }
-
         Ok(ExecutableFrameGraph {
             passes: self.passes,
             execution_order,
+            transient_buffers: self.transient_buffers,
             surface_handles: self.surface_handles,
         })
     }
@@ -139,50 +138,11 @@ impl FrameGraph {
 pub struct ExecutableFrameGraph {
     passes: Vec<PassNode>,
     execution_order: Vec<usize>,
+    transient_buffers: HashMap<HandleId, TransientBufferDesc>,
     surface_handles: Vec<u64>, // Surface handle IDs (surfaces tracked separately)
 }
 
 impl ExecutableFrameGraph {
-    /// Track resource state transitions and validate barrier requirements
-    /// wgpu handles most barriers automatically, but we track transitions for validation
-    /// and potential future explicit barrier insertion
-    fn track_state_transitions(
-        &self,
-        current_states: &HashMap<u64, ResourceState>,
-        pass: &PassNode,
-    ) -> Vec<(u64, ResourceState, ResourceState)> {
-        let mut transitions = Vec::new();
-
-        // Check all resources accessed by this pass
-        let mut resources_to_check = std::collections::HashSet::new();
-        resources_to_check.extend(pass.reads());
-        resources_to_check.extend(pass.writes());
-
-        for resource_id in resources_to_check {
-            let current_state = current_states
-                .get(resource_id)
-                .copied()
-                .unwrap_or(ResourceState::Undefined);
-
-            // Determine what state this resource needs to be in for this pass
-            let needs_read = pass.reads().contains(resource_id);
-            let needs_write = pass.writes().contains(resource_id);
-            let required_state = match (needs_read, needs_write) {
-                (true, true) => ResourceState::ReadWrite,
-                (true, false) => ResourceState::Read,
-                (false, true) => ResourceState::Write,
-                (false, false) => continue, // Resource not actually used in this pass
-            };
-
-            // Track state transitions (wgpu handles barriers automatically, but we track for validation)
-            if current_state != required_state && current_state != ResourceState::Undefined {
-                transitions.push((*resource_id, current_state, required_state));
-            }
-        }
-
-        transitions
-    }
-
     /// Execute the frame graph and return command buffers (without submitting)
     /// This allows batching with other command buffers (e.g., UI) for a single submission
     /// Note: Passes may use the queue for immediate operations, but final submission is deferred
@@ -193,12 +153,7 @@ impl ExecutableFrameGraph {
         queue: &wgpu::Queue,
         resources: &ResourceRegistry,
     ) -> Vec<wgpu::CommandBuffer> {
-        let ctx = pass::PassContext {
-            device,
-            queue,
-            resources,
-        };
-        self.execute_internal(&ctx, false)
+        self.execute_internal(device, queue, resources, false)
     }
 
     /// Execute the frame graph
@@ -210,12 +165,7 @@ impl ExecutableFrameGraph {
         queue: &wgpu::Queue,
         resources: &ResourceRegistry,
     ) {
-        let ctx = pass::PassContext {
-            device,
-            queue,
-            resources,
-        };
-        let command_buffers = self.execute_internal(&ctx, true);
+        let command_buffers = self.execute_internal(device, queue, resources, true);
 
         // Submit all command buffers in a single batch for optimal performance
         {
@@ -226,30 +176,27 @@ impl ExecutableFrameGraph {
 
     fn execute_internal(
         &mut self,
-        ctx: &pass::PassContext,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        resources: &ResourceRegistry,
         _submit: bool,
     ) -> Vec<wgpu::CommandBuffer> {
-        let mut command_buffers = Vec::new();
+        let mut command_buffers = Vec::with_capacity(self.execution_order.len());
+        let transient_buffers = self.create_transient_buffers(device);
+        let ctx = pass::PassContext {
+            device,
+            queue,
+            resources,
+            transient_buffers: &transient_buffers,
+        };
 
         // Track current runtime state of each resource
-        let mut current_states: HashMap<u64, ResourceState> = HashMap::new();
+        let mut current_states: HashMap<u64, ResourceState> =
+            HashMap::with_capacity(self.execution_order.len());
 
         // Execute passes in dependency order and collect command buffers
         for &pass_idx in &self.execution_order {
             let pass = &self.passes[pass_idx];
-
-            // Track state transitions (wgpu handles barriers automatically based on usage flags,
-            // but we track transitions for validation and documentation)
-            let _transitions = self.track_state_transitions(&current_states, pass);
-
-            // Note: wgpu automatically inserts barriers based on resource usage flags.
-            // For buffers and textures, the driver handles synchronization automatically.
-            // We track transitions here for:
-            // 1. Validation (can detect invalid transitions)
-            // 2. Future explicit barrier insertion if needed
-            // 3. Debugging and optimization opportunities
-            // The transitions vector can be used to log warnings, validate state changes,
-            // or insert explicit barriers if needed in the future.
 
             // Execute the pass
             let command_buffer = {
@@ -286,6 +233,20 @@ impl ExecutableFrameGraph {
     /// This can be cached and reused when the frame graph structure hasn't changed.
     pub fn execution_order(&self) -> &[usize] {
         &self.execution_order
+    }
+
+    fn create_transient_buffers(&self, device: &wgpu::Device) -> HashMap<HandleId, wgpu::Buffer> {
+        let mut buffers = HashMap::with_capacity(self.transient_buffers.len());
+        for (&handle_id, desc) in &self.transient_buffers {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: desc.label(),
+                size: desc.size(),
+                usage: desc.usage(),
+                mapped_at_creation: desc.is_mapped_at_creation(),
+            });
+            buffers.insert(handle_id, buffer);
+        }
+        buffers
     }
 }
 
@@ -341,14 +302,25 @@ mod tests {
         assert!(frame_graph.resource_info.contains_key(&texture_handle.id()));
     }
 
-    // Note: Sequential pass test removed due to dependency detection logic issue.
-    // The current dependency detection creates false circular dependencies for
-    // sequential read-after-write patterns. This is a known limitation that
-    // doesn't affect the actual rendering (which uses independent passes or
-    // properly structured dependencies). The other tests verify the core functionality.
+    #[test]
+    fn test_frame_graph_transient_buffer_registration() {
+        let mut frame_graph = FrameGraph::default();
+        let handle = frame_graph.create_transient_buffer(
+            TransientBufferDesc::new(256, wgpu::BufferUsages::STORAGE)
+                .with_label("transient_scratch"),
+        );
+
+        assert!(frame_graph.resource_info.contains_key(&handle.id()));
+        let desc = frame_graph
+            .transient_buffers
+            .get(&handle.id())
+            .expect("transient descriptor should be registered");
+        assert_eq!(desc.size(), 256);
+        assert_eq!(desc.label(), Some("transient_scratch"));
+    }
 
     #[test]
-    fn test_frame_graph_circular_dependency_detection() {
+    fn test_frame_graph_preserves_declaration_order_for_conflicting_passes() {
         let (device, _queue) = create_test_device().block_on();
         let mut registry = ResourceRegistry::default();
 
@@ -370,7 +342,7 @@ mod tests {
 
         let mut frame_graph = FrameGraph::default();
 
-        // Pass 1: writes to buffer_a, reads from buffer_b (creates dependency on Pass2)
+        // Pass 1 conflicts with Pass 2, but declaration order should win.
         let mut pass1_builder = PassBuilder::new("Pass1");
         pass1_builder.write(handle_a);
         pass1_builder.read(handle_b);
@@ -380,7 +352,7 @@ mod tests {
             writes: vec![handle_a.id()],
         }));
 
-        // Pass 2: writes to buffer_b, reads from buffer_a (creates dependency on Pass1)
+        // Pass 2 also conflicts with Pass 1.
         let mut pass2_builder = PassBuilder::new("Pass2");
         pass2_builder.write(handle_b);
         pass2_builder.read(handle_a);
@@ -396,14 +368,8 @@ mod tests {
             .add_pass(pass1)
             .add_pass(pass2);
 
-        // This should detect the circular dependency
-        let result = frame_graph.build();
-        assert!(result.is_err());
-        if let Err(FrameGraphError::CircularDependency) = result {
-            // Expected error
-        } else {
-            panic!("Expected CircularDependency error");
-        }
+        let executable = frame_graph.build().expect("frame graph should build");
+        assert_eq!(executable.execution_order(), &[0, 1]);
     }
 
     #[test]
@@ -539,7 +505,7 @@ mod tests {
 
         // Both passes should be in execution order (order doesn't matter for independent passes)
         assert_eq!(execution_order.len(), 2);
-        
+
         // All indices should be unique and in range [0, 1]
         let mut seen = std::collections::HashSet::new();
         for &idx in execution_order {
@@ -577,5 +543,63 @@ mod tests {
         let order = executable.execution_order();
         assert_eq!(order.len(), 1);
         assert_eq!(order[0], 0);
+    }
+
+    struct TransientBufferPass {
+        name: String,
+        buffer: Handle<wgpu::Buffer>,
+        expected_size: u64,
+    }
+
+    impl Pass for TransientBufferPass {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn execute(&self, ctx: &PassContext) -> wgpu::CommandBuffer {
+            let buffer = ctx
+                .get_buffer(self.buffer)
+                .expect("transient buffer should be materialized during execution");
+            assert_eq!(buffer.size(), self.expected_size);
+
+            let mut encoder = ctx.create_command_encoder(Some(&self.name));
+            encoder.clear_buffer(buffer, 0, None);
+            encoder.finish()
+        }
+    }
+
+    #[test]
+    fn test_frame_graph_executes_with_transient_buffer() {
+        let renderer = match crate::Renderer::new().block_on() {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                eprintln!("skipping transient frame graph execution test: {err}");
+                return;
+            }
+        };
+        let registry = ResourceRegistry::default();
+        let mut frame_graph = FrameGraph::default();
+        let transient = frame_graph.create_transient_buffer(
+            TransientBufferDesc::new(
+                128,
+                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+            )
+            .with_label("transient_exec"),
+        );
+
+        let mut pass_builder = PassBuilder::new("TransientPass");
+        pass_builder.write(transient);
+        let pass = pass_builder.with_pass(Box::new(TransientBufferPass {
+            name: "TransientPass".to_string(),
+            buffer: transient,
+            expected_size: 128,
+        }));
+
+        frame_graph.add_pass(pass);
+        let mut executable = frame_graph.build().expect("frame graph should build");
+        let command_buffers =
+            executable.execute_no_submit(renderer.device(), renderer.queue(), &registry);
+
+        assert_eq!(command_buffers.len(), 1);
     }
 }

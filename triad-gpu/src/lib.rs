@@ -1,30 +1,50 @@
+//! Core GPU infrastructure for Triad.
+//!
+//! `triad-gpu` intentionally stays below application concerns:
+//! it owns device/surface setup, resource registration, frame-graph execution,
+//! and pipeline/shader construction from in-memory inputs.
+//! Asset loading, file watching, and user-facing shader workflows belong in
+//! higher-level crates.
+
 use wgpu::{Instance, SurfaceConfiguration};
 mod builder;
+mod compute;
+mod copy;
 pub mod error;
 mod frame_graph;
+mod frame_slot;
+mod indirect;
 mod pipeline;
-pub mod ply_loader;
+#[cfg(test)]
+mod reference_pipeline;
+mod render;
 mod resource_registry;
-pub mod shaders;
 mod surface;
 mod type_map;
-mod types;
 
 // Re-export all error types at crate root for convenience
 pub use error::{
-    BindGroupError, BufferError, FrameGraphError, GpuError, PipelineError, PlyError,
-    RendererError, Result,
+    BindGroupError, BufferError, ComputePassError, CopyPassError, FrameGraphError, GpuError,
+    PipelineError, ReadbackError, RenderPassError, RendererError, Result, ShaderError,
 };
 
 pub use builder::{
-    BindGroupBuilder, BindingType, BufferBuilder, BufferUsage, DynamicBuffer, DynamicBufferBuilder,
-    ShaderStage,
+    BindGroupBuilder, BindingType, BufferBuilder, BufferUsage, ComputePipelineBuilder,
+    DynamicBuffer, DynamicBufferBuilder, GpuBuffer, GpuBufferBuilder, ShaderModuleBuilder,
+    ShaderSource, ShaderStage,
 };
-pub use frame_graph::{ExecutableFrameGraph, FrameGraph, Handle, Pass, PassBuilder, PassContext, ResourceType};
+pub use compute::{ComputeDispatch, ComputePassBuilder};
+pub use copy::{BufferCopy, CopyPassBuilder};
+pub use frame_graph::{
+    ExecutableFrameGraph, FrameGraph, Handle, Pass, PassBuilder, PassContext, ResourceType,
+    TransientBufferDesc,
+};
+pub use frame_slot::{FrameBufferHandle, FrameTextureView};
+pub use indirect::{DispatchIndirectArgs, DrawIndexedIndirectArgs, DrawIndirectArgs};
 pub use pipeline::RenderPipelineBuilder;
+pub use render::{ColorLoadOp, RenderDraw, RenderPassBuilder};
 pub use resource_registry::ResourceRegistry;
 pub use surface::SurfaceWrapper;
-pub use types::{CameraUniforms, GaussianPoint, PointPrimitive, TrianglePrimitive};
 pub use wgpu;
 
 pub struct Renderer {
@@ -77,9 +97,29 @@ impl Renderer {
         BufferBuilder::new(&self.device)
     }
 
+    /// Create a shader module builder for constructing shader modules from source.
+    pub fn create_shader_module(&self) -> ShaderModuleBuilder<'_> {
+        ShaderModuleBuilder::new(&self.device)
+    }
+
+    /// Create a typed GPU buffer builder for storage, uniforms, indirect args, and readback.
+    pub fn create_gpu_buffer<T: bytemuck::Pod>(&self) -> GpuBufferBuilder<'_, T> {
+        GpuBufferBuilder::new(&self.device)
+    }
+
     /// Create a bind group builder for constructing bind groups
-    pub fn create_bind_group<'a>(&'a self, registry: &'a ResourceRegistry) -> BindGroupBuilder<'a> {
-        BindGroupBuilder::new(&self.device, registry)
+    pub fn create_bind_group(&self) -> BindGroupBuilder<'_> {
+        BindGroupBuilder::new(&self.device)
+    }
+
+    /// Create a render pipeline builder.
+    pub fn create_render_pipeline(&self) -> RenderPipelineBuilder<'_> {
+        RenderPipelineBuilder::new(&self.device)
+    }
+
+    /// Create a compute pipeline builder.
+    pub fn create_compute_pipeline(&self) -> ComputePipelineBuilder<'_> {
+        ComputePipelineBuilder::new(&self.device)
     }
 
     /// Create a DynamicBuffer for incremental updates
@@ -88,6 +128,26 @@ impl Renderer {
     /// without recreating bind groups.
     pub fn create_dynamic_buffer<T: bytemuck::Pod>(&self) -> builder::DynamicBufferBuilder<'_, T> {
         builder::DynamicBufferBuilder::new(&self.device)
+    }
+
+    /// Start a fresh frame graph.
+    pub fn create_frame_graph(&self) -> FrameGraph {
+        FrameGraph::new()
+    }
+
+    /// Create a reusable compute pass builder for frame graph integration.
+    pub fn create_compute_pass(&self, name: impl Into<String>) -> ComputePassBuilder {
+        ComputePassBuilder::new(name)
+    }
+
+    /// Create a reusable render pass builder for frame graph integration.
+    pub fn create_render_pass(&self, name: impl Into<String>) -> RenderPassBuilder {
+        RenderPassBuilder::new(name)
+    }
+
+    /// Create a reusable copy pass builder for frame graph integration.
+    pub fn create_copy_pass(&self, name: impl Into<String>) -> CopyPassBuilder {
+        CopyPassBuilder::new(name)
     }
 
     /// Write data to a buffer
@@ -131,6 +191,44 @@ impl Renderer {
 
         self.queue.write_buffer(buffer_ref, offset, data_bytes);
         Ok(())
+    }
+
+    /// Read the full contents of a MAP_READ buffer back to the CPU as typed data.
+    pub fn read_buffer<T: bytemuck::Pod>(
+        &self,
+        buffer: Handle<wgpu::Buffer>,
+        registry: &ResourceRegistry,
+    ) -> std::result::Result<Vec<T>, ReadbackError> {
+        use std::sync::mpsc;
+
+        let buffer_ref = registry.get(buffer).ok_or(ReadbackError::BufferNotFound)?;
+        let buffer_size = buffer_ref.size();
+        let element_size = std::mem::size_of::<T>();
+
+        if buffer_size as usize % element_size != 0 {
+            return Err(ReadbackError::BufferSizeNotAligned {
+                buffer_size,
+                element_size,
+            });
+        }
+
+        let slice = buffer_ref.slice(..);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        self.device.poll(wgpu::PollType::wait_indefinitely())?;
+        let map_result = rx.recv().map_err(|_| ReadbackError::MapChannelClosed)?;
+        map_result?;
+
+        let data = {
+            let mapped = slice.get_mapped_range();
+            bytemuck::cast_slice::<u8, T>(&mapped).to_vec()
+        };
+        buffer_ref.unmap();
+
+        Ok(data)
     }
 
     pub fn create_surface(
@@ -260,6 +358,30 @@ mod tests {
     }
 
     #[test]
+    fn test_renderer_shader_builder_access() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let _builder = renderer.create_shader_module();
+    }
+
+    #[test]
+    fn test_renderer_gpu_buffer_builder_access() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let _builder = renderer.create_gpu_buffer::<u32>();
+    }
+
+    #[test]
+    fn test_renderer_compute_pass_builder_access() {
+        let renderer = Renderer::new()
+            .block_on()
+            .expect("Failed to create renderer");
+        let _builder = renderer.create_compute_pass("simulate");
+    }
+
+    #[test]
     fn test_renderer_create_buffer() {
         let renderer = Renderer::new()
             .block_on()
@@ -274,8 +396,7 @@ mod tests {
         let renderer = Renderer::new()
             .block_on()
             .expect("Failed to create renderer");
-        let registry = ResourceRegistry::default();
-        let builder = renderer.create_bind_group(&registry);
+        let builder = renderer.create_bind_group();
         // Builder created successfully
         assert!(std::mem::size_of_val(&builder) > 0);
     }
@@ -530,7 +651,13 @@ mod tests {
             .build(&mut registry)
             .expect("Failed to create dynamic buffer");
 
-        let elements = vec![TestElement { value: 1.0, _pad: [0.0; 3] }; 10];
+        let elements = vec![
+            TestElement {
+                value: 1.0,
+                _pad: [0.0; 3]
+            };
+            10
+        ];
         let idx = buf
             .push(&renderer, &registry, &elements)
             .expect("Failed to push");
@@ -539,7 +666,13 @@ mod tests {
         assert_eq!(buf.len(), 10);
 
         // Push more elements
-        let more_elements = vec![TestElement { value: 2.0, _pad: [0.0; 3] }; 5];
+        let more_elements = vec![
+            TestElement {
+                value: 2.0,
+                _pad: [0.0; 3]
+            };
+            5
+        ];
         let idx = buf
             .push(&renderer, &registry, &more_elements)
             .expect("Failed to push");
@@ -753,5 +886,56 @@ mod tests {
         let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
         let result = renderer.write_buffer_offset(buffer_handle, 0, &data, &registry);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_copy_pass_and_typed_readback() {
+        let renderer = match Renderer::new().block_on() {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                eprintln!("skipping copy/readback test: {err}");
+                return;
+            }
+        };
+        let mut registry = ResourceRegistry::default();
+
+        let source_data: [u32; 4] = [7, 11, 13, 17];
+        let source = renderer
+            .create_gpu_buffer::<u32>()
+            .label("copy_source")
+            .with_data(&source_data)
+            .usage(BufferUsage::CopySrc)
+            .build(&mut registry)
+            .expect("source buffer");
+
+        let readback = renderer
+            .create_gpu_buffer::<u32>()
+            .label("copy_readback")
+            .capacity(source_data.len())
+            .usage(BufferUsage::Readback)
+            .build(&mut registry)
+            .expect("readback buffer");
+
+        let pass = renderer
+            .create_copy_pass("CopyToReadback")
+            .copy_buffer(
+                source.handle(),
+                readback.handle(),
+                std::mem::size_of_val(&source_data) as u64,
+            )
+            .build()
+            .expect("copy pass");
+
+        let mut graph = FrameGraph::new();
+        graph.add_pass(pass);
+        let mut executable = graph.build().expect("frame graph");
+        let command_buffers =
+            executable.execute_no_submit(renderer.device(), renderer.queue(), &registry);
+        renderer.queue().submit(command_buffers);
+
+        let copied = renderer
+            .read_buffer::<u32>(readback.handle(), &registry)
+            .expect("typed readback");
+        assert_eq!(copied, source_data);
     }
 }

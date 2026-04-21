@@ -8,14 +8,16 @@ pub fn topological_sort(passes: &[PassNode]) -> Result<Vec<usize>, FrameGraphErr
     let mut in_degree = vec![0; n];
     let mut graph: Vec<Vec<usize>> = vec![Vec::new(); n];
 
-    // Build dependency graph
-    // When passes[i].dependencies(&passes[j]) is true, it means i depends on j,
-    // so j must execute before i. We add edge j→i (j before i).
-    for i in 0..n {
-        for j in 0..n {
-            if i != j && passes[i].dependencies(&passes[j]) {
-                graph[j].push(i);
-                in_degree[i] += 1;
+    // Build dependency graph using declaration order as the tie-breaker.
+    // If two passes touch the same resource, the later pass depends on the
+    // earlier pass. This keeps the graph stable for linear frame pipelines
+    // like reset -> simulate -> compact -> render and avoids false cycles
+    // from symmetric read/write conflicts.
+    for earlier in 0..n {
+        for later in (earlier + 1)..n {
+            if passes[later].dependencies(&passes[earlier]) {
+                graph[earlier].push(later);
+                in_degree[later] += 1;
             }
         }
     }

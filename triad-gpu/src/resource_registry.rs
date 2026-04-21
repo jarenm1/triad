@@ -55,7 +55,6 @@ impl ResourceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame_graph::resource::ResourceType;
     use pollster::FutureExt;
 
     async fn create_test_device() -> (wgpu::Device, wgpu::Queue) {
@@ -84,7 +83,7 @@ mod tests {
         });
 
         let handle = registry.insert(buffer);
-        
+
         // Verify we can retrieve it
         let retrieved = registry.get(handle);
         assert!(retrieved.is_some());
@@ -104,7 +103,7 @@ mod tests {
         });
 
         let handle = registry.insert(buffer);
-        
+
         // Verify we can get a mutable reference
         let buffer_mut = registry.get_mut(handle);
         assert!(buffer_mut.is_some());
@@ -123,11 +122,11 @@ mod tests {
         });
 
         let handle = registry.insert(buffer);
-        
+
         // Remove the resource
         let removed = registry.remove(handle);
         assert!(removed.is_some());
-        
+
         // Verify it's gone
         assert!(registry.get(handle).is_none());
     }
@@ -174,7 +173,7 @@ mod tests {
     #[test]
     fn test_resource_registry_nonexistent_handle() {
         let registry = ResourceRegistry::default();
-        
+
         // Try to get a handle that doesn't exist
         let fake_handle = crate::frame_graph::resource::Handle::<wgpu::Buffer>::next();
         assert!(registry.get(fake_handle).is_none());
@@ -203,7 +202,7 @@ mod tests {
 
         // Handles should be unique
         assert_ne!(handle1.id(), handle2.id());
-        
+
         // Both should be retrievable
         assert!(registry.get(handle1).is_some());
         assert!(registry.get(handle2).is_some());

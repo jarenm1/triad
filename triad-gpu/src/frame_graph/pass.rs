@@ -1,5 +1,6 @@
 use crate::frame_graph::resource::{Handle, ResourceState, ResourceType};
 use crate::resource_registry::ResourceRegistry;
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 /// Pass execution context - provides access to device, encoder creation, and resources
@@ -7,6 +8,7 @@ pub struct PassContext<'a> {
     pub device: &'a wgpu::Device,
     pub queue: &'a wgpu::Queue,
     pub resources: &'a ResourceRegistry,
+    pub transient_buffers: &'a HashMap<u64, wgpu::Buffer>,
 }
 
 impl<'a> PassContext<'a> {
@@ -18,7 +20,9 @@ impl<'a> PassContext<'a> {
 
     /// Get a buffer resource by handle
     pub fn get_buffer(&self, handle: Handle<wgpu::Buffer>) -> Option<&wgpu::Buffer> {
-        self.resources.get(handle)
+        self.resources
+            .get(handle)
+            .or_else(|| self.transient_buffers.get(&handle.id()))
     }
 
     /// Get a texture resource by handle
@@ -84,28 +88,40 @@ impl PassBuilder {
     }
 
     pub fn read<T: ResourceType>(&mut self, handle: Handle<T>) -> &mut Self {
+        self.read_handle_id(handle.id())
+    }
+
+    pub fn read_handle_id(&mut self, handle_id: u64) -> &mut Self {
         self.reads.push(ResourceAccess {
-            handle_id: handle.id(),
+            handle_id,
             state: ResourceState::Read,
         });
         self
     }
 
     pub fn write<T: ResourceType>(&mut self, handle: Handle<T>) -> &mut Self {
+        self.write_handle_id(handle.id())
+    }
+
+    pub fn write_handle_id(&mut self, handle_id: u64) -> &mut Self {
         self.writes.push(ResourceAccess {
-            handle_id: handle.id(),
+            handle_id,
             state: ResourceState::Write,
         });
         self
     }
 
     pub fn read_write<T: ResourceType>(&mut self, handle: Handle<T>) -> &mut Self {
+        self.read_write_handle_id(handle.id())
+    }
+
+    pub fn read_write_handle_id(&mut self, handle_id: u64) -> &mut Self {
         self.reads.push(ResourceAccess {
-            handle_id: handle.id(),
+            handle_id,
             state: ResourceState::Read,
         });
         self.writes.push(ResourceAccess {
-            handle_id: handle.id(),
+            handle_id,
             state: ResourceState::ReadWrite,
         });
         self

@@ -6,18 +6,15 @@ The current direction is:
 
 - `triad-gpu` as the render core on top of `wgpu`
 - `triad-window` as the reusable windowing, input, and viewer shell
-- `triad-app` and the old splatting/reconstruction infrastructure to be removed or replaced
+- `triad-app` as a temporary placeholder while the new application layer is designed
 
-This repository is in transition. Some crates and files still reflect the older triangle/gaussian splatting project and should be treated as legacy code until they are either deleted or rewritten.
+This repository is in transition. Some crates and files still reflect the older prototype and should be treated as legacy code until they are either deleted or rewritten.
 
 ## Workspace
 
 - **`triad-gpu`**: render core, frame graph, GPU resource management, shader/pipeline utilities
 - **`triad-window`**: window lifecycle, input handling, camera controls, egui integration
-- **`triad-app`**: legacy application crate slated for replacement
-- **`triad-data`**: legacy data/import code slated for removal or extraction
-- **`triad-train`**: legacy reconstruction/training code slated for removal
-- **`triad-capture`**: legacy capture pipeline pending evaluation during the refactor
+- **`triad-app`**: minimal placeholder app during the refactor
 
 ## Refactor Goal
 

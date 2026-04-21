@@ -2,7 +2,7 @@
 name = "triad-app"
 version = "0.1.0"
 edition = "2024"
-description = "Main application for triad - a visualization and reconstruction tool"
+description = "Minimal placeholder application during the Triad refactor"
 
 [[bin]]
 name = "triad"
@@ -11,16 +11,9 @@ path = "src/main.rs"
 [dependencies]
 triad-gpu = { workspace = true }
 triad-window = { workspace = true }
-triad-train = { workspace = true }
-triad-data = { workspace = true }
-triad-capture = { workspace = true, features = ["webcam"] }
-glam = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 bytemuck = { workspace = true }
-clap = { version = "4.4", features = ["derive"] }
-rfd = "0.14"
-thiserror = "1.0"
 tracing-tracy = { version = "0.11", optional = true }
 
 [features]

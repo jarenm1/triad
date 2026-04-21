@@ -27,17 +27,33 @@ pub enum GpuError {
     #[error(transparent)]
     BindGroup(#[from] BindGroupError),
 
+    /// Error during shader operations
+    #[error(transparent)]
+    Shader(#[from] ShaderError),
+
     /// Error during pipeline operations
     #[error(transparent)]
     Pipeline(#[from] PipelineError),
+
+    /// Error during compute pass construction
+    #[error(transparent)]
+    ComputePass(#[from] ComputePassError),
+
+    /// Error during copy pass construction
+    #[error(transparent)]
+    CopyPass(#[from] CopyPassError),
+
+    /// Error during render pass construction
+    #[error(transparent)]
+    RenderPass(#[from] RenderPassError),
 
     /// Error during frame graph operations
     #[error(transparent)]
     FrameGraph(#[from] FrameGraphError),
 
-    /// Error during PLY file loading
+    /// Error during CPU readback from GPU buffers
     #[error(transparent)]
-    Ply(#[from] PlyError),
+    Readback(#[from] ReadbackError),
 }
 
 /// Errors that occur during renderer initialization and surface management.
@@ -86,7 +102,9 @@ pub enum BufferError {
     NotFound,
 
     /// Buffer write would exceed buffer bounds
-    #[error("invalid buffer offset: offset {offset} + data size {data_size} exceeds buffer size {buffer_size}")]
+    #[error(
+        "invalid buffer offset: offset {offset} + data size {data_size} exceeds buffer size {buffer_size}"
+    )]
     InvalidOffset {
         offset: u64,
         data_size: u64,
@@ -115,6 +133,15 @@ pub enum BindGroupError {
     LayoutNotFound,
 }
 
+/// Errors that occur during shader module operations.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ShaderError {
+    /// Shader module builder requires an in-memory source payload.
+    #[error("shader module must have source specified")]
+    MissingSource,
+}
+
 /// Errors that occur during render pipeline operations.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -123,9 +150,52 @@ pub enum PipelineError {
     #[error("vertex shader is required")]
     MissingVertexShader,
 
+    /// Compute shader is required for compute pipelines
+    #[error("compute shader is required")]
+    MissingComputeShader,
+
     /// Shader module not found in registry
     #[error("shader module not found in registry")]
     ShaderNotFound,
+}
+
+/// Errors that occur during compute pass construction.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ComputePassError {
+    /// Compute pass requires a pipeline handle.
+    #[error("compute pass requires a compute pipeline")]
+    MissingPipeline,
+
+    /// Compute pass requires a dispatch configuration.
+    #[error("compute pass requires a dispatch configuration")]
+    MissingDispatch,
+}
+
+/// Errors that occur during copy pass construction.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum CopyPassError {
+    /// Copy pass requires at least one copy command.
+    #[error("copy pass requires at least one copy command")]
+    MissingCopy,
+}
+
+/// Errors that occur during render pass construction.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum RenderPassError {
+    /// Render pass requires a render pipeline handle.
+    #[error("render pass requires a render pipeline")]
+    MissingPipeline,
+
+    /// Render pass requires at least one color attachment.
+    #[error("render pass requires at least one color attachment")]
+    MissingColorAttachment,
+
+    /// Render pass requires a draw configuration.
+    #[error("render pass requires a draw configuration")]
+    MissingDraw,
 }
 
 /// Errors that occur during frame graph operations.
@@ -137,40 +207,32 @@ pub enum FrameGraphError {
     CircularDependency,
 }
 
-/// Errors that occur during PLY file loading.
+/// Errors that occur while reading back GPU buffer contents to the CPU.
 #[derive(Debug, Error)]
 #[non_exhaustive]
-pub enum PlyError {
-    /// Failed to open the PLY file
-    #[error("failed to open PLY file: {0}")]
-    Io(#[from] std::io::Error),
+pub enum ReadbackError {
+    /// Buffer handle not found in registry
+    #[error("buffer not found in registry")]
+    BufferNotFound,
 
-    /// Failed to parse the PLY header
-    #[error("failed to parse PLY header: {message}")]
-    HeaderParse { message: String },
-
-    /// Failed to parse a PLY element
-    #[error("failed to parse PLY element '{element}': {message}")]
-    ElementParse { element: String, message: String },
-
-    /// Required vertex property is missing
-    #[error("missing required property '{property}' at vertex {vertex_index}")]
-    MissingProperty {
-        property: &'static str,
-        vertex_index: usize,
+    /// Buffer size is not a whole number of requested elements
+    #[error("buffer size {buffer_size} is not aligned to element size {element_size}")]
+    BufferSizeNotAligned {
+        buffer_size: u64,
+        element_size: usize,
     },
 
-    /// PLY file contains no face data when faces were expected
-    #[error("PLY file contains no face data; use triangulation for point clouds")]
-    NoFaceData,
+    /// Waiting for buffer mapping callback failed
+    #[error("buffer map callback channel closed before completion")]
+    MapChannelClosed,
 
-    /// Face references an out-of-bounds vertex index
-    #[error("face {face_index} references invalid vertex index {vertex_index} (max: {max_index})")]
-    InvalidVertexIndex {
-        face_index: usize,
-        vertex_index: usize,
-        max_index: usize,
-    },
+    /// Device polling failed
+    #[error("device poll failed during readback: {0}")]
+    Poll(#[from] wgpu::PollError),
+
+    /// Buffer mapping failed
+    #[error("buffer map failed during readback: {0}")]
+    Map(#[from] wgpu::BufferAsyncError),
 }
 
 /// Result type alias using the unified `GpuError`.
@@ -194,14 +256,8 @@ mod tests {
             "resource not found in registry at binding 2"
         );
 
-        let err = PlyError::MissingProperty {
-            property: "x",
-            vertex_index: 42,
-        };
-        assert_eq!(
-            err.to_string(),
-            "missing required property 'x' at vertex 42"
-        );
+        let err = ShaderError::MissingSource;
+        assert_eq!(err.to_string(), "shader module must have source specified");
     }
 
     #[test]
@@ -215,6 +271,34 @@ mod tests {
         assert!(matches!(
             gpu_err,
             GpuError::Pipeline(PipelineError::MissingVertexShader)
+        ));
+
+        let shader_err = ShaderError::MissingSource;
+        let gpu_err: GpuError = shader_err.into();
+        assert!(matches!(
+            gpu_err,
+            GpuError::Shader(ShaderError::MissingSource)
+        ));
+
+        let compute_pass_err = ComputePassError::MissingDispatch;
+        let gpu_err: GpuError = compute_pass_err.into();
+        assert!(matches!(
+            gpu_err,
+            GpuError::ComputePass(ComputePassError::MissingDispatch)
+        ));
+
+        let render_pass_err = RenderPassError::MissingDraw;
+        let gpu_err: GpuError = render_pass_err.into();
+        assert!(matches!(
+            gpu_err,
+            GpuError::RenderPass(RenderPassError::MissingDraw)
+        ));
+
+        let copy_pass_err = CopyPassError::MissingCopy;
+        let gpu_err: GpuError = copy_pass_err.into();
+        assert!(matches!(
+            gpu_err,
+            GpuError::CopyPass(CopyPassError::MissingCopy)
         ));
     }
 }
