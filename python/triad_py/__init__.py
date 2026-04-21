@@ -6,6 +6,7 @@ import json
 import os
 from dataclasses import dataclass
 from enum import IntEnum
+from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
 
@@ -33,10 +34,12 @@ _lib = _load_library()
 
 __all__ = [
     "CourseSpec",
+    "PackedStepResult",
     "SimulationConfig",
     "SimulationCore",
     "StageKind",
     "StageSpec",
+    "TriadFastVecEnv",
     "TriadVecEnv",
     "TurnDirection",
     "build_basic_lap_course",
@@ -56,6 +59,15 @@ def _last_error_message() -> str:
 def _require(success: bool) -> None:
     if not success:
         raise RuntimeError(_last_error_message())
+
+
+@lru_cache(maxsize=1)
+def _numpy_module():
+    try:
+        import numpy as np
+    except ImportError as error:
+        raise RuntimeError("NumPy is required for zero-copy array views") from error
+    return np
 
 
 class StageKind(IntEnum):
@@ -174,6 +186,8 @@ _lib.triad_course_get_stats.argtypes = [
 ]
 _lib.triad_course_get_stats.restype = ctypes.c_bool
 _lib.triad_sim_config_default.restype = _TriadSimConfig
+_lib.triad_action_stride.restype = ctypes.c_size_t
+_lib.triad_observation_stride.restype = ctypes.c_size_t
 
 _lib.triad_simulation_create.argtypes = [_TriadSimConfig]
 _lib.triad_simulation_create.restype = ctypes.c_void_p
@@ -216,12 +230,55 @@ _lib.triad_simulation_readback_observations.argtypes = [
     ctypes.c_size_t,
 ]
 _lib.triad_simulation_readback_observations.restype = ctypes.c_bool
+_lib.triad_simulation_readback_observations_flat.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_size_t,
+]
+_lib.triad_simulation_readback_observations_flat.restype = ctypes.c_bool
 _lib.triad_simulation_readback_reward_done.argtypes = [
     ctypes.c_void_p,
     ctypes.POINTER(_TriadRewardDone),
     ctypes.c_size_t,
 ]
 _lib.triad_simulation_readback_reward_done.restype = ctypes.c_bool
+_lib.triad_simulation_readback_reward_done_flat.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_uint8),
+    ctypes.c_size_t,
+]
+_lib.triad_simulation_readback_reward_done_flat.restype = ctypes.c_bool
+_lib.triad_simulation_step_actions_readback.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(_TriadAction),
+    ctypes.c_size_t,
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_uint8),
+    ctypes.c_size_t,
+]
+_lib.triad_simulation_step_actions_readback.restype = ctypes.c_bool
+_lib.triad_simulation_step_flat_actions_readback.argtypes = [
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_size_t,
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_uint8),
+    ctypes.c_size_t,
+]
+_lib.triad_simulation_step_flat_actions_readback.restype = ctypes.c_bool
+
+ACTION_STRIDE = int(_lib.triad_action_stride())
+OBSERVATION_STRIDE = int(_lib.triad_observation_stride())
 
 
 @dataclass
@@ -368,6 +425,60 @@ class CourseSpec:
         }
 
 
+@dataclass
+class PackedStepResult:
+    observations: ctypes.Array[ctypes.c_float]
+    rewards: ctypes.Array[ctypes.c_float]
+    dones: ctypes.Array[ctypes.c_uint8]
+    env_count: int
+    observation_stride: int = OBSERVATION_STRIDE
+
+    def observation_rows(self) -> list[list[float]]:
+        return [
+            [
+                float(self.observations[(env_index * self.observation_stride) + offset])
+                for offset in range(self.observation_stride)
+            ]
+            for env_index in range(self.env_count)
+        ]
+
+    def reward_list(self) -> list[float]:
+        return [float(self.rewards[index]) for index in range(self.env_count)]
+
+    def done_list(self) -> list[bool]:
+        return [bool(self.dones[index]) for index in range(self.env_count)]
+
+    def observation_buffer(self) -> memoryview:
+        return memoryview(self.observations)
+
+    def reward_buffer(self) -> memoryview:
+        return memoryview(self.rewards)
+
+    def done_buffer(self) -> memoryview:
+        return memoryview(self.dones)
+
+    def action_buffer(self) -> memoryview:
+        raise RuntimeError("PackedStepResult does not own an action buffer")
+
+    def numpy_views(self) -> tuple[object, object, object]:
+        np = _numpy_module()
+        observations = np.ctypeslib.as_array(self.observations).reshape(
+            self.env_count, self.observation_stride
+        )
+        rewards = np.ctypeslib.as_array(self.rewards)
+        dones = np.ctypeslib.as_array(self.dones)
+        return observations, rewards, dones
+
+    def numpy_bool_dones(self) -> object:
+        np = _numpy_module()
+        return np.ctypeslib.as_array(self.dones).astype(bool)
+
+    def to_numpy(self) -> tuple[object, object, object]:
+        observations, rewards, _ = self.numpy_views()
+        dones = self.numpy_bool_dones()
+        return observations, rewards, dones
+
+
 class SimulationCore:
     def __init__(self, config: SimulationConfig | None = None) -> None:
         self.config = config or SimulationConfig.default()
@@ -386,6 +497,34 @@ class SimulationCore:
     @property
     def env_count(self) -> int:
         return int(_lib.triad_simulation_env_count(self._handle))
+
+    @property
+    def observation_stride(self) -> int:
+        return OBSERVATION_STRIDE
+
+    @property
+    def action_stride(self) -> int:
+        return ACTION_STRIDE
+
+    @property
+    def flat_action_count(self) -> int:
+        return self.env_count * self.action_stride
+
+    @property
+    def flat_observation_count(self) -> int:
+        return self.env_count * self.observation_stride
+
+    def create_action_buffer(self) -> ctypes.Array[ctypes.c_float]:
+        return (ctypes.c_float * self.flat_action_count)()
+
+    def _allocate_flat_observation_buffer(self) -> ctypes.Array[ctypes.c_float]:
+        return (ctypes.c_float * self.flat_observation_count)()
+
+    def _allocate_reward_buffer(self) -> ctypes.Array[ctypes.c_float]:
+        return (ctypes.c_float * self.env_count)()
+
+    def _allocate_done_buffer(self) -> ctypes.Array[ctypes.c_uint8]:
+        return (ctypes.c_uint8 * self.env_count)()
 
     def set_course(self, course: CourseSpec) -> "SimulationCore":
         _require(_lib.triad_simulation_set_course(self._handle, course._handle))
@@ -434,6 +573,83 @@ class SimulationCore:
     def step(self, steps: int = 1) -> "SimulationCore":
         _require(_lib.triad_simulation_step(self._handle, steps))
         return self
+
+    def read_observation_buffer(self) -> ctypes.Array[ctypes.c_float]:
+        values = self._allocate_flat_observation_buffer()
+        _require(
+            _lib.triad_simulation_readback_observations_flat(
+                self._handle, values, len(values)
+            )
+        )
+        return values
+
+    def read_reward_done_buffers(
+        self,
+    ) -> tuple[ctypes.Array[ctypes.c_float], ctypes.Array[ctypes.c_uint8]]:
+        rewards = self._allocate_reward_buffer()
+        dones = self._allocate_done_buffer()
+        _require(
+            _lib.triad_simulation_readback_reward_done_flat(
+                self._handle,
+                rewards,
+                len(rewards),
+                dones,
+                len(dones),
+            )
+        )
+        return rewards, dones
+
+    def step_actions(
+        self, actions: Sequence[tuple[float, float]], steps: int = 1
+    ) -> PackedStepResult:
+        ffi_actions = (_TriadAction * len(actions))(
+            *(_TriadAction(accel_x=x, accel_y=y) for x, y in actions)
+        )
+        observations = self._allocate_flat_observation_buffer()
+        rewards = self._allocate_reward_buffer()
+        dones = self._allocate_done_buffer()
+        _require(
+            _lib.triad_simulation_step_actions_readback(
+                self._handle,
+                ffi_actions,
+                len(actions),
+                steps,
+                observations,
+                len(observations),
+                rewards,
+                len(rewards),
+                dones,
+                len(dones),
+            )
+        )
+        return PackedStepResult(
+            observations=observations,
+            rewards=rewards,
+            dones=dones,
+            env_count=self.env_count,
+        )
+
+    def step_flat_actions_into(
+        self,
+        action_values: ctypes.Array[ctypes.c_float],
+        result: PackedStepResult,
+        steps: int = 1,
+    ) -> PackedStepResult:
+        _require(
+            _lib.triad_simulation_step_flat_actions_readback(
+                self._handle,
+                action_values,
+                len(action_values),
+                steps,
+                result.observations,
+                len(result.observations),
+                result.rewards,
+                len(result.rewards),
+                result.dones,
+                len(result.dones),
+            )
+        )
+        return result
 
     def get_state(self) -> list[dict[str, int | float]]:
         values = (_TriadEnvState * self.env_count)()
@@ -518,6 +734,101 @@ class TriadVecEnv:
                     observations[index] = reset_observations[index]
 
         return observations, rewards, dones, infos
+
+
+class TriadFastVecEnv:
+    def __init__(self, sim: SimulationCore, auto_reset: bool = True) -> None:
+        self.sim = sim
+        self.auto_reset = auto_reset
+        self._action_values = self.sim.create_action_buffer()
+        self._result = PackedStepResult(
+            observations=self.sim._allocate_flat_observation_buffer(),
+            rewards=self.sim._allocate_reward_buffer(),
+            dones=self.sim._allocate_done_buffer(),
+            env_count=self.sim.env_count,
+        )
+
+    @property
+    def action_values(self) -> ctypes.Array[ctypes.c_float]:
+        return self._action_values
+
+    @property
+    def result(self) -> PackedStepResult:
+        return self._result
+
+    def action_buffer(self) -> memoryview:
+        return memoryview(self._action_values)
+
+    def numpy_action_view(self) -> object:
+        np = _numpy_module()
+        return np.ctypeslib.as_array(self._action_values).reshape(
+            self.sim.env_count, self.sim.action_stride
+        )
+
+    def numpy_result_views(self) -> tuple[object, object, object]:
+        return self._result.numpy_views()
+
+    def set_actions_flat(self, action_values: Sequence[float]) -> "TriadFastVecEnv":
+        if len(action_values) != len(self._action_values):
+            raise ValueError(
+                f"expected {len(self._action_values)} flat action values, got {len(action_values)}"
+            )
+        self._action_values[:] = action_values
+        return self
+
+    def reset(self) -> ctypes.Array[ctypes.c_float]:
+        self.sim.reset_all().step(1)
+        reset_obs = self.sim.read_observation_buffer()
+        self._result.observations[:] = reset_obs
+        return self._result.observations
+
+    def step(self, actions: Sequence[tuple[float, float]]) -> PackedStepResult:
+        if len(actions) == len(self._action_values):
+            self._action_values[:] = actions
+        else:
+            if len(actions) != self.sim.env_count:
+                raise ValueError(
+                    f"expected {self.sim.env_count} action pairs or {len(self._action_values)} flat values, got {len(actions)}"
+                )
+            write_index = 0
+            for accel_x, accel_y in actions:
+                self._action_values[write_index] = accel_x
+                self._action_values[write_index + 1] = accel_y
+                write_index += 2
+        return self.step_in_place(1)
+
+    def step_in_place(self, steps: int = 1) -> PackedStepResult:
+        result = self.sim.step_flat_actions_into(
+            self._action_values, self._result, steps
+        )
+        if self.auto_reset:
+            done_indices = [index for index, done in enumerate(result.dones) if done]
+            if done_indices:
+                self.sim.request_resets(done_indices).step(1)
+                reset_obs = self.sim.read_observation_buffer()
+                for index in done_indices:
+                    start = index * self.sim.observation_stride
+                    end = start + self.sim.observation_stride
+                    result.observations[start:end] = reset_obs[start:end]
+        return result
+
+    def rollout(self, steps: int) -> PackedStepResult:
+        return self.step_in_place(steps)
+
+    def reset_numpy(self) -> object:
+        self.reset()
+        observations, _, _ = self._result.numpy_views()
+        return observations
+
+    def step_numpy(
+        self, actions: Sequence[tuple[float, float]]
+    ) -> tuple[object, object, object]:
+        result = self.step(actions)
+        return result.numpy_views()
+
+    def rollout_numpy(self, steps: int) -> tuple[object, object, object]:
+        result = self.rollout(steps)
+        return result.numpy_views()
 
 
 def build_basic_lap_course() -> CourseSpec:
@@ -618,6 +929,9 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "core-demo", help="Create a headless core sim and print a short rollout"
     )
     subparsers.add_parser("vec-demo", help="Run the vector env wrapper for a few steps")
+    subparsers.add_parser(
+        "fast-demo", help="Run the packed-array fast env wrapper for a few steps"
+    )
 
     custom = subparsers.add_parser("custom-course", help="Build a simple custom course")
     custom.add_argument("--name", default="custom-course")
@@ -700,6 +1014,27 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "step_head": step_result[0][:2],
                     "reward_head": step_result[1][:4],
                     "done_head": step_result[2][:4],
+                }
+            )
+        finally:
+            sim.close()
+            course.close()
+        return 0
+
+    if args.command == "fast-demo":
+        course = build_basic_lap_course()
+        sim = SimulationCore(_demo_config(course))
+        env = TriadFastVecEnv(sim)
+        try:
+            observations = env.reset()
+            result = env.step([(0.0, 0.0)] * sim.env_count)
+            _print_json(
+                {
+                    "reset_obs_len": len(observations),
+                    "step_obs_len": len(result.observations),
+                    "reward_head": result.reward_list()[:4],
+                    "done_head": result.done_list()[:4],
+                    "obs_head": result.observation_rows()[:2],
                 }
             )
         finally:
