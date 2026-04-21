@@ -1,0 +1,16 @@
+[package]
+name = "triad-headless"
+version = "0.1.0"
+edition = "2024"
+description = "Headless offscreen render and readback demo for triad-gpu"
+
+[[bin]]
+name = "triad-headless"
+path = "src/main.rs"
+
+[dependencies]
+triad-gpu = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+pollster = "0.3"
+png = "0.17"

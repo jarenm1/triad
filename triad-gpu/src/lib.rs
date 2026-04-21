@@ -38,7 +38,7 @@ pub use builder::{
     ShaderSource, ShaderStage, TextureBuilder, TextureViewBuilder,
 };
 pub use compute::{ComputeDispatch, ComputePassBuilder};
-pub use copy::{BufferCopy, CopyPassBuilder};
+pub use copy::{BufferCopy, CopyPassBuilder, TextureBufferCopy, TextureCopy};
 pub use frame_graph::{
     ExecutableFrameGraph, FrameGraph, Handle, Pass, PassBuilder, PassContext, ResourceType,
     TransientBufferDesc, TransientTextureDesc,

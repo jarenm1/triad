@@ -4,6 +4,7 @@ members = [
 "triad-window",
 "triad-app",
 "triad-cubes",
+"triad-headless",
 ]
 resolver = "3"
 
