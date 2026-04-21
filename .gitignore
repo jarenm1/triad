@@ -9,3 +9,6 @@ run.log
 vase.ply
 bear.ply
 .claude/
+__pycache__/
+*.py[cod]
+triad-headless-output.png

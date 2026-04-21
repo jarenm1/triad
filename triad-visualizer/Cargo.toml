@@ -1,0 +1,18 @@
+[package]
+name = "triad-visualizer"
+version = "0.1.0"
+edition = "2024"
+description = "Windowed visualizer for the shared Triad GPU simulation core"
+
+[[bin]]
+name = "triad-visualizer"
+path = "src/main.rs"
+
+[dependencies]
+triad-gpu = { workspace = true }
+triad-sim = { workspace = true }
+triad-window = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }

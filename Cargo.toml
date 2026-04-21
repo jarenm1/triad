@@ -6,6 +6,8 @@ members = [
 "triad-app",
 "triad-cubes",
 "triad-headless",
+"triad-visualizer",
+"triad-py",
 ]
 resolver = "3"
 

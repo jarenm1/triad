@@ -4,7 +4,10 @@ use triad_gpu::{
     ShaderStage, wgpu,
 };
 
+use crate::course::{CompiledCourse, CourseSpec, GpuCourseHeader, GpuStageSpec};
+
 const SIM_WORKGROUP_SIZE: u32 = 64;
+const COURSE_STAGE_CAPACITY: usize = 32;
 
 const STEP_SHADER: &str = r#"
 struct EnvState {
@@ -13,7 +16,7 @@ struct EnvState {
     step_count: u32,
     done: u32,
     current_gate: u32,
-    _pad0: u32,
+    current_lap: u32,
 };
 
 struct Action {
@@ -68,6 +71,28 @@ struct Gate {
     _pad0: vec2<f32>,
 };
 
+struct CourseHeader {
+    stage_count: u32,
+    total_gate_count: u32,
+    loop_enabled: u32,
+    laps_required: u32,
+};
+
+struct StageSpec {
+    kind: u32,
+    gate_count: u32,
+    flags: u32,
+    _pad0: u32,
+    spacing: f32,
+    lateral_amp: f32,
+    turn_radians: f32,
+    radius: f32,
+    vertical_amp: f32,
+    hole_half_width: f32,
+    hole_half_height: f32,
+    _pad1: f32,
+};
+
 struct EnvStateBuffer {
     values: array<EnvState>,
 };
@@ -92,12 +117,12 @@ struct ResetParamsBuffer {
     values: array<ResetParams>,
 };
 
-struct EnvLayoutBuffer {
-    values: array<EnvLayoutHeader>,
-};
-
 struct GateBuffer {
     values: array<Gate>,
+};
+
+struct StageBuffer {
+    values: array<StageSpec>,
 };
 
 @group(0) @binding(0) var<storage, read_write> states: EnvStateBuffer;
@@ -107,8 +132,9 @@ struct GateBuffer {
 @group(0) @binding(4) var<storage, read_write> reset_mask: ResetMaskBuffer;
 @group(0) @binding(5) var<uniform> params: SimParams;
 @group(0) @binding(6) var<storage, read> reset_params: ResetParamsBuffer;
-@group(0) @binding(7) var<storage, read_write> layouts: EnvLayoutBuffer;
-@group(0) @binding(8) var<storage, read_write> gates: GateBuffer;
+@group(0) @binding(7) var<storage, read_write> gates: GateBuffer;
+@group(0) @binding(8) var<uniform> course_header: CourseHeader;
+@group(0) @binding(9) var<storage, read> course_stages: StageBuffer;
 
 fn hash_to_unit(seed: u32) -> f32 {
     let mixed = seed * 747796405u + 2891336453u;
@@ -116,77 +142,153 @@ fn hash_to_unit(seed: u32) -> f32 {
     return f32(masked) / 16777215.0;
 }
 
+fn rotate_vec2(v: vec2<f32>, angle: f32) -> vec2<f32> {
+    let s = sin(angle);
+    let c = cos(angle);
+    return vec2<f32>(c * v.x - s * v.y, s * v.x + c * v.y);
+}
+
 fn gate_slot(env_index: u32, gate_index: u32) -> u32 {
     return env_index * params.max_gates_per_env + gate_index;
 }
 
-fn gate_count_for_difficulty(difficulty: f32) -> u32 {
-    let max_gates = max(params.max_gates_per_env, 1u);
-    let scaled = u32(round(clamp(difficulty, 0.0, 1.0) * f32(max(max_gates, 2u) - 2u)));
-    return min(max_gates, max(2u, 2u + scaled));
+fn stage_direction(stage: StageSpec) -> f32 {
+    return select(-1.0, 1.0, stage.flags != 0u);
+}
+
+fn generated_gate_count() -> u32 {
+    return min(course_header.total_gate_count, params.max_gates_per_env);
+}
+
+fn env_gate_offset(index: u32) -> u32 {
+    return index * params.max_gates_per_env;
+}
+
+fn gate_from_stage(
+    stage: StageSpec,
+    cursor_position: vec2<f32>,
+    cursor_forward: vec2<f32>,
+    local_gate_index: u32,
+    total_gate_index: u32,
+    total_gate_count: u32,
+    seed: u32,
+) -> Gate {
+    let lateral_axis = vec2<f32>(-cursor_forward.y, cursor_forward.x);
+    let progress = (f32(total_gate_index) + 0.5) / max(f32(total_gate_count), 1.0);
+    let elevation =
+        sin(progress * 6.283185307179586 + hash_to_unit(seed ^ 0x44f1u) * 6.283185307179586)
+            * stage.vertical_amp
+        + (hash_to_unit(seed ^ (total_gate_index * 97u + 0x0f0fu)) - 0.5) * 0.12;
+
+    var gate: Gate;
+    if (stage.kind == 2u) {
+        let t = (f32(local_gate_index) + 1.0) / max(f32(stage.gate_count), 1.0);
+        let lateral = sin(t * 6.283185307179586) * stage.lateral_amp;
+        gate.center = cursor_position + cursor_forward * stage.spacing + lateral_axis * lateral;
+        gate.forward = cursor_forward;
+    } else if (stage.kind == 3u) {
+        let turn_sign = stage_direction(stage);
+        let arc_center = cursor_position + lateral_axis * (turn_sign * stage.radius);
+        let start_offset = cursor_position - arc_center;
+        let angle =
+            turn_sign * stage.turn_radians
+            * ((f32(local_gate_index) + 1.0) / max(f32(stage.gate_count), 1.0));
+        gate.center = arc_center + rotate_vec2(start_offset, angle);
+        gate.forward = normalize(rotate_vec2(cursor_forward, angle));
+    } else {
+        gate.center = cursor_position + cursor_forward * stage.spacing;
+        gate.forward = cursor_forward;
+    }
+    gate.half_extents = vec2<f32>(stage.hole_half_width, stage.hole_half_height);
+    gate._pad0 = vec2<f32>(elevation, 0.0);
+    return gate;
+}
+
+fn next_cursor_forward(stage: StageSpec, cursor_forward: vec2<f32>) -> vec2<f32> {
+    if (stage.kind == 3u) {
+        return normalize(rotate_vec2(
+            cursor_forward,
+            stage_direction(stage) * stage.turn_radians,
+        ));
+    }
+    return cursor_forward;
+}
+
+fn progress_value(current_lap: u32, current_gate: u32, gate_count: u32) -> f32 {
+    let laps_required = max(course_header.laps_required, 1u);
+    let total_targets = max(gate_count * laps_required, 1u);
+    let completed = current_lap * gate_count + current_gate;
+    return f32(completed) / f32(total_targets);
 }
 
 fn reset_env(index: u32) {
     let reset = reset_params.values[index];
-    let difficulty = clamp(reset.difficulty, 0.0, 1.0);
-    let env_fraction = f32(index) / max(f32(params.env_count), 1.0);
-    let base_angle =
-        env_fraction * 6.283185307179586 + hash_to_unit(reset.seed ^ 0x12345u) * 6.283185307179586;
-    let forward_axis = normalize(vec2<f32>(cos(base_angle), sin(base_angle)));
-    let lateral_axis = vec2<f32>(-forward_axis.y, forward_axis.x);
-    let radius = 0.15 + 0.2 * hash_to_unit(reset.seed ^ 0xabcdefu);
-    let start_position = forward_axis * radius;
-    let count = gate_count_for_difficulty(difficulty);
-    let base_slot = gate_slot(index, 0u);
+    let count = generated_gate_count();
+    let base_slot = env_gate_offset(index);
 
-    layouts.values[index].gate_offset = base_slot;
-    layouts.values[index].gate_count = count;
-    layouts.values[index].obstacle_offset = 0u;
-    layouts.values[index].obstacle_count = 0u;
-
+    let course_angle =
+        hash_to_unit(reset.seed ^ 0x12345u) * 6.283185307179586
+        + f32(reset.grammar_id % 4u) * 1.5707963267948966;
+    var cursor_position = vec2<f32>(0.0, 0.0);
+    var cursor_forward = rotate_vec2(vec2<f32>(1.0, 0.0), course_angle);
     var gate_index = 0u;
+    var stage_index = 0u;
+
+    loop {
+        if (stage_index >= course_header.stage_count || gate_index >= count) {
+            break;
+        }
+
+        let stage = course_stages.values[stage_index];
+        var local_gate_index = 0u;
+        loop {
+            if (local_gate_index >= stage.gate_count || gate_index >= count) {
+                break;
+            }
+
+            let gate = gate_from_stage(
+                stage,
+                cursor_position,
+                cursor_forward,
+                local_gate_index,
+                gate_index,
+                count,
+                reset.seed,
+            );
+            gates.values[gate_slot(index, gate_index)] = gate;
+            cursor_position = gate.center;
+            gate_index = gate_index + 1u;
+            local_gate_index = local_gate_index + 1u;
+        }
+
+        cursor_forward = next_cursor_forward(stage, cursor_forward);
+        stage_index = stage_index + 1u;
+    }
+
     loop {
         if (gate_index >= params.max_gates_per_env) {
             break;
         }
-
         let slot = gate_slot(index, gate_index);
-        if (gate_index < count) {
-            let t = f32(gate_index) + 1.0;
-            let spacing = 0.18 + difficulty * 0.12;
-            let wobble = sin(
-                t * 0.8
-                    + hash_to_unit(reset.seed + gate_index * 17u + reset.grammar_id * 31u)
-                        * 6.283185307179586,
-            ) * (0.04 + difficulty * 0.22);
-            gates.values[slot].center =
-                start_position + forward_axis * (spacing * (t + 0.5)) + lateral_axis * wobble;
-            gates.values[slot].half_extents = vec2<f32>(
-                0.09 - difficulty * 0.025,
-                0.09 - difficulty * 0.025,
-            );
-            gates.values[slot].forward = forward_axis;
-            gates.values[slot]._pad0 = vec2<f32>(0.0, 0.0);
-        } else {
-            gates.values[slot].center = vec2<f32>(0.0, 0.0);
-            gates.values[slot].half_extents = vec2<f32>(0.0, 0.0);
-            gates.values[slot].forward = vec2<f32>(0.0, 0.0);
-            gates.values[slot]._pad0 = vec2<f32>(0.0, 0.0);
-        }
-
+        gates.values[slot].center = vec2<f32>(0.0, 0.0);
+        gates.values[slot].half_extents = vec2<f32>(0.0, 0.0);
+        gates.values[slot].forward = vec2<f32>(0.0, 0.0);
+        gates.values[slot]._pad0 = vec2<f32>(0.0, 0.0);
         gate_index = gate_index + 1u;
     }
 
+    let first_gate = gates.values[base_slot];
+    let start_position = first_gate.center - first_gate.forward * 1.0;
     states.values[index].position = start_position;
     states.values[index].velocity = vec2<f32>(0.0, 0.0);
     states.values[index].step_count = 0u;
     states.values[index].done = 0u;
     states.values[index].current_gate = 0u;
-    states.values[index]._pad0 = 0u;
+    states.values[index].current_lap = 0u;
 
     observations.values[index].position = start_position;
     observations.values[index].velocity = vec2<f32>(0.0, 0.0);
-    observations.values[index].target_gate_position = gates.values[base_slot].center;
+    observations.values[index].target_gate_position = first_gate.center;
     observations.values[index].progress = 0.0;
     observations.values[index]._pad0 = 0.0;
 
@@ -198,10 +300,9 @@ fn reset_env(index: u32) {
 }
 
 fn current_target_gate(index: u32, current_gate: u32) -> Gate {
-    let header = layouts.values[index];
-    let safe_count = max(header.gate_count, 1u);
+    let safe_count = max(generated_gate_count(), 1u);
     let safe_gate = min(current_gate, safe_count - 1u);
-    return gates.values[header.gate_offset + safe_gate];
+    return gates.values[env_gate_offset(index) + safe_gate];
 }
 
 @compute @workgroup_size(64)
@@ -223,7 +324,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         observations.values[index].position = state.position;
         observations.values[index].velocity = state.velocity;
         observations.values[index].target_gate_position = target_gate.center;
-        observations.values[index].progress = observations.values[index].progress;
+        observations.values[index].progress =
+            progress_value(state.current_lap, state.current_gate, generated_gate_count());
         reward_done.values[index].reward = 0.0;
         reward_done.values[index].done = 1u;
         return;
@@ -234,14 +336,22 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     state.position = state.position + state.velocity * params.dt_seconds;
     state.step_count = state.step_count + 1u;
 
-    let header = layouts.values[index];
+    let gate_count = generated_gate_count();
     var delta = target_gate.center - state.position;
     var distance_to_gate = length(delta);
     let gate_radius = max(target_gate.half_extents.x, target_gate.half_extents.y) * 1.5;
     if (distance_to_gate <= gate_radius) {
-        if (state.current_gate + 1u < header.gate_count) {
+        if (state.current_gate + 1u < gate_count) {
             state.current_gate = state.current_gate + 1u;
             target_gate = current_target_gate(index, state.current_gate);
+            delta = target_gate.center - state.position;
+            distance_to_gate = length(delta);
+        } else if (course_header.loop_enabled != 0u
+            && state.current_lap + 1u < max(course_header.laps_required, 1u))
+        {
+            state.current_lap = state.current_lap + 1u;
+            state.current_gate = 0u;
+            target_gate = current_target_gate(index, 0u);
             delta = target_gate.center - state.position;
             distance_to_gate = length(delta);
         } else {
@@ -261,11 +371,11 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     observations.values[index].position = state.position;
     observations.values[index].velocity = state.velocity;
     observations.values[index].target_gate_position = target_gate.center;
-    observations.values[index].progress = f32(state.current_gate) / max(f32(header.gate_count), 1.0);
+    observations.values[index].progress =
+        progress_value(state.current_lap, state.current_gate, gate_count);
     observations.values[index]._pad0 = 0.0;
 
-    reward_done.values[index].reward =
-        observations.values[index].progress * 2.0 - distance_to_gate;
+    reward_done.values[index].reward = observations.values[index].progress * 2.0 - distance_to_gate;
     reward_done.values[index].done = state.done;
     reward_done.values[index]._pad0 = 0u;
     reward_done.values[index]._pad1 = 0u;
@@ -280,7 +390,7 @@ pub struct EnvState {
     pub step_count: u32,
     pub done: u32,
     pub current_gate: u32,
-    pub _pad: u32,
+    pub current_lap: u32,
 }
 
 #[repr(C)]
@@ -375,6 +485,7 @@ pub struct GpuSimulationConfig {
     pub bounds: f32,
     pub max_steps: u32,
     pub max_gates_per_env: usize,
+    pub laps_required: u32,
 }
 
 impl Default for GpuSimulationConfig {
@@ -382,17 +493,14 @@ impl Default for GpuSimulationConfig {
         Self {
             env_count: 1024,
             dt_seconds: 1.0 / 60.0,
-            bounds: 1.0,
-            max_steps: 512,
-            max_gates_per_env: 8,
+            bounds: 8.0,
+            max_steps: 1024,
+            max_gates_per_env: 24,
+            laps_required: 1,
         }
     }
 }
 
-/// Minimal GPU-first simulation core for future headless training and visualization runners.
-///
-/// The authoritative environment state lives in GPU buffers. Callers step the simulation via
-/// a cached compute graph and only trigger CPU readback explicitly.
 pub struct GpuSimulation {
     config: GpuSimulationConfig,
     state: triad_gpu::GpuBuffer<EnvState>,
@@ -404,6 +512,8 @@ pub struct GpuSimulation {
     layout_headers: triad_gpu::GpuBuffer<EnvLayoutHeader>,
     gates: triad_gpu::GpuBuffer<Gate>,
     params: triad_gpu::GpuBuffer<SimParams>,
+    course_header: triad_gpu::GpuBuffer<GpuCourseHeader>,
+    course_stages: triad_gpu::GpuBuffer<GpuStageSpec>,
     state_readback: triad_gpu::GpuBuffer<EnvState>,
     observation_readback: triad_gpu::GpuBuffer<Observation>,
     reward_done_readback: triad_gpu::GpuBuffer<RewardDone>,
@@ -440,6 +550,16 @@ impl GpuSimulation {
             .into());
         }
 
+        let mut default_course = CourseSpec::default_drone_course();
+        default_course.laps_required = config.laps_required.max(1);
+        let compiled_course = default_course.compile();
+        let gate_capacity = config.env_count * config.max_gates_per_env;
+        let layout_values = build_layout_headers(
+            config.env_count,
+            config.max_gates_per_env,
+            compiled_course.header.total_gate_count,
+        );
+
         let reset_values = vec![1u32; config.env_count];
         let reset_params_values: Vec<ResetParams> = (0..config.env_count)
             .map(|env_index| ResetParams::new(env_index as u32, 0, 0.35))
@@ -452,7 +572,6 @@ impl GpuSimulation {
             max_gates_per_env: config.max_gates_per_env as u32,
             _pad: [0; 3],
         };
-        let gate_capacity = config.env_count * config.max_gates_per_env;
 
         let state = renderer
             .create_gpu_buffer::<EnvState>()
@@ -496,7 +615,7 @@ impl GpuSimulation {
         let layout_headers = renderer
             .create_gpu_buffer::<EnvLayoutHeader>()
             .label("sim env layout headers")
-            .capacity(config.env_count)
+            .with_data(&layout_values)
             .add_usage(wgpu::BufferUsages::COPY_SRC)
             .build(registry)?;
 
@@ -512,6 +631,20 @@ impl GpuSimulation {
             .label("sim params")
             .with_data(&[params])
             .usage(BufferUsage::Uniform)
+            .build(registry)?;
+
+        let course_header = renderer
+            .create_gpu_buffer::<GpuCourseHeader>()
+            .label("sim course header")
+            .with_data(&[compiled_course.header])
+            .usage(BufferUsage::Uniform)
+            .build(registry)?;
+
+        let course_stages = renderer
+            .create_gpu_buffer::<GpuStageSpec>()
+            .label("sim course stages")
+            .capacity(COURSE_STAGE_CAPACITY)
+            .with_data(&compiled_course.stages)
             .build(registry)?;
 
         let state_readback = renderer
@@ -603,14 +736,20 @@ impl GpuSimulation {
             .buffer_stage(
                 7,
                 ShaderStage::Compute,
-                layout_headers.handle(),
+                gates.handle(),
                 BindingType::StorageWrite,
             )
             .buffer_stage(
                 8,
                 ShaderStage::Compute,
-                gates.handle(),
-                BindingType::StorageWrite,
+                course_header.handle(),
+                BindingType::Uniform,
+            )
+            .buffer_stage(
+                9,
+                ShaderStage::Compute,
+                course_stages.handle(),
+                BindingType::StorageRead,
             )
             .build(registry)?;
 
@@ -644,8 +783,9 @@ impl GpuSimulation {
             reset_mask.handle(),
             params.handle(),
             reset_params.handle(),
-            layout_headers.handle(),
             gates.handle(),
+            course_header.handle(),
+            course_stages.handle(),
             dispatch_count,
         )?;
 
@@ -691,6 +831,8 @@ impl GpuSimulation {
             layout_headers,
             gates,
             params,
+            course_header,
+            course_stages,
             state_readback,
             observation_readback,
             reward_done_readback,
@@ -705,6 +847,39 @@ impl GpuSimulation {
             layout_headers_readback_graph,
             gates_readback_graph,
         })
+    }
+
+    pub fn set_course(
+        &self,
+        renderer: &Renderer,
+        registry: &ResourceRegistry,
+        course: &CourseSpec,
+    ) -> Result<()> {
+        let CompiledCourse { header, stages } = course.compile();
+        if stages.len() > COURSE_STAGE_CAPACITY {
+            return Err(BufferError::CapacityExceeded {
+                requested: stages.len(),
+                capacity: COURSE_STAGE_CAPACITY,
+            }
+            .into());
+        }
+        if header.total_gate_count as usize > self.config.max_gates_per_env {
+            return Err(BufferError::CapacityExceeded {
+                requested: header.total_gate_count as usize,
+                capacity: self.config.max_gates_per_env,
+            }
+            .into());
+        }
+
+        let layout_values = build_layout_headers(
+            self.config.env_count,
+            self.config.max_gates_per_env,
+            header.total_gate_count,
+        );
+        renderer.write_buffer(self.course_header.handle(), &[header], registry)?;
+        renderer.write_buffer(self.course_stages.handle(), &stages, registry)?;
+        renderer.write_buffer(self.layout_headers.handle(), &layout_values, registry)?;
+        Ok(())
     }
 
     #[must_use]
@@ -919,8 +1094,9 @@ fn build_step_graph(
     reset_mask: triad_gpu::Handle<wgpu::Buffer>,
     params: triad_gpu::Handle<wgpu::Buffer>,
     reset_params: triad_gpu::Handle<wgpu::Buffer>,
-    layout_headers: triad_gpu::Handle<wgpu::Buffer>,
     gates: triad_gpu::Handle<wgpu::Buffer>,
+    course_header: triad_gpu::Handle<wgpu::Buffer>,
+    course_stages: triad_gpu::Handle<wgpu::Buffer>,
     dispatch_x: u32,
 ) -> Result<ExecutableFrameGraph> {
     let pass = ComputePassBuilder::new("GpuSimulationStep")
@@ -931,8 +1107,9 @@ fn build_step_graph(
         .read_write(reset_mask)
         .read(params)
         .read(reset_params)
-        .write(layout_headers)
         .write(gates)
+        .read(course_header)
+        .read(course_stages)
         .with_pipeline(pipeline)
         .with_bind_group(0, bind_group)
         .dispatch(dispatch_x, 1, 1)
@@ -956,4 +1133,19 @@ fn build_readback_graph(
     let mut graph = FrameGraph::new();
     graph.add_pass(pass);
     Ok(graph.build()?)
+}
+
+fn build_layout_headers(
+    env_count: usize,
+    max_gates_per_env: usize,
+    gate_count: u32,
+) -> Vec<EnvLayoutHeader> {
+    (0..env_count)
+        .map(|env_index| EnvLayoutHeader {
+            gate_offset: (env_index * max_gates_per_env) as u32,
+            gate_count,
+            obstacle_offset: 0,
+            obstacle_count: 0,
+        })
+        .collect()
 }
