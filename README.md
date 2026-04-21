@@ -1,17 +1,28 @@
-**Triad** is a modular GPU rendering framework / application for use in real-time splatting.
-Aims to become a complete autonomy tool/sim.
+# Triad
 
-[ROADMAP](./ROADMAP.md)
+Triad is being refactored into a generic renderer and particle simulation workspace.
 
-![Showcase image for triangle like splatting](./showcase.png "Triangle Like Splatting PLY file render")
+The current direction is:
 
-## Crates
+- `triad-gpu` as the render core on top of `wgpu`
+- `triad-window` as the reusable windowing, input, and viewer shell
+- `triad-app` and the old splatting/reconstruction infrastructure to be removed or replaced
 
-- **`triad-data`**: Data loading helpers (PLY files)
-- **`triad-gpu`**: Low-level GPU rendering infrastructure built on wgpu
-- **`triad-window`**: Window management and application framework (winit)
+This repository is in transition. Some crates and files still reflect the older triangle/gaussian splatting project and should be treated as legacy code until they are either deleted or rewritten.
 
-## Resources
-- [Triangle Splatting+](https://arxiv.org/abs/2509.25122)
-- [3DGS Real-Time Radiance Field Rendering](https://arxiv.org/abs/2308.04079)
-- [4D Gaussian Splatting Research](./docs/4d_gaussian_research.md)
+## Workspace
+
+- **`triad-gpu`**: render core, frame graph, GPU resource management, shader/pipeline utilities
+- **`triad-window`**: window lifecycle, input handling, camera controls, egui integration
+- **`triad-app`**: legacy application crate slated for replacement
+- **`triad-data`**: legacy data/import code slated for removal or extraction
+- **`triad-train`**: legacy reconstruction/training code slated for removal
+- **`triad-capture`**: legacy capture pipeline pending evaluation during the refactor
+
+## Refactor Goal
+
+The immediate goal is to simplify the workspace around a clean rendering core that can support:
+
+- generic scene rendering
+- particle simulation and visualization
+- future app/tooling built on stable engine boundaries
