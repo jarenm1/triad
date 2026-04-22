@@ -79,6 +79,51 @@ class CurriculumSchedule:
         return reset_params
 
 
+@dataclass(frozen=True)
+class CurriculumProgression:
+    total_updates: int
+    warmup_updates: int = 0
+    start_progress: float = 0.0
+    end_progress: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.total_updates <= 0:
+            raise ValueError("total_updates must be positive")
+        if self.warmup_updates < 0:
+            raise ValueError("warmup_updates must be non-negative")
+
+    def progress_for_update(self, update_index: int) -> float:
+        if update_index < 0:
+            raise ValueError("update_index must be non-negative")
+        if update_index <= self.warmup_updates:
+            return float(self.start_progress)
+
+        ramp_updates = max(1, self.total_updates - self.warmup_updates)
+        ramp_index = min(update_index - self.warmup_updates, ramp_updates)
+        alpha = ramp_index / ramp_updates
+        progress = self.start_progress + (
+            (self.end_progress - self.start_progress) * alpha
+        )
+        return max(0.0, min(1.0, float(progress)))
+
+    def apply(
+        self,
+        sim: object,
+        update_index: int,
+        base_seed: int = 0,
+        schedule: CurriculumSchedule | None = None,
+    ) -> list[tuple[int, int, float, int]]:
+        progress = self.progress_for_update(update_index)
+        active_schedule = schedule or build_teacher_curriculum_schedule()
+        reset_params = active_schedule.sample_reset_params(
+            env_count=int(sim.env_count),
+            progress=progress,
+            base_seed=base_seed,
+        )
+        sim.set_reset_params(reset_params)
+        return reset_params
+
+
 def build_teacher_curriculum_schedule() -> CurriculumSchedule:
     return CurriculumSchedule(
         phases=(
@@ -126,3 +171,13 @@ def sample_curriculum_reset_params(
 ) -> list[tuple[int, int, float, int]]:
     active_schedule = schedule or build_teacher_curriculum_schedule()
     return active_schedule.sample_reset_params(env_count, progress, base_seed)
+
+
+def build_teacher_curriculum_progression(
+    total_updates: int,
+    warmup_updates: int = 0,
+) -> CurriculumProgression:
+    return CurriculumProgression(
+        total_updates=total_updates,
+        warmup_updates=warmup_updates,
+    )

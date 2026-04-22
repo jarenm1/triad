@@ -5,7 +5,7 @@ import ctypes
 import json
 import os
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, IntFlag
 from functools import lru_cache
 from pathlib import Path
 from typing import Sequence
@@ -35,11 +35,17 @@ _lib = _load_library()
 __all__ = [
     "ACTION_STRIDE",
     "OBSERVATION_STRIDE",
+    "apply_curriculum_progress",
+    "apply_curriculum_update",
     "BenchmarkResult",
     "CourseSpec",
     "CurriculumPhase",
+    "CurriculumProgression",
     "CurriculumSchedule",
+    "DoneReason",
     "PackedStepResult",
+    "PPOConfig",
+    "PPOTrainResult",
     "RolloutCollector",
     "RolloutBatch",
     "CurriculumStage",
@@ -51,12 +57,16 @@ __all__ = [
     "TriadVecEnv",
     "TurnDirection",
     "build_basic_lap_course",
+    "build_teacher_curriculum_progression",
     "build_teacher_curriculum_schedule",
     "benchmark_rollout",
     "collect_rollout_numpy",
     "main",
     "point_to_gate_policy",
     "sample_curriculum_reset_params",
+    "serve_ppo_policy",
+    "train_ppo",
+    "load_ppo_policy",
     "zero_policy",
 ]
 
@@ -114,6 +124,17 @@ class CurriculumStage(IntEnum):
     ARENA = _lib.triad_curriculum_stage_arena()
     TECHNICAL = _lib.triad_curriculum_stage_technical()
     ELEVATED = _lib.triad_curriculum_stage_elevated()
+
+
+class DoneReason(IntFlag):
+    NONE = 0
+    COMPLETE = 1 << 0
+    GATE_COLLISION = 1 << 1
+    OBSTACLE_COLLISION = 1 << 2
+    FLOOR_COLLISION = 1 << 3
+    OUT_OF_BOUNDS = 1 << 4
+    STEP_LIMIT = 1 << 5
+    EXCESSIVE_TILT = 1 << 6
 
 
 class _TriadStageDesc(ctypes.Structure):
@@ -225,6 +246,16 @@ class _TriadRewardDone(ctypes.Structure):
     _fields_ = [
         ("reward", ctypes.c_float),
         ("done", ctypes.c_uint32),
+        ("done_reason", ctypes.c_uint32),
+        ("_pad0", ctypes.c_uint32),
+        ("progress_reward", ctypes.c_float),
+        ("distance_penalty", ctypes.c_float),
+        ("alignment_reward", ctypes.c_float),
+        ("tilt_penalty", ctypes.c_float),
+        ("completion_bonus", ctypes.c_float),
+        ("collision_penalty", ctypes.c_float),
+        ("_pad1", ctypes.c_float),
+        ("_pad2", ctypes.c_float),
     ]
 
 
@@ -354,7 +385,9 @@ OBSERVATION_STRIDE = int(_lib.triad_observation_stride())
 
 from .curriculum import (  # noqa: E402
     CurriculumPhase,
+    CurriculumProgression,
     CurriculumSchedule,
+    build_teacher_curriculum_progression,
     build_teacher_curriculum_schedule,
     sample_curriculum_reset_params,
 )
@@ -824,7 +857,7 @@ class SimulationCore:
             for value in values
         ]
 
-    def get_reward_done(self) -> list[dict[str, int | float]]:
+    def get_reward_done(self) -> list[dict[str, object]]:
         values = (_TriadRewardDone * self.env_count)()
         _require(
             _lib.triad_simulation_readback_reward_done(
@@ -832,9 +865,56 @@ class SimulationCore:
             )
         )
         return [
-            {"reward": float(value.reward), "done": bool(value.done)}
+            {
+                "reward": float(value.reward),
+                "done": bool(value.done),
+                "done_reason": int(value.done_reason),
+                "done_reason_labels": [
+                    reason.name
+                    for reason in DoneReason
+                    if reason is not DoneReason.NONE
+                    and int(value.done_reason) & int(reason)
+                ],
+                "progress_reward": float(value.progress_reward),
+                "distance_penalty": float(value.distance_penalty),
+                "alignment_reward": float(value.alignment_reward),
+                "tilt_penalty": float(value.tilt_penalty),
+                "completion_bonus": float(value.completion_bonus),
+                "collision_penalty": float(value.collision_penalty),
+            }
             for value in values
         ]
+
+
+def apply_curriculum_progress(
+    sim: SimulationCore,
+    progress: float,
+    base_seed: int = 0,
+    schedule: CurriculumSchedule | None = None,
+) -> list[tuple[int, int, float, int]]:
+    reset_params = sample_curriculum_reset_params(
+        env_count=sim.env_count,
+        progress=progress,
+        base_seed=base_seed,
+        schedule=schedule,
+    )
+    sim.set_reset_params(reset_params)
+    return reset_params
+
+
+def apply_curriculum_update(
+    sim: SimulationCore,
+    update_index: int,
+    progression: CurriculumProgression,
+    base_seed: int = 0,
+    schedule: CurriculumSchedule | None = None,
+) -> list[tuple[int, int, float, int]]:
+    return progression.apply(
+        sim=sim,
+        update_index=update_index,
+        base_seed=base_seed,
+        schedule=schedule,
+    )
 
 
 class TriadVecEnv:
@@ -972,6 +1052,7 @@ class TriadFastVecEnv:
         return result.numpy_views()
 
 
+from .ppo import PPOConfig, PPOTrainResult, load_ppo_policy, serve_ppo_policy, train_ppo
 from .rollout import (
     BenchmarkResult,
     RolloutBatch,
@@ -1098,6 +1179,26 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     benchmark_demo.add_argument("--horizon", type=int, default=32)
     benchmark_demo.add_argument("--iterations", type=int, default=10)
     benchmark_demo.add_argument("--warmup", type=int, default=1)
+    ppo_train = subparsers.add_parser(
+        "ppo-train", help="Train a minimal PPO teacher on the Triad sim"
+    )
+    ppo_train.add_argument("--env-count", type=int, default=256)
+    ppo_train.add_argument("--horizon", type=int, default=128)
+    ppo_train.add_argument("--total-updates", type=int, default=500)
+    ppo_train.add_argument("--warmup-updates", type=int, default=25)
+    ppo_train.add_argument("--learning-rate", type=float, default=3.0e-4)
+    ppo_train.add_argument("--ppo-epochs", type=int, default=4)
+    ppo_train.add_argument("--minibatch-size", type=int, default=4096)
+    ppo_train.add_argument("--hidden-size", type=int, default=256)
+    ppo_train.add_argument("--device", default="auto")
+    ppo_train.add_argument("--seed", type=int, default=0)
+    ppo_train.add_argument("--log-interval", type=int, default=10)
+    ppo_train.add_argument("--checkpoint", default=None)
+    ppo_policy_server = subparsers.add_parser(
+        "ppo-policy-server", help="Serve PPO checkpoint actions over stdio"
+    )
+    ppo_policy_server.add_argument("--checkpoint", required=True)
+    ppo_policy_server.add_argument("--device", default="auto")
     curriculum_demo = subparsers.add_parser(
         "curriculum-demo", help="Sample reset params from the default curriculum"
     )
@@ -1278,6 +1379,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         )
         return 0
+
+    if args.command == "ppo-train":
+        config = PPOConfig(
+            env_count=args.env_count,
+            horizon=args.horizon,
+            total_updates=args.total_updates,
+            warmup_updates=args.warmup_updates,
+            learning_rate=args.learning_rate,
+            ppo_epochs=args.ppo_epochs,
+            minibatch_size=args.minibatch_size,
+            hidden_size=args.hidden_size,
+            device=args.device,
+            seed=args.seed,
+            log_interval=args.log_interval,
+            checkpoint_path=args.checkpoint,
+        )
+        result = train_ppo(config)
+        _print_json(result.__dict__)
+        return 0
+
+    if args.command == "ppo-policy-server":
+        return serve_ppo_policy(args.checkpoint, device=args.device)
 
     course = (
         CourseSpec(args.name)

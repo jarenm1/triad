@@ -39,9 +39,26 @@ struct Observation {
 struct RewardDone {
     reward: f32,
     done: u32,
+    done_reason: u32,
     _pad0: u32,
-    _pad1: u32,
+    progress_reward: f32,
+    distance_penalty: f32,
+    alignment_reward: f32,
+    tilt_penalty: f32,
+    completion_bonus: f32,
+    collision_penalty: f32,
+    _pad1: f32,
+    _pad2: f32,
 };
+
+const DONE_REASON_NONE: u32 = 0u;
+const DONE_REASON_COMPLETE: u32 = 1u;
+const DONE_REASON_GATE_COLLISION: u32 = 1u << 1u;
+const DONE_REASON_OBSTACLE_COLLISION: u32 = 1u << 2u;
+const DONE_REASON_FLOOR_COLLISION: u32 = 1u << 3u;
+const DONE_REASON_OUT_OF_BOUNDS: u32 = 1u << 4u;
+const DONE_REASON_STEP_LIMIT: u32 = 1u << 5u;
+const DONE_REASON_EXCESSIVE_TILT: u32 = 1u << 6u;
 
 struct SimParams {
     dt_seconds: f32,
@@ -1201,8 +1218,16 @@ fn reset_env(index: u32) {
 
     reward_done.values[index].reward = 0.0;
     reward_done.values[index].done = 0u;
+    reward_done.values[index].done_reason = DONE_REASON_NONE;
     reward_done.values[index]._pad0 = 0u;
-    reward_done.values[index]._pad1 = 0u;
+    reward_done.values[index].progress_reward = 0.0;
+    reward_done.values[index].distance_penalty = 0.0;
+    reward_done.values[index].alignment_reward = 0.0;
+    reward_done.values[index].tilt_penalty = 0.0;
+    reward_done.values[index].completion_bonus = 0.0;
+    reward_done.values[index].collision_penalty = 0.0;
+    reward_done.values[index]._pad1 = 0.0;
+    reward_done.values[index]._pad2 = 0.0;
     reset_mask.values[index] = 0u;
 }
 
@@ -1228,6 +1253,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var target_gate = current_target_gate(index, state.current_gate);
 
     if (state.done != 0u) {
+        var debug = reward_done.values[index];
         let position = state.position.xyz;
         let target_position = target_gate.center.xyz;
         let to_gate = target_position - position;
@@ -1252,8 +1278,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             gate_alignment,
             dot(state.motor_thrust, vec4<f32>(0.25)),
         );
-        reward_done.values[index].reward = 0.0;
-        reward_done.values[index].done = 1u;
+        debug.reward = 0.0;
+        debug.done = 1u;
+        reward_done.values[index] = debug;
         return;
     }
 
@@ -1308,6 +1335,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         previous_gate_cleared && crossed_gate_plane(prev_position, state.position.xyz, target_gate);
     let collided_gate = !passed_gate && gate_frame_collision(target_gate, state.position.xyz);
     var collided_obstacle = false;
+    var done_reason = DONE_REASON_NONE;
     var obstacle_index = 0u;
     loop {
         if (obstacle_index >= generated_obstacle_count()) {
@@ -1338,9 +1366,17 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             distance_to_gate = length(delta);
         } else {
             state.done = 1u;
+            done_reason = done_reason | DONE_REASON_COMPLETE;
         }
-    } else if (collided_gate || collided_obstacle) {
-        state.done = 1u;
+    } else {
+        if (collided_gate) {
+            state.done = 1u;
+            done_reason = done_reason | DONE_REASON_GATE_COLLISION;
+        }
+        if (collided_obstacle) {
+            state.done = 1u;
+            done_reason = done_reason | DONE_REASON_OBSTACLE_COLLISION;
+        }
     }
 
     let collided_floor = state.position.y <= params.min_altitude + params.drone_radius;
@@ -1349,10 +1385,23 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         || state.position.y > params.max_altitude - params.drone_radius;
     let reached_step_limit = state.step_count >= params.max_steps;
     let excessive_tilt = abs(attitude.x) > 1.2 || abs(attitude.y) > 1.2;
-    let collided_world = collided_floor || out_of_bounds;
-    if (collided_world || reached_step_limit || excessive_tilt) {
+    if (collided_floor) {
         state.done = 1u;
+        done_reason = done_reason | DONE_REASON_FLOOR_COLLISION;
     }
+    if (out_of_bounds) {
+        state.done = 1u;
+        done_reason = done_reason | DONE_REASON_OUT_OF_BOUNDS;
+    }
+    if (reached_step_limit) {
+        state.done = 1u;
+        done_reason = done_reason | DONE_REASON_STEP_LIMIT;
+    }
+    if (excessive_tilt) {
+        state.done = 1u;
+        done_reason = done_reason | DONE_REASON_EXCESSIVE_TILT;
+    }
+    let collided_world = collided_floor || out_of_bounds;
 
     states.values[index] = state;
 
@@ -1374,20 +1423,32 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         dot(state.motor_thrust, vec4<f32>(0.25)),
     );
 
-    let tilt_penalty = abs(attitude.x) + abs(attitude.y);
+    let tilt_magnitude = abs(attitude.x) + abs(attitude.y);
     let collision_happened = collided_gate || collided_obstacle || collided_world;
     let completion_bonus = select(0.0, 4.0, passed_gate);
+    let progress_reward = progress * 6.0;
+    let distance_penalty = distance_to_gate * 0.35;
+    let alignment_reward = gate_alignment * 0.15;
+    let tilt_penalty = tilt_magnitude * 0.05;
     let collision_penalty = select(0.0, params.collision_penalty, collision_happened);
     reward_done.values[index].reward =
-        progress * 6.0
-        - distance_to_gate * 0.35
-        + gate_alignment * 0.15
-        - tilt_penalty * 0.05
+        progress_reward
+        - distance_penalty
+        + alignment_reward
+        - tilt_penalty
         + completion_bonus
         - collision_penalty;
     reward_done.values[index].done = state.done;
+    reward_done.values[index].done_reason = done_reason;
     reward_done.values[index]._pad0 = 0u;
-    reward_done.values[index]._pad1 = 0u;
+    reward_done.values[index].progress_reward = progress_reward;
+    reward_done.values[index].distance_penalty = distance_penalty;
+    reward_done.values[index].alignment_reward = alignment_reward;
+    reward_done.values[index].tilt_penalty = tilt_penalty;
+    reward_done.values[index].completion_bonus = completion_bonus;
+    reward_done.values[index].collision_penalty = collision_penalty;
+    reward_done.values[index]._pad1 = 0.0;
+    reward_done.values[index]._pad2 = 0.0;
 }
 "#;
 
@@ -1448,7 +1509,16 @@ pub struct Observation {
 pub struct RewardDone {
     pub reward: f32,
     pub done: u32,
-    pub _pad: [u32; 2],
+    pub done_reason: u32,
+    pub _pad: u32,
+    pub progress_reward: f32,
+    pub distance_penalty: f32,
+    pub alignment_reward: f32,
+    pub tilt_penalty: f32,
+    pub completion_bonus: f32,
+    pub collision_penalty: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
 }
 
 #[repr(C)]

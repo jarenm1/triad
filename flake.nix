@@ -47,6 +47,8 @@
             C_INCLUDE_PATH = "${pkgs.linuxHeaders}/include:${pkgs.glibc.dev}/include";
 
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+              pkgs.zlib
+              pkgs.stdenv.cc.cc.lib
               pkgs.wayland
               pkgs.libdecor
               pkgs.libxkbcommon

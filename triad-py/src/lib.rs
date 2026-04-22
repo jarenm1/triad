@@ -170,6 +170,16 @@ pub struct TriadObservation {
 pub struct TriadRewardDone {
     pub reward: f32,
     pub done: u32,
+    pub done_reason: u32,
+    pub _pad0: u32,
+    pub progress_reward: f32,
+    pub distance_penalty: f32,
+    pub alignment_reward: f32,
+    pub tilt_penalty: f32,
+    pub completion_bonus: f32,
+    pub collision_penalty: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
 }
 
 impl Default for TriadStageDesc {
@@ -425,6 +435,16 @@ fn convert_reward_done(reward_done: &RewardDone) -> TriadRewardDone {
     TriadRewardDone {
         reward: reward_done.reward,
         done: reward_done.done,
+        done_reason: reward_done.done_reason,
+        _pad0: reward_done._pad,
+        progress_reward: reward_done.progress_reward,
+        distance_penalty: reward_done.distance_penalty,
+        alignment_reward: reward_done.alignment_reward,
+        tilt_penalty: reward_done.tilt_penalty,
+        completion_bonus: reward_done.completion_bonus,
+        collision_penalty: reward_done.collision_penalty,
+        _pad1: reward_done._pad1,
+        _pad2: reward_done._pad2,
     }
 }
 

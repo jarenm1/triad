@@ -4,3 +4,5 @@ Version: 0.1.0
 Summary: Python bindings and rollout helpers for Triad simulation
 Requires-Python: >=3.11
 Requires-Dist: numpy>=1.26
+Provides-Extra: training
+Requires-Dist: torch>=2.4; extra == "training"
