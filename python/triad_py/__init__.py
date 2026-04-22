@@ -1180,20 +1180,48 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     benchmark_demo.add_argument("--iterations", type=int, default=10)
     benchmark_demo.add_argument("--warmup", type=int, default=1)
     ppo_train = subparsers.add_parser(
-        "ppo-train", help="Train a minimal PPO teacher on the Triad sim"
+        "ppo-train", help="Train a PPO teacher on the Triad sim"
     )
     ppo_train.add_argument("--env-count", type=int, default=256)
     ppo_train.add_argument("--horizon", type=int, default=128)
     ppo_train.add_argument("--total-updates", type=int, default=500)
     ppo_train.add_argument("--warmup-updates", type=int, default=25)
     ppo_train.add_argument("--learning-rate", type=float, default=3.0e-4)
+    ppo_train.add_argument("--gamma", type=float, default=0.99)
+    ppo_train.add_argument("--gae-lambda", type=float, default=0.95)
+    ppo_train.add_argument("--clip-coef", type=float, default=0.2)
+    ppo_train.add_argument("--value-clip-coef", type=float, default=0.2)
+    ppo_train.add_argument("--value-coef", type=float, default=0.5)
+    ppo_train.add_argument("--entropy-coef", type=float, default=0.001)
+    ppo_train.add_argument("--max-grad-norm", type=float, default=0.5)
     ppo_train.add_argument("--ppo-epochs", type=int, default=4)
     ppo_train.add_argument("--minibatch-size", type=int, default=4096)
+    ppo_train.add_argument("--target-kl", type=float, default=0.015)
     ppo_train.add_argument("--hidden-size", type=int, default=256)
     ppo_train.add_argument("--device", default="auto")
     ppo_train.add_argument("--seed", type=int, default=0)
     ppo_train.add_argument("--log-interval", type=int, default=10)
     ppo_train.add_argument("--checkpoint", default=None)
+    ppo_train.add_argument("--checkpoint-interval", type=int, default=0)
+    ppo_train.add_argument(
+        "--no-lr-anneal", action="store_true", help="Disable learning rate annealing"
+    )
+    ppo_train.add_argument(
+        "--no-advantage-norm",
+        action="store_true",
+        help="Disable advantage normalization",
+    )
+    ppo_train.add_argument(
+        "--no-observation-norm",
+        action="store_true",
+        help="Disable running observation normalization",
+    )
+    ppo_train.add_argument(
+        "--observation-clip",
+        type=float,
+        default=10.0,
+        help="Absolute clip applied after observation normalization",
+    )
     ppo_policy_server = subparsers.add_parser(
         "ppo-policy-server", help="Serve PPO checkpoint actions over stdio"
     )
@@ -1387,13 +1415,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             total_updates=args.total_updates,
             warmup_updates=args.warmup_updates,
             learning_rate=args.learning_rate,
+            anneal_learning_rate=not args.no_lr_anneal,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            clip_coef=args.clip_coef,
+            value_clip_coef=None if args.value_clip_coef <= 0.0 else args.value_clip_coef,
+            value_coef=args.value_coef,
+            entropy_coef=args.entropy_coef,
+            max_grad_norm=args.max_grad_norm,
             ppo_epochs=args.ppo_epochs,
             minibatch_size=args.minibatch_size,
+            normalize_advantages=not args.no_advantage_norm,
+            target_kl=None if args.target_kl <= 0.0 else args.target_kl,
+            normalize_observations=not args.no_observation_norm,
+            observation_clip=args.observation_clip,
             hidden_size=args.hidden_size,
             device=args.device,
             seed=args.seed,
             log_interval=args.log_interval,
             checkpoint_path=args.checkpoint,
+            checkpoint_interval=args.checkpoint_interval,
         )
         result = train_ppo(config)
         _print_json(result.__dict__)

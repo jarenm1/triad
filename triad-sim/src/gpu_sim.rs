@@ -1225,8 +1225,14 @@ fn reset_env(index: u32) {
     }
 
     let first_gate = gates.values[base_slot];
-    let start_position = first_gate.center.xyz - first_gate.forward.xyz * 1.2 + vec3<f32>(0.0, 0.2, 0.0);
     let start_yaw = atan2(first_gate.forward.z, first_gate.forward.x);
+    var start_position =
+        first_gate.center.xyz - first_gate.forward.xyz * 1.2 + vec3<f32>(0.0, 0.2, 0.0);
+    let spawn_floor_clearance =
+        params.min_altitude
+        + drone_support_extent(gate_up_axis(), vec3<f32>(0.0, 0.0, start_yaw))
+        + 0.08;
+    start_position.y = max(start_position.y, spawn_floor_clearance);
     states.values[index].position = vec4<f32>(start_position, 0.0);
     states.values[index].velocity = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     states.values[index].attitude = vec4<f32>(0.0, 0.0, start_yaw, 0.0);
