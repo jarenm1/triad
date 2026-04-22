@@ -17,7 +17,7 @@ use triad_window::{
 
 const WINDOW_TITLE: &str = "Triad Visualizer";
 const GATE_DEPTH_HALF: f32 = 0.015;
-const GATE_THICKNESS_MIN: f32 = 0.0125;
+const GATE_THICKNESS_MIN: f32 = 0.035;
 const DRONE_HALF_EXTENTS: [f32; 3] = [0.08, 0.08, 0.05];
 const TARGET_HALF_EXTENTS: [f32; 3] = [0.05, 0.05, 0.05];
 const VISUALIZER_ENV_COUNT: usize = 128;
@@ -721,7 +721,7 @@ fn gate_bar_instances(gate: Gate) -> [RenderInstance; 4] {
     let hole_half_width = gate.half_extents[0].max(0.1);
     let hole_half_height = gate.half_extents[1].max(0.1);
     let depth_half = gate.half_extents[2].max(GATE_DEPTH_HALF);
-    let thickness = (hole_half_width.min(hole_half_height) * 0.08).max(GATE_THICKNESS_MIN);
+    let thickness = (hole_half_width.min(hole_half_height) * 0.16).max(GATE_THICKNESS_MIN);
     let center = gate.center;
     let gate_color = [0.96, 0.57, 0.14, 1.0];
 
