@@ -70,7 +70,7 @@ struct ResetParams {
     seed: u32,
     grammar_id: u32,
     difficulty: f32,
-    _pad0: u32,
+    curriculum_stage: u32,
 };
 
 struct EnvLayoutHeader {
@@ -462,11 +462,65 @@ fn family_segment_count(grammar_id: u32) -> u32 {
     return 5u;
 }
 
+fn curriculum_family(curriculum_stage: u32, grammar_id: u32) -> u32 {
+    let family = grammar_id % 4u;
+    if (curriculum_stage == 0u) {
+        return family % 2u;
+    }
+    if (curriculum_stage == 1u) {
+        return family % 3u;
+    }
+    if (curriculum_stage == 2u) {
+        return 1u + (family % 3u);
+    }
+    return family;
+}
+
+fn curriculum_length_scale(curriculum_stage: u32) -> f32 {
+    if (curriculum_stage == 0u) {
+        return 1.18;
+    }
+    if (curriculum_stage == 2u) {
+        return 0.92;
+    }
+    if (curriculum_stage == 3u) {
+        return 1.02;
+    }
+    return 1.0;
+}
+
+fn curriculum_vertical_scale(curriculum_stage: u32) -> f32 {
+    if (curriculum_stage == 0u) {
+        return 0.45;
+    }
+    if (curriculum_stage == 1u) {
+        return 0.8;
+    }
+    if (curriculum_stage == 2u) {
+        return 0.95;
+    }
+    return 1.35;
+}
+
+fn curriculum_hole_scale(curriculum_stage: u32) -> f32 {
+    if (curriculum_stage == 0u) {
+        return 1.18;
+    }
+    if (curriculum_stage == 2u) {
+        return 0.94;
+    }
+    if (curriculum_stage == 3u) {
+        return 0.98;
+    }
+    return 1.0;
+}
+
 fn family_segment_length(
     grammar_id: u32,
     segment_index: u32,
     seed: u32,
     difficulty: f32,
+    curriculum_stage: u32,
     path_scale: f32,
 ) -> f32 {
     var base = 8.5;
@@ -519,7 +573,9 @@ fn family_segment_length(
         jitter = 0.75;
     }
     let random = hash_to_unit(seed ^ (grammar_id * 0x9e37u + segment_index * 0x85ebu));
-    return (base + (random - 0.5) * jitter + difficulty * 0.8) * path_scale;
+    return (base + (random - 0.5) * jitter + difficulty * 0.8)
+        * curriculum_length_scale(curriculum_stage)
+        * path_scale;
 }
 
 fn family_turn_radians(grammar_id: u32, segment_index: u32) -> f32 {
@@ -566,7 +622,13 @@ fn family_turn_radians(grammar_id: u32, segment_index: u32) -> f32 {
     return 0.0;
 }
 
-fn path_total_length(grammar_id: u32, seed: u32, difficulty: f32, path_scale: f32) -> f32 {
+fn path_total_length(
+    grammar_id: u32,
+    seed: u32,
+    difficulty: f32,
+    curriculum_stage: u32,
+    path_scale: f32,
+) -> f32 {
     let segment_count = family_segment_count(grammar_id);
     var total = 0.0;
     var segment_index = 0u;
@@ -574,7 +636,14 @@ fn path_total_length(grammar_id: u32, seed: u32, difficulty: f32, path_scale: f3
         if (segment_index >= segment_count) {
             break;
         }
-        total = total + family_segment_length(grammar_id, segment_index, seed, difficulty, path_scale);
+        total = total + family_segment_length(
+            grammar_id,
+            segment_index,
+            seed,
+            difficulty,
+            curriculum_stage,
+            path_scale,
+        );
         segment_index = segment_index + 1u;
     }
     return total;
@@ -590,6 +659,7 @@ fn sample_family_path(
     grammar_id: u32,
     seed: u32,
     difficulty: f32,
+    curriculum_stage: u32,
     course_angle: f32,
     distance_along_path: f32,
     path_scale: f32,
@@ -606,13 +676,30 @@ fn sample_family_path(
         }
 
         let segment_length =
-            family_segment_length(grammar_id, segment_index, seed, difficulty, path_scale);
+            family_segment_length(
+                grammar_id,
+                segment_index,
+                seed,
+                difficulty,
+                curriculum_stage,
+                path_scale,
+            );
         let is_last = segment_index + 1u >= segment_count;
         if (remaining <= segment_length || is_last) {
             let local_distance = min(remaining, segment_length);
             let center_2d = cursor_position + cursor_forward * local_distance;
             let path_progress =
-                distance_along_path / max(path_total_length(grammar_id, seed, difficulty, path_scale), 1.0);
+                distance_along_path
+                / max(
+                    path_total_length(
+                        grammar_id,
+                        seed,
+                        difficulty,
+                        curriculum_stage,
+                        path_scale,
+                    ),
+                    1.0,
+                );
             let phase = hash_to_unit(seed ^ 0x44f1u) * 6.283185307179586;
             var elevation =
                 sin(path_progress * 6.283185307179586 + phase) * (0.18 + difficulty * 0.16)
@@ -629,8 +716,10 @@ fn sample_family_path(
                     exp(-pow((path_progress - 0.45) * 4.0, 2.0)) * (0.32 + difficulty * 0.14);
                 elevation = elevation + hump;
             }
-            let hole_half_width = 0.58 - difficulty * 0.08;
-            let hole_half_height = 0.58 - difficulty * 0.06;
+            elevation = elevation * curriculum_vertical_scale(curriculum_stage);
+            let hole_scale = curriculum_hole_scale(curriculum_stage);
+            let hole_half_width = (0.58 - difficulty * 0.08) * hole_scale;
+            let hole_half_height = (0.58 - difficulty * 0.06) * hole_scale;
             var gate: Gate;
             gate.center = vec4<f32>(center_2d.x, elevation, center_2d.y, 0.0);
             gate.forward = vec4<f32>(cursor_forward.x, 0.0, cursor_forward.y, 0.0);
@@ -695,14 +784,26 @@ fn reset_env(index: u32) {
     let reset = reset_params.values[index];
     let count = generated_gate_count();
     let base_slot = env_gate_offset(index);
-    let family_id = reset.grammar_id % 4u;
+    let family_id = curriculum_family(reset.curriculum_stage, reset.grammar_id);
 
     let course_angle =
         hash_to_unit(reset.seed ^ 0x12345u) * 6.283185307179586
         + f32(family_id) * 0.37;
-    let base_total_path_length = path_total_length(family_id, reset.seed, reset.difficulty, 1.0);
+    let base_total_path_length = path_total_length(
+        family_id,
+        reset.seed,
+        reset.difficulty,
+        reset.curriculum_stage,
+        1.0,
+    );
     let path_scale = family_path_scale(count, reset.difficulty, base_total_path_length);
-    let total_path_length = path_total_length(family_id, reset.seed, reset.difficulty, path_scale);
+    let total_path_length = path_total_length(
+        family_id,
+        reset.seed,
+        reset.difficulty,
+        reset.curriculum_stage,
+        path_scale,
+    );
     let entry_margin = min(1.8, total_path_length * 0.12);
     let exit_margin = min(1.2, total_path_length * 0.08);
     let usable_length = max(total_path_length - entry_margin - exit_margin, 0.5);
@@ -732,6 +833,7 @@ fn reset_env(index: u32) {
             family_id,
             reset.seed,
             reset.difficulty,
+            reset.curriculum_stage,
             course_angle,
             distance_along_path,
             path_scale,
@@ -750,6 +852,7 @@ fn reset_env(index: u32) {
                     family_id,
                     reset.seed,
                     reset.difficulty,
+                    reset.curriculum_stage,
                     course_angle,
                     distance_along_path,
                     path_scale,
@@ -777,6 +880,7 @@ fn reset_env(index: u32) {
                 family_id,
                 reset.seed,
                 reset.difficulty,
+                reset.curriculum_stage,
                 course_angle,
                 adjusted_distance,
                 path_scale,
@@ -1135,17 +1239,17 @@ pub struct ResetParams {
     pub seed: u32,
     pub grammar_id: u32,
     pub difficulty: f32,
-    pub _pad: u32,
+    pub curriculum_stage: u32,
 }
 
 impl ResetParams {
     #[must_use]
-    pub fn new(seed: u32, grammar_id: u32, difficulty: f32) -> Self {
+    pub fn new(seed: u32, grammar_id: u32, difficulty: f32, curriculum_stage: u32) -> Self {
         Self {
             seed,
             grammar_id,
             difficulty,
-            _pad: 0,
+            curriculum_stage,
         }
     }
 }
@@ -1282,7 +1386,7 @@ impl GpuSimulation {
         let reset_params_values: Vec<ResetParams> = (0..config.env_count)
             .map(|env_index| {
                 let env_index = env_index as u32;
-                ResetParams::new(env_index, env_index % 4, 0.35)
+                ResetParams::new(env_index, env_index % 4, 0.35, 1)
             })
             .collect();
         let params = SimParams {

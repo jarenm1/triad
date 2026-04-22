@@ -16,6 +16,10 @@ const STAGE_KIND_INTRO: u32 = 0;
 const STAGE_KIND_STRAIGHT: u32 = 1;
 const STAGE_KIND_OFFSET: u32 = 2;
 const STAGE_KIND_TURN90: u32 = 3;
+const CURRICULUM_STAGE_INTRO: u32 = 0;
+const CURRICULUM_STAGE_ARENA: u32 = 1;
+const CURRICULUM_STAGE_TECHNICAL: u32 = 2;
+const CURRICULUM_STAGE_ELEVATED: u32 = 3;
 const ACTION_STRIDE: usize = 4;
 const OBSERVATION_STRIDE: usize = 22;
 
@@ -106,6 +110,7 @@ pub struct TriadResetParams {
     pub seed: u32,
     pub grammar_id: u32,
     pub difficulty: f32,
+    pub curriculum_stage: u32,
 }
 
 #[repr(C)]
@@ -353,7 +358,14 @@ fn write_flat_actions_into_scratch(
 fn convert_reset_params(reset_params: &[TriadResetParams]) -> Vec<ResetParams> {
     reset_params
         .iter()
-        .map(|params| ResetParams::new(params.seed, params.grammar_id, params.difficulty))
+        .map(|params| {
+            ResetParams::new(
+                params.seed,
+                params.grammar_id,
+                params.difficulty,
+                params.curriculum_stage,
+            )
+        })
         .collect()
 }
 
@@ -1163,4 +1175,28 @@ pub extern "C" fn triad_turn_direction_left() -> u32 {
 pub extern "C" fn triad_turn_direction_right() -> u32 {
     clear_last_error();
     TURN_DIRECTION_RIGHT
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn triad_curriculum_stage_intro() -> u32 {
+    clear_last_error();
+    CURRICULUM_STAGE_INTRO
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn triad_curriculum_stage_arena() -> u32 {
+    clear_last_error();
+    CURRICULUM_STAGE_ARENA
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn triad_curriculum_stage_technical() -> u32 {
+    clear_last_error();
+    CURRICULUM_STAGE_TECHNICAL
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn triad_curriculum_stage_elevated() -> u32 {
+    clear_last_error();
+    CURRICULUM_STAGE_ELEVATED
 }

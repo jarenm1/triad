@@ -160,6 +160,7 @@ struct UiState {
     running: bool,
     selected_env: usize,
     difficulty: f32,
+    curriculum_stage: u32,
     seed_base: u32,
     request_reset_all: bool,
     request_randomize: bool,
@@ -176,6 +177,7 @@ impl Default for UiState {
             running: false,
             selected_env: 0,
             difficulty: 0.35,
+            curriculum_stage: 1,
             seed_base: 1,
             request_reset_all: false,
             request_randomize: false,
@@ -193,6 +195,7 @@ struct UiSnapshot {
     running: bool,
     selected_env: usize,
     difficulty: f32,
+    curriculum_stage: u32,
     seed_base: u32,
     reset_all: bool,
     randomize: bool,
@@ -348,6 +351,7 @@ impl VisualizerManager {
                 .selected_env
                 .min(self.sim.env_count().saturating_sub(1)),
             difficulty: state.difficulty,
+            curriculum_stage: state.curriculum_stage.min(3),
             seed_base: state.seed_base,
             reset_all: state.request_reset_all,
             randomize: state.request_randomize,
@@ -359,14 +363,19 @@ impl VisualizerManager {
         snapshot
     }
 
-    fn randomize_reset_params(&self, base_seed: u32, difficulty: f32) -> Vec<ResetParams> {
+    fn randomize_reset_params(
+        &self,
+        base_seed: u32,
+        difficulty: f32,
+        curriculum_stage: u32,
+    ) -> Vec<ResetParams> {
         (0..self.sim.env_count())
             .map(|env_index| {
                 let env_seed = hash_u32(base_seed ^ (env_index as u32).wrapping_mul(0x9e37_79b9));
                 let grammar_id = env_seed % 4;
                 let difficulty_jitter = hash_to_unit(env_seed ^ 0x85eb_ca6b) * 0.2 - 0.1;
                 let env_difficulty = (difficulty + difficulty_jitter).clamp(0.0, 1.0);
-                ResetParams::new(env_seed, grammar_id, env_difficulty)
+                ResetParams::new(env_seed, grammar_id, env_difficulty, curriculum_stage)
             })
             .collect()
     }
@@ -494,7 +503,11 @@ impl RendererManager for VisualizerManager {
         }
 
         if snapshot.randomize {
-            let params = self.randomize_reset_params(snapshot.seed_base, snapshot.difficulty);
+            let params = self.randomize_reset_params(
+                snapshot.seed_base,
+                snapshot.difficulty,
+                snapshot.curriculum_stage,
+            );
             self.sim.set_reset_params(renderer, registry, &params)?;
             self.sim.reset_all(renderer, registry)?;
             self.sim.step(renderer, registry);
@@ -640,6 +653,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         );
                         panel.add(
                             egui::Slider::new(&mut ui.difficulty, 0.0..=1.0).text("Difficulty"),
+                        );
+                        panel.add(
+                            egui::Slider::new(&mut ui.curriculum_stage, 0..=3).text("Curriculum"),
                         );
 
                         panel.label(format!("Gate Count: {}", ui.gate_count));

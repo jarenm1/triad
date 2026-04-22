@@ -40,6 +40,7 @@ __all__ = [
     "PackedStepResult",
     "RolloutCollector",
     "RolloutBatch",
+    "CurriculumStage",
     "SimulationConfig",
     "SimulationCore",
     "StageKind",
@@ -104,6 +105,13 @@ class TurnDirection(IntEnum):
     RIGHT = _lib.triad_turn_direction_right()
 
 
+class CurriculumStage(IntEnum):
+    INTRO = _lib.triad_curriculum_stage_intro()
+    ARENA = _lib.triad_curriculum_stage_arena()
+    TECHNICAL = _lib.triad_curriculum_stage_technical()
+    ELEVATED = _lib.triad_curriculum_stage_elevated()
+
+
 class _TriadStageDesc(ctypes.Structure):
     _fields_ = [
         ("kind", ctypes.c_uint32),
@@ -153,6 +161,7 @@ class _TriadResetParams(ctypes.Structure):
         ("seed", ctypes.c_uint32),
         ("grammar_id", ctypes.c_uint32),
         ("difficulty", ctypes.c_float),
+        ("curriculum_stage", ctypes.c_uint32),
     ]
 
 
@@ -239,6 +248,14 @@ _lib.triad_course_get_stats.restype = ctypes.c_bool
 _lib.triad_sim_config_default.restype = _TriadSimConfig
 _lib.triad_action_stride.restype = ctypes.c_size_t
 _lib.triad_observation_stride.restype = ctypes.c_size_t
+_lib.triad_curriculum_stage_intro.argtypes = []
+_lib.triad_curriculum_stage_intro.restype = ctypes.c_uint32
+_lib.triad_curriculum_stage_arena.argtypes = []
+_lib.triad_curriculum_stage_arena.restype = ctypes.c_uint32
+_lib.triad_curriculum_stage_technical.argtypes = []
+_lib.triad_curriculum_stage_technical.restype = ctypes.c_uint32
+_lib.triad_curriculum_stage_elevated.argtypes = []
+_lib.triad_curriculum_stage_elevated.restype = ctypes.c_uint32
 
 _lib.triad_simulation_create.argtypes = [_TriadSimConfig]
 _lib.triad_simulation_create.restype = ctypes.c_void_p
@@ -591,16 +608,30 @@ class SimulationCore:
         return self
 
     def set_reset_params(
-        self, reset_params: Sequence[tuple[int, int, float]]
+        self,
+        reset_params: Sequence[tuple[int, int, float] | tuple[int, int, float, int]],
     ) -> "SimulationCore":
-        ffi_params = (_TriadResetParams * len(reset_params))(
-            *(
-                _TriadResetParams(
-                    seed=seed, grammar_id=grammar_id, difficulty=difficulty
+        ffi_values = []
+        for params in reset_params:
+            if len(params) == 3:
+                seed, grammar_id, difficulty = params
+                curriculum_stage = int(CurriculumStage.ARENA)
+            elif len(params) == 4:
+                seed, grammar_id, difficulty, curriculum_stage = params
+            else:
+                raise ValueError(
+                    "reset params must be (seed, grammar_id, difficulty) or "
+                    "(seed, grammar_id, difficulty, curriculum_stage)"
                 )
-                for seed, grammar_id, difficulty in reset_params
+            ffi_values.append(
+                _TriadResetParams(
+                    seed=seed,
+                    grammar_id=grammar_id,
+                    difficulty=difficulty,
+                    curriculum_stage=curriculum_stage,
+                )
             )
-        )
+        ffi_params = (_TriadResetParams * len(reset_params))(*ffi_values)
         _require(
             _lib.triad_simulation_set_reset_params(
                 self._handle, ffi_params, len(reset_params)
