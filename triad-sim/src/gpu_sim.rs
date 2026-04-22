@@ -136,8 +136,8 @@ struct GateBuffer {
     values: array<Gate>,
 };
 
-struct StageBuffer {
-    values: array<StageSpec>,
+struct LayoutHeaderBuffer {
+    values: array<EnvLayoutHeader>,
 };
 
 @group(0) @binding(0) var<storage, read_write> states: EnvStateBuffer;
@@ -149,7 +149,7 @@ struct StageBuffer {
 @group(0) @binding(6) var<storage, read> reset_params: ResetParamsBuffer;
 @group(0) @binding(7) var<storage, read_write> gates: GateBuffer;
 @group(0) @binding(8) var<uniform> course_header: CourseHeader;
-@group(0) @binding(9) var<storage, read> course_stages: StageBuffer;
+@group(0) @binding(9) var<storage, read_write> layout_headers: LayoutHeaderBuffer;
 
 fn hash_to_unit(seed: u32) -> f32 {
     let mixed = seed * 747796405u + 2891336453u;
@@ -284,8 +284,8 @@ fn stage_direction(stage: StageSpec) -> f32 {
     return select(-1.0, 1.0, stage.flags != 0u);
 }
 
-fn generated_gate_count() -> u32 {
-    return min(course_header.total_gate_count, params.max_gates_per_env);
+fn configured_gate_count(index: u32) -> u32 {
+    return min(layout_headers.values[index].gate_count, params.max_gates_per_env);
 }
 
 fn generated_obstacle_count() -> u32 {
@@ -293,7 +293,7 @@ fn generated_obstacle_count() -> u32 {
 }
 
 fn env_gate_offset(index: u32) -> u32 {
-    return index * params.max_gates_per_env;
+    return layout_headers.values[index].gate_offset;
 }
 
 fn gate_from_stage(
@@ -449,15 +449,18 @@ fn obstacle_collision(obstacle: Gate, position: vec3<f32>) -> bool {
     return dot(delta, delta) <= params.drone_radius * params.drone_radius;
 }
 
-fn family_segment_count(grammar_id: u32) -> u32 {
-    if (grammar_id == 1u) {
+fn family_segment_count(curriculum_stage: u32, grammar_id: u32) -> u32 {
+    if (curriculum_stage == 0u) {
+        return 3u;
+    }
+    if (curriculum_stage == 1u) {
         return 4u;
     }
-    if (grammar_id == 2u) {
+    if (curriculum_stage == 2u) {
+        if (grammar_id == 3u) {
+            return 5u;
+        }
         return 4u;
-    }
-    if (grammar_id == 3u) {
-        return 5u;
     }
     return 5u;
 }
@@ -470,47 +473,44 @@ fn curriculum_family(curriculum_stage: u32, grammar_id: u32) -> u32 {
     if (curriculum_stage == 1u) {
         return family % 3u;
     }
-    if (curriculum_stage == 2u) {
-        return 1u + (family % 3u);
-    }
     return family;
 }
 
 fn curriculum_length_scale(curriculum_stage: u32) -> f32 {
     if (curriculum_stage == 0u) {
-        return 1.18;
+        return 1.22;
+    }
+    if (curriculum_stage == 1u) {
+        return 1.08;
     }
     if (curriculum_stage == 2u) {
-        return 0.92;
+        return 1.0;
     }
-    if (curriculum_stage == 3u) {
-        return 1.02;
-    }
-    return 1.0;
+    return 1.14;
 }
 
 fn curriculum_vertical_scale(curriculum_stage: u32) -> f32 {
     if (curriculum_stage == 0u) {
-        return 0.45;
+        return 0.12;
     }
     if (curriculum_stage == 1u) {
-        return 0.8;
+        return 0.3;
     }
     if (curriculum_stage == 2u) {
-        return 0.95;
+        return 0.85;
     }
     return 1.35;
 }
 
 fn curriculum_hole_scale(curriculum_stage: u32) -> f32 {
     if (curriculum_stage == 0u) {
-        return 1.18;
+        return 1.25;
     }
-    if (curriculum_stage == 2u) {
-        return 0.94;
+    if (curriculum_stage == 1u) {
+        return 1.12;
     }
     if (curriculum_stage == 3u) {
-        return 0.98;
+        return 0.92;
     }
     return 1.0;
 }
@@ -523,54 +523,149 @@ fn family_segment_length(
     curriculum_stage: u32,
     path_scale: f32,
 ) -> f32 {
-    var base = 8.5;
-    var jitter = 1.1;
-    if (grammar_id == 0u) {
+    var base = 8.0;
+    var jitter = 0.9;
+    if (curriculum_stage == 0u) {
         if (segment_index == 0u) {
-            base = 10.5;
+            base = 11.5;
         } else if (segment_index == 1u) {
-            base = 7.8;
-        } else if (segment_index == 2u) {
-            base = 9.6;
-        } else if (segment_index == 3u) {
-            base = 7.2;
+            base = 10.4;
         } else {
-            base = 8.9;
+            base = 9.1;
         }
-    } else if (grammar_id == 1u) {
-        if (segment_index == 0u) {
-            base = 9.2;
-        } else if (segment_index == 1u) {
-            base = 8.6;
-        } else if (segment_index == 2u) {
-            base = 8.2;
+        jitter = 0.45;
+    } else if (curriculum_stage == 1u) {
+        if (grammar_id == 0u) {
+            if (segment_index == 0u) {
+                base = 10.8;
+            } else if (segment_index == 1u) {
+                base = 8.6;
+            } else if (segment_index == 2u) {
+                base = 9.4;
+            } else {
+                base = 7.8;
+            }
+        } else if (grammar_id == 1u) {
+            if (segment_index == 0u) {
+                base = 9.8;
+            } else if (segment_index == 1u) {
+                base = 8.4;
+            } else if (segment_index == 2u) {
+                base = 8.8;
+            } else {
+                base = 8.1;
+            }
         } else {
-            base = 7.4;
-        }
-    } else if (grammar_id == 2u) {
-        if (segment_index == 0u) {
-            base = 12.8;
-        } else if (segment_index == 1u) {
-            base = 5.4;
-        } else if (segment_index == 2u) {
-            base = 11.6;
-        } else {
-            base = 6.1;
+            if (segment_index == 0u) {
+                base = 10.1;
+            } else if (segment_index == 1u) {
+                base = 7.9;
+            } else if (segment_index == 2u) {
+                base = 9.1;
+            } else {
+                base = 7.4;
+            }
         }
         jitter = 0.7;
-    } else {
-        if (segment_index == 0u) {
-            base = 9.6;
-        } else if (segment_index == 1u) {
-            base = 5.3;
-        } else if (segment_index == 2u) {
-            base = 5.1;
-        } else if (segment_index == 3u) {
-            base = 9.1;
+    } else if (curriculum_stage == 2u) {
+        if (grammar_id == 0u) {
+            if (segment_index == 0u) {
+                base = 10.5;
+            } else if (segment_index == 1u) {
+                base = 7.8;
+            } else if (segment_index == 2u) {
+                base = 9.6;
+            } else if (segment_index == 3u) {
+                base = 7.2;
+            } else {
+                base = 8.9;
+            }
+        } else if (grammar_id == 1u) {
+            if (segment_index == 0u) {
+                base = 9.2;
+            } else if (segment_index == 1u) {
+                base = 8.6;
+            } else if (segment_index == 2u) {
+                base = 8.2;
+            } else {
+                base = 7.4;
+            }
+        } else if (grammar_id == 2u) {
+            if (segment_index == 0u) {
+                base = 12.8;
+            } else if (segment_index == 1u) {
+                base = 5.4;
+            } else if (segment_index == 2u) {
+                base = 11.6;
+            } else {
+                base = 6.1;
+            }
+            jitter = 0.7;
         } else {
-            base = 8.4;
+            if (segment_index == 0u) {
+                base = 9.6;
+            } else if (segment_index == 1u) {
+                base = 5.3;
+            } else if (segment_index == 2u) {
+                base = 5.1;
+            } else if (segment_index == 3u) {
+                base = 9.1;
+            } else {
+                base = 8.4;
+            }
+            jitter = 0.75;
         }
-        jitter = 0.75;
+    } else {
+        if (grammar_id == 0u) {
+            if (segment_index == 0u) {
+                base = 11.4;
+            } else if (segment_index == 1u) {
+                base = 7.0;
+            } else if (segment_index == 2u) {
+                base = 10.2;
+            } else if (segment_index == 3u) {
+                base = 6.8;
+            } else {
+                base = 9.4;
+            }
+        } else if (grammar_id == 1u) {
+            if (segment_index == 0u) {
+                base = 8.8;
+            } else if (segment_index == 1u) {
+                base = 8.1;
+            } else if (segment_index == 2u) {
+                base = 7.6;
+            } else if (segment_index == 3u) {
+                base = 7.4;
+            } else {
+                base = 8.0;
+            }
+        } else if (grammar_id == 2u) {
+            if (segment_index == 0u) {
+                base = 13.4;
+            } else if (segment_index == 1u) {
+                base = 4.6;
+            } else if (segment_index == 2u) {
+                base = 12.4;
+            } else if (segment_index == 3u) {
+                base = 4.8;
+            } else {
+                base = 10.2;
+            }
+        } else {
+            if (segment_index == 0u) {
+                base = 9.8;
+            } else if (segment_index == 1u) {
+                base = 5.0;
+            } else if (segment_index == 2u) {
+                base = 5.2;
+            } else if (segment_index == 3u) {
+                base = 9.3;
+            } else {
+                base = 7.6;
+            }
+        }
+        jitter = 0.95;
     }
     let random = hash_to_unit(seed ^ (grammar_id * 0x9e37u + segment_index * 0x85ebu));
     return (base + (random - 0.5) * jitter + difficulty * 0.8)
@@ -578,8 +673,104 @@ fn family_segment_length(
         * path_scale;
 }
 
-fn family_turn_radians(grammar_id: u32, segment_index: u32) -> f32 {
+fn family_turn_radians(curriculum_stage: u32, grammar_id: u32, segment_index: u32) -> f32 {
     let quarter_turn = 1.5707963267948966;
+    if (curriculum_stage == 0u) {
+        if (grammar_id == 0u) {
+            if (segment_index == 0u) {
+                return 0.18;
+            }
+            if (segment_index == 1u) {
+                return -0.14;
+            }
+            return 0.0;
+        }
+        if (segment_index == 0u) {
+            return -0.16;
+        }
+        if (segment_index == 1u) {
+            return 0.12;
+        }
+        return 0.0;
+    }
+    if (curriculum_stage == 1u) {
+        if (grammar_id == 0u) {
+            if (segment_index == 0u) {
+                return 0.34;
+            }
+            if (segment_index == 1u) {
+                return -0.28;
+            }
+            if (segment_index == 2u) {
+                return 0.18;
+            }
+            return 0.0;
+        }
+        if (grammar_id == 1u) {
+            if (segment_index == 0u) {
+                return -0.32;
+            }
+            if (segment_index == 1u) {
+                return 0.26;
+            }
+            if (segment_index == 2u) {
+                return -0.18;
+            }
+            return 0.0;
+        }
+        if (segment_index == 0u) {
+            return 0.22;
+        }
+        if (segment_index == 1u) {
+            return 0.0;
+        }
+        if (segment_index == 2u) {
+            return -0.24;
+        }
+        return 0.0;
+    }
+    if (curriculum_stage == 2u) {
+        if (grammar_id == 0u) {
+            if (segment_index == 0u) {
+                return quarter_turn;
+            }
+            if (segment_index == 1u) {
+                return -quarter_turn;
+            }
+            if (segment_index == 2u) {
+                return -quarter_turn;
+            }
+            if (segment_index == 3u) {
+                return quarter_turn;
+            }
+            return quarter_turn;
+        }
+        if (grammar_id == 1u) {
+            if (segment_index < 3u) {
+                return quarter_turn;
+            }
+            return 0.0;
+        }
+        if (grammar_id == 2u) {
+            if (segment_index < 3u) {
+                return quarter_turn;
+            }
+            return 0.0;
+        }
+        if (segment_index == 0u) {
+            return -quarter_turn;
+        }
+        if (segment_index == 1u) {
+            return quarter_turn;
+        }
+        if (segment_index == 2u) {
+            return quarter_turn;
+        }
+        if (segment_index == 3u) {
+            return -quarter_turn;
+        }
+        return 0.0;
+    }
     if (grammar_id == 0u) {
         if (segment_index == 0u) {
             return quarter_turn;
@@ -588,24 +779,33 @@ fn family_turn_radians(grammar_id: u32, segment_index: u32) -> f32 {
             return -quarter_turn;
         }
         if (segment_index == 2u) {
-            return -quarter_turn;
+            return quarter_turn;
         }
         if (segment_index == 3u) {
-            return quarter_turn;
+            return -quarter_turn;
         }
         return quarter_turn;
     }
     if (grammar_id == 1u) {
-        if (segment_index < 3u) {
+        if (segment_index < 4u) {
             return quarter_turn;
         }
         return 0.0;
     }
     if (grammar_id == 2u) {
-        if (segment_index < 3u) {
+        if (segment_index == 0u) {
             return quarter_turn;
         }
-        return 0.0;
+        if (segment_index == 1u) {
+            return quarter_turn;
+        }
+        if (segment_index == 2u) {
+            return -quarter_turn;
+        }
+        if (segment_index == 3u) {
+            return -quarter_turn;
+        }
+        return quarter_turn;
     }
     if (segment_index == 0u) {
         return -quarter_turn;
@@ -629,7 +829,7 @@ fn path_total_length(
     curriculum_stage: u32,
     path_scale: f32,
 ) -> f32 {
-    let segment_count = family_segment_count(grammar_id);
+    let segment_count = family_segment_count(curriculum_stage, grammar_id);
     var total = 0.0;
     var segment_index = 0u;
     loop {
@@ -664,7 +864,7 @@ fn sample_family_path(
     distance_along_path: f32,
     path_scale: f32,
 ) -> Gate {
-    let segment_count = family_segment_count(grammar_id);
+    let segment_count = family_segment_count(curriculum_stage, grammar_id);
     var remaining = distance_along_path;
     var cursor_position = vec2<f32>(0.0, 0.0);
     var cursor_forward = rotate_vec2(vec2<f32>(1.0, 0.0), course_angle);
@@ -736,7 +936,7 @@ fn sample_family_path(
         cursor_position = cursor_position + cursor_forward * segment_length;
         cursor_forward = normalize(rotate_vec2(
             cursor_forward,
-            family_turn_radians(grammar_id, segment_index),
+            family_turn_radians(curriculum_stage, grammar_id, segment_index),
         ));
         segment_index = segment_index + 1u;
     }
@@ -761,7 +961,7 @@ fn minimum_previous_gate_exit_distance(previous_gate: Gate) -> f32 {
 }
 
 fn previous_target_gate(index: u32, current_gate: u32, current_lap: u32) -> Gate {
-    let gate_count = max(generated_gate_count(), 1u);
+    let gate_count = max(configured_gate_count(index), 1u);
     if (current_gate > 0u) {
         return gates.values[env_gate_offset(index) + current_gate - 1u];
     }
@@ -780,11 +980,29 @@ fn has_cleared_previous_gate_zone(index: u32, state: EnvState, position: vec3<f3
         >= minimum_previous_gate_exit_distance(previous_gate);
 }
 
+fn curriculum_gate_count(curriculum_stage: u32, base_gate_count: u32) -> u32 {
+    if (curriculum_stage == 0u) {
+        return clamp(base_gate_count / 2u, 5u, 7u);
+    }
+    if (curriculum_stage == 1u) {
+        return clamp((base_gate_count * 2u) / 3u, 7u, 9u);
+    }
+    if (curriculum_stage == 2u) {
+        return max(select(0u, base_gate_count - 2u, base_gate_count >= 2u), 8u);
+    }
+    return base_gate_count;
+}
+
 fn reset_env(index: u32) {
     let reset = reset_params.values[index];
-    let count = generated_gate_count();
+    let count = curriculum_gate_count(
+        reset.curriculum_stage,
+        min(course_header.total_gate_count, params.max_gates_per_env),
+    );
     let base_slot = env_gate_offset(index);
     let family_id = curriculum_family(reset.curriculum_stage, reset.grammar_id);
+    layout_headers.values[index].gate_count = count;
+    layout_headers.values[index].obstacle_count = 0u;
 
     let course_angle =
         hash_to_unit(reset.seed ^ 0x12345u) * 6.283185307179586
@@ -989,7 +1207,7 @@ fn reset_env(index: u32) {
 }
 
 fn current_target_gate(index: u32, current_gate: u32) -> Gate {
-    let safe_count = max(generated_gate_count(), 1u);
+    let safe_count = max(configured_gate_count(index), 1u);
     let safe_gate = min(current_gate, safe_count - 1u);
     return gates.values[env_gate_offset(index) + safe_gate];
 }
@@ -1026,10 +1244,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         observations.values[index].target_gate_position = target_gate.center;
         observations.values[index].target_gate_forward_progress = vec4<f32>(
             target_forward,
-            progress_value(state.current_lap, state.current_gate, generated_gate_count()),
+            progress_value(state.current_lap, state.current_gate, configured_gate_count(index)),
         );
         observations.values[index].metrics = vec4<f32>(
-            progress_value(state.current_lap, state.current_gate, generated_gate_count()),
+            progress_value(state.current_lap, state.current_gate, configured_gate_count(index)),
             distance_to_gate,
             gate_alignment,
             dot(state.motor_thrust, vec4<f32>(0.25)),
@@ -1080,7 +1298,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     state.position = vec4<f32>(state.position.xyz + state.velocity.xyz * params.dt_seconds, 0.0);
     state.step_count = state.step_count + 1u;
 
-    let gate_count = generated_gate_count();
+    let gate_count = configured_gate_count(index);
     let target_position = target_gate.center.xyz;
     var target_forward = normalize(target_gate.forward.xyz);
     var delta = target_position - state.position.xyz;
@@ -1587,8 +1805,8 @@ impl GpuSimulation {
             .buffer_stage(
                 9,
                 ShaderStage::Compute,
-                course_stages.handle(),
-                BindingType::StorageRead,
+                layout_headers.handle(),
+                BindingType::StorageWrite,
             )
             .build(registry)?;
 
@@ -1624,7 +1842,7 @@ impl GpuSimulation {
             reset_params.handle(),
             gates.handle(),
             course_header.handle(),
-            course_stages.handle(),
+            layout_headers.handle(),
             dispatch_count,
         )?;
 
@@ -1936,7 +2154,7 @@ fn build_step_graph(
     reset_params: triad_gpu::Handle<wgpu::Buffer>,
     gates: triad_gpu::Handle<wgpu::Buffer>,
     course_header: triad_gpu::Handle<wgpu::Buffer>,
-    course_stages: triad_gpu::Handle<wgpu::Buffer>,
+    layout_headers: triad_gpu::Handle<wgpu::Buffer>,
     dispatch_x: u32,
 ) -> Result<ExecutableFrameGraph> {
     let pass = ComputePassBuilder::new("GpuSimulationStep")
@@ -1949,7 +2167,7 @@ fn build_step_graph(
         .read(reset_params)
         .write(gates)
         .read(course_header)
-        .read(course_stages)
+        .read_write(layout_headers)
         .with_pipeline(pipeline)
         .with_bind_group(0, bind_group)
         .dispatch(dispatch_x, 1, 1)

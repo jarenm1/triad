@@ -218,6 +218,8 @@ struct VisualizerManager {
     instances: Vec<RenderInstance>,
     selected_env: usize,
     layouts_dirty: bool,
+    applied_difficulty: f32,
+    applied_curriculum_stage: u32,
 }
 
 impl VisualizerManager {
@@ -340,6 +342,8 @@ impl VisualizerManager {
             instances: hidden_instances,
             selected_env: 0,
             layouts_dirty: true,
+            applied_difficulty: 0.35,
+            applied_curriculum_stage: 1,
         })
     }
 
@@ -495,6 +499,8 @@ impl RendererManager for VisualizerManager {
 
         let snapshot = self.snapshot_ui();
         self.selected_env = snapshot.selected_env;
+        let generation_changed = (snapshot.difficulty - self.applied_difficulty).abs() > 1e-5
+            || snapshot.curriculum_stage != self.applied_curriculum_stage;
 
         let mut forced_reset_step = false;
         if self.layouts_dirty {
@@ -502,7 +508,7 @@ impl RendererManager for VisualizerManager {
             forced_reset_step = true;
         }
 
-        if snapshot.randomize {
+        if snapshot.randomize || generation_changed {
             let params = self.randomize_reset_params(
                 snapshot.seed_base,
                 snapshot.difficulty,
@@ -513,7 +519,15 @@ impl RendererManager for VisualizerManager {
             self.sim.step(renderer, registry);
             self.layouts_dirty = true;
             forced_reset_step = true;
+            self.applied_difficulty = snapshot.difficulty;
+            self.applied_curriculum_stage = snapshot.curriculum_stage;
         } else if snapshot.reset_all {
+            let params = self.randomize_reset_params(
+                snapshot.seed_base,
+                snapshot.difficulty,
+                snapshot.curriculum_stage,
+            );
+            self.sim.set_reset_params(renderer, registry, &params)?;
             self.sim.reset_all(renderer, registry)?;
             self.sim.step(renderer, registry);
             self.layouts_dirty = true;
