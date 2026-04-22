@@ -9,7 +9,7 @@ use triad_gpu::{
 };
 use triad_sim::{
     Action, CourseSpec, EnvLayoutHeader, EnvState, Gate, GpuSimulation, GpuSimulationConfig,
-    ResetParams, StageSpec, TurnDirection,
+    ResetParams,
 };
 use triad_window::{
     CameraPose, CameraUniforms, RendererManager, WindowConfig, egui, run_with_renderer_config,
@@ -432,6 +432,19 @@ impl VisualizerManager {
             }
         }
 
+        for obstacle_index in 0..layout.obstacle_count as usize {
+            if let Some(obstacle) = self
+                .cached_gates
+                .get((layout.obstacle_offset as usize) + obstacle_index)
+                .copied()
+            {
+                if let Some(slot) = self.instances.get_mut(write_index) {
+                    *slot = obstacle_instance(obstacle);
+                    write_index += 1;
+                }
+            }
+        }
+
         if let Some(state) = selected_state {
             let target_gate = self.target_gate(&state);
             if let Some(slot) = self.instances.get_mut(write_index) {
@@ -660,7 +673,7 @@ fn init_logging() {
 }
 
 fn visible_instance_capacity(max_gates_per_env: usize) -> usize {
-    max_gates_per_env * 4 + 2
+    max_gates_per_env * 4 + max_obstacles_per_env(max_gates_per_env) + 2
 }
 
 fn required_gate_capacity(course: &CourseSpec) -> usize {
@@ -668,84 +681,97 @@ fn required_gate_capacity(course: &CourseSpec) -> usize {
 }
 
 fn visualizer_course() -> CourseSpec {
-    CourseSpec::new("basic-lap")
-        .with_loop_enabled(true)
-        .with_laps_required(1)
-        .with_stage(StageSpec::intro(4, 1.6).with_vertical_amp(0.15))
-        .with_stage(StageSpec::offset(5, 1.9, 0.8).with_vertical_amp(0.35))
-        .with_stage(StageSpec::turn90(3, 2.6, TurnDirection::Left).with_vertical_amp(0.5))
-        .with_stage(StageSpec::straight(4, 2.2).with_vertical_amp(0.25))
-        .with_stage(StageSpec::turn90(3, 2.6, TurnDirection::Left).with_vertical_amp(0.6))
-        .with_stage(StageSpec::offset(5, 1.9, 1.0).with_vertical_amp(0.4))
-        .with_stage(StageSpec::turn90(3, 2.6, TurnDirection::Left).with_vertical_amp(0.55))
-        .with_stage(StageSpec::straight(4, 2.2).with_vertical_amp(0.2))
-        .with_stage(StageSpec::turn90(3, 2.6, TurnDirection::Left).with_vertical_amp(0.3))
+    CourseSpec::default_drone_course()
 }
 
 fn gate_bar_instances(gate: Gate) -> [RenderInstance; 4] {
     let forward = normalized_xz(gate.forward).unwrap_or([0.0, 0.0, 1.0]);
     let right = [forward[2], 0.0, -forward[0]];
     let up = [0.0, 1.0, 0.0];
-    let hole_half_x = gate.half_extents[0].max(0.05);
-    let hole_half_z = gate.half_extents[1].max(0.05);
-    let thickness = (hole_half_x.min(hole_half_z) * 0.08).max(GATE_THICKNESS_MIN);
+    let hole_half_width = gate.half_extents[0].max(0.1);
+    let hole_half_height = gate.half_extents[1].max(0.1);
+    let depth_half = gate.half_extents[2].max(GATE_DEPTH_HALF);
+    let thickness = (hole_half_width.min(hole_half_height) * 0.08).max(GATE_THICKNESS_MIN);
     let center = gate.center;
     let gate_color = [0.96, 0.57, 0.14, 1.0];
 
     [
         RenderInstance::oriented_box(
             [
-                center[0] - right[0] * (hole_half_x + thickness),
-                center[1] - right[1] * (hole_half_x + thickness),
-                center[2],
+                center[0] - right[0] * (hole_half_width + thickness),
+                center[1],
+                center[2] - right[2] * (hole_half_width + thickness),
             ],
             right,
             forward,
             up,
-            [thickness, GATE_DEPTH_HALF, hole_half_z + 2.0 * thickness],
+            [thickness, depth_half, hole_half_height + 2.0 * thickness],
             gate_color,
         ),
         RenderInstance::oriented_box(
             [
-                center[0] + right[0] * (hole_half_x + thickness),
-                center[1] + right[1] * (hole_half_x + thickness),
+                center[0] + right[0] * (hole_half_width + thickness),
+                center[1],
+                center[2] + right[2] * (hole_half_width + thickness),
+            ],
+            right,
+            forward,
+            up,
+            [thickness, depth_half, hole_half_height + 2.0 * thickness],
+            gate_color,
+        ),
+        RenderInstance::oriented_box(
+            [
+                center[0],
+                center[1] + hole_half_height + thickness,
                 center[2],
             ],
             right,
             forward,
             up,
-            [thickness, GATE_DEPTH_HALF, hole_half_z + 2.0 * thickness],
+            [hole_half_width + 2.0 * thickness, depth_half, thickness],
             gate_color,
         ),
         RenderInstance::oriented_box(
-            [center[0], center[1] + hole_half_z + thickness, center[2]],
+            [
+                center[0],
+                center[1] - hole_half_height - thickness,
+                center[2],
+            ],
             right,
             forward,
             up,
-            [hole_half_x + 2.0 * thickness, GATE_DEPTH_HALF, thickness],
-            gate_color,
-        ),
-        RenderInstance::oriented_box(
-            [center[0], center[1] - hole_half_z - thickness, center[2]],
-            right,
-            forward,
-            up,
-            [hole_half_x + 2.0 * thickness, GATE_DEPTH_HALF, thickness],
+            [hole_half_width + 2.0 * thickness, depth_half, thickness],
             gate_color,
         ),
     ]
 }
 
-fn drone_instance(state: EnvState, target_gate: Option<Gate>) -> RenderInstance {
+fn obstacle_instance(obstacle: Gate) -> RenderInstance {
+    let forward = normalized_xz(obstacle.forward).unwrap_or([0.0, 0.0, 1.0]);
+    let right = [forward[2], 0.0, -forward[0]];
+    let up = [0.0, 1.0, 0.0];
+    RenderInstance::oriented_box(
+        obstacle.center,
+        right,
+        forward,
+        up,
+        [
+            obstacle.half_extents[0].max(0.05),
+            obstacle.half_extents[2].max(0.05),
+            obstacle.half_extents[1].max(0.05),
+        ],
+        [0.18, 0.74, 0.68, 1.0],
+    )
+}
+
+fn drone_instance(state: EnvState, _target_gate: Option<Gate>) -> RenderInstance {
     let yaw = state.attitude[2];
     let forward = [yaw.cos(), 0.0, yaw.sin()];
     let right = [forward[2], 0.0, -forward[0]];
     let up = [0.0, 1.0, 0.0];
-    let height = target_gate
-        .map(|gate| gate.center[1])
-        .unwrap_or(state.position[1]);
     RenderInstance::oriented_box(
-        [state.position[0], height, state.position[2]],
+        [state.position[0], state.position[1], state.position[2]],
         right,
         forward,
         up,
@@ -816,4 +842,8 @@ fn hash_u32(mut value: u32) -> u32 {
 
 fn hash_to_unit(value: u32) -> f32 {
     (hash_u32(value) & 0x00ff_ffff) as f32 / 16_777_215.0
+}
+
+fn max_obstacles_per_env(max_gates_per_env: usize) -> usize {
+    max_gates_per_env.saturating_div(2).max(1)
 }

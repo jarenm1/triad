@@ -57,8 +57,8 @@ impl StageSpec {
             turn_degrees: 0.0,
             radius: 0.0,
             vertical_amp: 0.0,
-            hole_half_width: 0.14,
-            hole_half_height: 0.14,
+            hole_half_width: 0.6,
+            hole_half_height: 0.6,
             direction: TurnDirection::Left,
         }
     }
@@ -90,8 +90,8 @@ impl StageSpec {
             turn_degrees: 90.0,
             radius,
             vertical_amp: 0.0,
-            hole_half_width: 0.14,
-            hole_half_height: 0.14,
+            hole_half_width: 0.6,
+            hole_half_height: 0.6,
             direction,
         }
     }
@@ -166,15 +166,15 @@ impl CourseSpec {
             loop_enabled: true,
             laps_required: 1,
             stages: vec![
-                StageSpec::intro(4, 1.6),
-                StageSpec::offset(5, 1.9, 0.75),
-                StageSpec::turn90(3, 2.5, TurnDirection::Left),
-                StageSpec::straight(4, 2.1),
-                StageSpec::turn90(3, 2.5, TurnDirection::Left),
-                StageSpec::offset(5, 1.9, 0.95),
-                StageSpec::turn90(3, 2.5, TurnDirection::Left),
-                StageSpec::straight(4, 2.1),
-                StageSpec::turn90(3, 2.5, TurnDirection::Left),
+                StageSpec::intro(1, 3.2).with_vertical_amp(0.08),
+                StageSpec::straight(2, 4.8).with_vertical_amp(0.12),
+                StageSpec::turn90(1, 4.8, TurnDirection::Left).with_vertical_amp(0.22),
+                StageSpec::straight(2, 5.1).with_vertical_amp(0.18),
+                StageSpec::offset(2, 4.4, 1.5).with_vertical_amp(0.3),
+                StageSpec::turn90(1, 4.5, TurnDirection::Right).with_vertical_amp(0.38),
+                StageSpec::straight(2, 5.0).with_vertical_amp(0.28),
+                StageSpec::turn90(1, 4.7, TurnDirection::Right).with_vertical_amp(0.2),
+                StageSpec::straight(2, 4.6).with_vertical_amp(0.14),
             ],
         }
     }

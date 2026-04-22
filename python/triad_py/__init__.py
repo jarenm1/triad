@@ -946,79 +946,83 @@ def build_basic_lap_course() -> CourseSpec:
         CourseSpec("basic-lap")
         .set_loop_enabled(True)
         .set_laps_required(1)
-        .add_stage(StageSpec.intro(4, 1.6))
         .add_stage(
             StageSpec(
-                kind=StageKind.OFFSET,
-                gate_count=5,
-                spacing=1.9,
-                lateral_amp=0.8,
-                vertical_amp=0.35,
+                kind=StageKind.INTRO,
+                gate_count=1,
+                spacing=3.2,
+                vertical_amp=0.08,
+            )
+        )
+        .add_stage(
+            StageSpec(
+                kind=StageKind.STRAIGHT,
+                gate_count=2,
+                spacing=4.8,
+                vertical_amp=0.12,
             )
         )
         .add_stage(
             StageSpec(
                 kind=StageKind.TURN90,
-                gate_count=3,
+                gate_count=1,
                 turn_degrees=90.0,
-                radius=2.6,
-                vertical_amp=0.5,
+                radius=4.8,
+                vertical_amp=0.22,
                 direction=TurnDirection.LEFT,
             )
         )
         .add_stage(
             StageSpec(
                 kind=StageKind.STRAIGHT,
-                gate_count=4,
-                spacing=2.2,
-                vertical_amp=0.25,
-            )
-        )
-        .add_stage(
-            StageSpec(
-                kind=StageKind.TURN90,
-                gate_count=3,
-                turn_degrees=90.0,
-                radius=2.6,
-                vertical_amp=0.6,
-                direction=TurnDirection.LEFT,
+                gate_count=2,
+                spacing=5.1,
+                vertical_amp=0.18,
             )
         )
         .add_stage(
             StageSpec(
                 kind=StageKind.OFFSET,
-                gate_count=5,
-                spacing=1.9,
-                lateral_amp=1.0,
-                vertical_amp=0.4,
-            )
-        )
-        .add_stage(
-            StageSpec(
-                kind=StageKind.TURN90,
-                gate_count=3,
-                turn_degrees=90.0,
-                radius=2.6,
-                vertical_amp=0.55,
-                direction=TurnDirection.LEFT,
-            )
-        )
-        .add_stage(
-            StageSpec(
-                kind=StageKind.STRAIGHT,
-                gate_count=4,
-                spacing=2.2,
-                vertical_amp=0.2,
-            )
-        )
-        .add_stage(
-            StageSpec(
-                kind=StageKind.TURN90,
-                gate_count=3,
-                turn_degrees=90.0,
-                radius=2.6,
+                gate_count=2,
+                spacing=4.4,
+                lateral_amp=1.5,
                 vertical_amp=0.3,
-                direction=TurnDirection.LEFT,
+            )
+        )
+        .add_stage(
+            StageSpec(
+                kind=StageKind.TURN90,
+                gate_count=1,
+                turn_degrees=90.0,
+                radius=4.5,
+                vertical_amp=0.38,
+                direction=TurnDirection.RIGHT,
+            )
+        )
+        .add_stage(
+            StageSpec(
+                kind=StageKind.STRAIGHT,
+                gate_count=2,
+                spacing=5.0,
+                vertical_amp=0.28,
+            )
+        )
+        .add_stage(
+            StageSpec(
+                kind=StageKind.TURN90,
+                gate_count=1,
+                turn_degrees=90.0,
+                radius=4.7,
+                vertical_amp=0.2,
+                direction=TurnDirection.RIGHT,
+            )
+        )
+        .add_stage(
+            StageSpec(
+                kind=StageKind.STRAIGHT,
+                gate_count=2,
+                spacing=4.6,
+                vertical_amp=0.14,
             )
         )
     )

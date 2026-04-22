@@ -56,10 +56,14 @@ struct SimParams {
     linear_drag: f32,
     angular_drag: f32,
     motor_response: f32,
+    drone_radius: f32,
+    gate_frame_thickness: f32,
+    gate_depth_half: f32,
+    collision_penalty: f32,
     env_count: u32,
     max_steps: u32,
     max_gates_per_env: u32,
-    _pad0: u32,
+    max_obstacles_per_env: u32,
 };
 
 struct ResetParams {
@@ -201,12 +205,91 @@ fn gate_slot(env_index: u32, gate_index: u32) -> u32 {
     return env_index * params.max_gates_per_env + gate_index;
 }
 
+fn env_obstacle_offset(index: u32) -> u32 {
+    return params.env_count * params.max_gates_per_env + index * params.max_obstacles_per_env;
+}
+
+fn obstacle_slot(env_index: u32, obstacle_index: u32) -> u32 {
+    return env_obstacle_offset(env_index) + obstacle_index;
+}
+
+fn family_spacing_scale(grammar_id: u32) -> f32 {
+    if (grammar_id == 1u) {
+        return 1.12;
+    }
+    if (grammar_id == 2u) {
+        return 0.94;
+    }
+    if (grammar_id == 3u) {
+        return 1.06;
+    }
+    return 1.0;
+}
+
+fn family_offset_scale(grammar_id: u32) -> f32 {
+    if (grammar_id == 1u) {
+        return 1.15;
+    }
+    if (grammar_id == 2u) {
+        return 0.9;
+    }
+    if (grammar_id == 3u) {
+        return 1.25;
+    }
+    return 1.0;
+}
+
+fn family_radius_scale(grammar_id: u32) -> f32 {
+    if (grammar_id == 1u) {
+        return 1.08;
+    }
+    if (grammar_id == 2u) {
+        return 0.92;
+    }
+    if (grammar_id == 3u) {
+        return 1.18;
+    }
+    return 1.0;
+}
+
+fn resolved_turn_sign(stage: StageSpec, stage_index: u32, grammar_id: u32) -> f32 {
+    let base = stage_direction(stage);
+    if (grammar_id == 1u) {
+        return -base;
+    }
+    if (grammar_id == 2u) {
+        return base * select(1.0, -1.0, (stage_index & 1u) != 0u);
+    }
+    if (grammar_id == 3u) {
+        let flip = hash_to_unit(stage_index * 977u + 0x51u) > 0.42;
+        return base * select(1.0, -1.0, flip);
+    }
+    return base;
+}
+
+fn offset_direction(stage_index: u32, grammar_id: u32) -> f32 {
+    if (grammar_id == 1u) {
+        return select(-1.0, 1.0, (stage_index & 1u) == 0u);
+    }
+    if (grammar_id == 2u) {
+        return select(1.0, -1.0, (stage_index & 1u) == 0u);
+    }
+    if (grammar_id == 3u) {
+        return select(-1.0, 1.0, hash_to_unit(stage_index * 313u + 0x21u) > 0.5);
+    }
+    return 1.0;
+}
+
 fn stage_direction(stage: StageSpec) -> f32 {
     return select(-1.0, 1.0, stage.flags != 0u);
 }
 
 fn generated_gate_count() -> u32 {
     return min(course_header.total_gate_count, params.max_gates_per_env);
+}
+
+fn generated_obstacle_count() -> u32 {
+    return 0u;
 }
 
 fn env_gate_offset(index: u32) -> u32 {
@@ -220,10 +303,15 @@ fn gate_from_stage(
     local_gate_index: u32,
     total_gate_index: u32,
     total_gate_count: u32,
+    stage_index: u32,
     seed: u32,
+    grammar_id: u32,
 ) -> Gate {
     let lateral_axis = vec2<f32>(-cursor_forward.y, cursor_forward.x);
     let progress = (f32(total_gate_index) + 0.5) / max(f32(total_gate_count), 1.0);
+    let spacing = stage.spacing * family_spacing_scale(grammar_id);
+    let offset_scale = family_offset_scale(grammar_id);
+    let radius = max(stage.radius * family_radius_scale(grammar_id), 0.1);
     let elevation =
         sin(progress * 6.283185307179586 + hash_to_unit(seed ^ 0x44f1u) * 6.283185307179586)
             * stage.vertical_amp
@@ -232,36 +320,57 @@ fn gate_from_stage(
     var gate: Gate;
     if (stage.kind == 2u) {
         let t = (f32(local_gate_index) + 1.0) / max(f32(stage.gate_count), 1.0);
-        let lateral = sin(t * 6.283185307179586) * stage.lateral_amp;
+        let lateral =
+            sin(t * 3.141592653589793)
+            * stage.lateral_amp
+            * offset_scale
+            * offset_direction(stage_index, grammar_id);
         let center_2d =
-            cursor_position + cursor_forward * stage.spacing + lateral_axis * lateral;
+            cursor_position + cursor_forward * spacing + lateral_axis * lateral;
         gate.center = vec4<f32>(center_2d.x, elevation, center_2d.y, 0.0);
         gate.forward = vec4<f32>(cursor_forward.x, 0.0, cursor_forward.y, 0.0);
     } else if (stage.kind == 3u) {
-        let turn_sign = stage_direction(stage);
-        let arc_center = cursor_position + lateral_axis * (turn_sign * stage.radius);
-        let start_offset = cursor_position - arc_center;
-        let angle =
-            turn_sign * stage.turn_radians
-            * ((f32(local_gate_index) + 1.0) / max(f32(stage.gate_count), 1.0));
-        let center_2d = arc_center + rotate_vec2(start_offset, angle);
-        let forward_2d = normalize(rotate_vec2(cursor_forward, angle));
-        gate.center = vec4<f32>(center_2d.x, elevation, center_2d.y, 0.0);
-        gate.forward = vec4<f32>(forward_2d.x, 0.0, forward_2d.y, 0.0);
+        let turn_sign = resolved_turn_sign(stage, stage_index, grammar_id);
+        let exit_forward = normalize(rotate_vec2(cursor_forward, turn_sign * stage.turn_radians));
+        let setup_distance = max(radius * 0.65, 2.1);
+        let exit_spacing = max(radius * 0.95, 2.4);
+        let corner_anchor = cursor_position + cursor_forward * setup_distance;
+        if (stage.gate_count <= 1u) {
+            let center_2d = corner_anchor + exit_forward * (exit_spacing * 0.35);
+            let blended_forward = normalize(cursor_forward + exit_forward);
+            gate.center = vec4<f32>(center_2d.x, elevation, center_2d.y, 0.0);
+            gate.forward = vec4<f32>(blended_forward.x, 0.0, blended_forward.y, 0.0);
+        } else {
+            let normalized_index =
+                f32(local_gate_index) / max(f32(stage.gate_count - 1u), 1.0);
+            let center_2d = corner_anchor + exit_forward * (normalized_index * exit_spacing);
+            gate.center = vec4<f32>(center_2d.x, elevation, center_2d.y, 0.0);
+            gate.forward = vec4<f32>(exit_forward.x, 0.0, exit_forward.y, 0.0);
+        }
     } else {
-        let center_2d = cursor_position + cursor_forward * stage.spacing;
+        let center_2d = cursor_position + cursor_forward * spacing;
         gate.center = vec4<f32>(center_2d.x, elevation, center_2d.y, 0.0);
         gate.forward = vec4<f32>(cursor_forward.x, 0.0, cursor_forward.y, 0.0);
     }
-    gate.half_extents = vec4<f32>(stage.hole_half_width, stage.hole_half_height, 0.0, 0.0);
+    gate.half_extents = vec4<f32>(
+        stage.hole_half_width,
+        stage.hole_half_height,
+        params.gate_depth_half,
+        0.0,
+    );
     return gate;
 }
 
-fn next_cursor_forward(stage: StageSpec, cursor_forward: vec2<f32>) -> vec2<f32> {
+fn next_cursor_forward(
+    stage: StageSpec,
+    cursor_forward: vec2<f32>,
+    stage_index: u32,
+    grammar_id: u32,
+) -> vec2<f32> {
     if (stage.kind == 3u) {
         return normalize(rotate_vec2(
             cursor_forward,
-            stage_direction(stage) * stage.turn_radians,
+            resolved_turn_sign(stage, stage_index, grammar_id) * stage.turn_radians,
         ));
     }
     return cursor_forward;
@@ -274,48 +383,407 @@ fn progress_value(current_lap: u32, current_gate: u32, gate_count: u32) -> f32 {
     return f32(completed) / f32(total_targets);
 }
 
+fn gate_up_axis() -> vec3<f32> {
+    return vec3<f32>(0.0, 1.0, 0.0);
+}
+
+fn gate_right_axis(forward: vec3<f32>) -> vec3<f32> {
+    let horizontal_forward = normalize(vec3<f32>(forward.x, 0.0, forward.z));
+    return normalize(cross(gate_up_axis(), horizontal_forward));
+}
+
+fn gate_hole_contains(gate: Gate, offset: vec3<f32>) -> bool {
+    let gate_forward = normalize(gate.forward.xyz);
+    let gate_right = gate_right_axis(gate_forward);
+    let right_distance = abs(dot(offset, gate_right));
+    let up_distance = abs(dot(offset, gate_up_axis()));
+    let hole_half_width = max(gate.half_extents.x - params.drone_radius, 0.0);
+    let hole_half_height = max(gate.half_extents.y - params.drone_radius, 0.0);
+    return right_distance <= hole_half_width && up_distance <= hole_half_height;
+}
+
+fn gate_frame_collision(gate: Gate, position: vec3<f32>) -> bool {
+    let gate_forward = normalize(gate.forward.xyz);
+    let gate_right = gate_right_axis(gate_forward);
+    let offset = position - gate.center.xyz;
+    let plane_distance = abs(dot(offset, gate_forward));
+    let right_distance = abs(dot(offset, gate_right));
+    let up_distance = abs(dot(offset, gate_up_axis()));
+    let outer_half_width = gate.half_extents.x + params.gate_frame_thickness + params.drone_radius;
+    let outer_half_height = gate.half_extents.y + params.gate_frame_thickness + params.drone_radius;
+    let within_outer = plane_distance <= params.gate_depth_half + params.drone_radius
+        && right_distance <= outer_half_width
+        && up_distance <= outer_half_height;
+    return within_outer && !gate_hole_contains(gate, offset);
+}
+
+fn crossed_gate_plane(prev_position: vec3<f32>, next_position: vec3<f32>, gate: Gate) -> bool {
+    let gate_forward = normalize(gate.forward.xyz);
+    let prev_distance = dot(prev_position - gate.center.xyz, gate_forward);
+    let next_distance = dot(next_position - gate.center.xyz, gate_forward);
+    if (!(prev_distance <= 0.0 && next_distance >= 0.0)) {
+        return false;
+    }
+
+    let denominator = prev_distance - next_distance;
+    let interpolation = select(
+        0.0,
+        clamp(prev_distance / denominator, 0.0, 1.0),
+        abs(denominator) > 1e-5,
+    );
+    let hit_position = prev_position + (next_position - prev_position) * interpolation;
+    return gate_hole_contains(gate, hit_position - gate.center.xyz);
+}
+
+fn obstacle_collision(obstacle: Gate, position: vec3<f32>) -> bool {
+    let obstacle_forward = normalize(obstacle.forward.xyz);
+    let obstacle_right = gate_right_axis(obstacle_forward);
+    let offset = position - obstacle.center.xyz;
+    let local = vec3<f32>(
+        dot(offset, obstacle_right),
+        dot(offset, gate_up_axis()),
+        dot(offset, obstacle_forward),
+    );
+    let clamped = clamp(local, -obstacle.half_extents.xyz, obstacle.half_extents.xyz);
+    let delta = local - clamped;
+    return dot(delta, delta) <= params.drone_radius * params.drone_radius;
+}
+
+fn family_segment_count(grammar_id: u32) -> u32 {
+    if (grammar_id == 1u) {
+        return 4u;
+    }
+    if (grammar_id == 2u) {
+        return 4u;
+    }
+    if (grammar_id == 3u) {
+        return 5u;
+    }
+    return 5u;
+}
+
+fn family_segment_length(
+    grammar_id: u32,
+    segment_index: u32,
+    seed: u32,
+    difficulty: f32,
+    path_scale: f32,
+) -> f32 {
+    var base = 8.5;
+    var jitter = 1.1;
+    if (grammar_id == 0u) {
+        if (segment_index == 0u) {
+            base = 10.5;
+        } else if (segment_index == 1u) {
+            base = 7.8;
+        } else if (segment_index == 2u) {
+            base = 9.6;
+        } else if (segment_index == 3u) {
+            base = 7.2;
+        } else {
+            base = 8.9;
+        }
+    } else if (grammar_id == 1u) {
+        if (segment_index == 0u) {
+            base = 9.2;
+        } else if (segment_index == 1u) {
+            base = 8.6;
+        } else if (segment_index == 2u) {
+            base = 8.2;
+        } else {
+            base = 7.4;
+        }
+    } else if (grammar_id == 2u) {
+        if (segment_index == 0u) {
+            base = 12.8;
+        } else if (segment_index == 1u) {
+            base = 5.4;
+        } else if (segment_index == 2u) {
+            base = 11.6;
+        } else {
+            base = 6.1;
+        }
+        jitter = 0.7;
+    } else {
+        if (segment_index == 0u) {
+            base = 9.6;
+        } else if (segment_index == 1u) {
+            base = 5.3;
+        } else if (segment_index == 2u) {
+            base = 5.1;
+        } else if (segment_index == 3u) {
+            base = 9.1;
+        } else {
+            base = 8.4;
+        }
+        jitter = 0.75;
+    }
+    let random = hash_to_unit(seed ^ (grammar_id * 0x9e37u + segment_index * 0x85ebu));
+    return (base + (random - 0.5) * jitter + difficulty * 0.8) * path_scale;
+}
+
+fn family_turn_radians(grammar_id: u32, segment_index: u32) -> f32 {
+    let quarter_turn = 1.5707963267948966;
+    if (grammar_id == 0u) {
+        if (segment_index == 0u) {
+            return quarter_turn;
+        }
+        if (segment_index == 1u) {
+            return -quarter_turn;
+        }
+        if (segment_index == 2u) {
+            return -quarter_turn;
+        }
+        if (segment_index == 3u) {
+            return quarter_turn;
+        }
+        return quarter_turn;
+    }
+    if (grammar_id == 1u) {
+        if (segment_index < 3u) {
+            return quarter_turn;
+        }
+        return 0.0;
+    }
+    if (grammar_id == 2u) {
+        if (segment_index < 3u) {
+            return quarter_turn;
+        }
+        return 0.0;
+    }
+    if (segment_index == 0u) {
+        return -quarter_turn;
+    }
+    if (segment_index == 1u) {
+        return quarter_turn;
+    }
+    if (segment_index == 2u) {
+        return quarter_turn;
+    }
+    if (segment_index == 3u) {
+        return -quarter_turn;
+    }
+    return 0.0;
+}
+
+fn path_total_length(grammar_id: u32, seed: u32, difficulty: f32, path_scale: f32) -> f32 {
+    let segment_count = family_segment_count(grammar_id);
+    var total = 0.0;
+    var segment_index = 0u;
+    loop {
+        if (segment_index >= segment_count) {
+            break;
+        }
+        total = total + family_segment_length(grammar_id, segment_index, seed, difficulty, path_scale);
+        segment_index = segment_index + 1u;
+    }
+    return total;
+}
+
+fn family_path_scale(gate_count: u32, difficulty: f32, base_total_length: f32) -> f32 {
+    let required_usable = max(f32(max(gate_count, 1u) - 1u), 0.0) * minimum_gate_path_spacing(difficulty);
+    let required_total = required_usable + 3.6;
+    return max(1.0, required_total / max(base_total_length, 1.0));
+}
+
+fn sample_family_path(
+    grammar_id: u32,
+    seed: u32,
+    difficulty: f32,
+    course_angle: f32,
+    distance_along_path: f32,
+    path_scale: f32,
+) -> Gate {
+    let segment_count = family_segment_count(grammar_id);
+    var remaining = distance_along_path;
+    var cursor_position = vec2<f32>(0.0, 0.0);
+    var cursor_forward = rotate_vec2(vec2<f32>(1.0, 0.0), course_angle);
+    var segment_index = 0u;
+
+    loop {
+        if (segment_index >= segment_count) {
+            break;
+        }
+
+        let segment_length =
+            family_segment_length(grammar_id, segment_index, seed, difficulty, path_scale);
+        let is_last = segment_index + 1u >= segment_count;
+        if (remaining <= segment_length || is_last) {
+            let local_distance = min(remaining, segment_length);
+            let center_2d = cursor_position + cursor_forward * local_distance;
+            let path_progress =
+                distance_along_path / max(path_total_length(grammar_id, seed, difficulty, path_scale), 1.0);
+            let phase = hash_to_unit(seed ^ 0x44f1u) * 6.283185307179586;
+            var elevation =
+                sin(path_progress * 6.283185307179586 + phase) * (0.18 + difficulty * 0.16)
+                + (hash_to_unit(seed ^ (segment_index * 97u + 0x0f0fu)) - 0.5) * 0.12;
+            if (grammar_id == 1u) {
+                elevation = elevation
+                    + sin(path_progress * 12.566370614359172 + phase * 0.7) * 0.18;
+            } else if (grammar_id == 2u) {
+                elevation = elevation
+                    + select(-0.22, 0.28, path_progress > 0.52)
+                    + sin(path_progress * 9.42477796076938 + phase) * 0.08;
+            } else if (grammar_id == 3u) {
+                let hump =
+                    exp(-pow((path_progress - 0.45) * 4.0, 2.0)) * (0.32 + difficulty * 0.14);
+                elevation = elevation + hump;
+            }
+            let hole_half_width = 0.58 - difficulty * 0.08;
+            let hole_half_height = 0.58 - difficulty * 0.06;
+            var gate: Gate;
+            gate.center = vec4<f32>(center_2d.x, elevation, center_2d.y, 0.0);
+            gate.forward = vec4<f32>(cursor_forward.x, 0.0, cursor_forward.y, 0.0);
+            gate.half_extents = vec4<f32>(
+                hole_half_width,
+                hole_half_height,
+                params.gate_depth_half,
+                0.0,
+            );
+            return gate;
+        }
+
+        remaining = remaining - segment_length;
+        cursor_position = cursor_position + cursor_forward * segment_length;
+        cursor_forward = normalize(rotate_vec2(
+            cursor_forward,
+            family_turn_radians(grammar_id, segment_index),
+        ));
+        segment_index = segment_index + 1u;
+    }
+
+    var fallback: Gate;
+    fallback.center = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    fallback.half_extents = vec4<f32>(0.58, 0.58, params.gate_depth_half, 0.0);
+    fallback.forward = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+    return fallback;
+}
+
+fn minimum_gate_separation(difficulty: f32) -> f32 {
+    return 2.6 + difficulty * 0.35;
+}
+
+fn minimum_gate_path_spacing(difficulty: f32) -> f32 {
+    return 4.4 + difficulty * 0.6;
+}
+
+fn minimum_previous_gate_exit_distance(previous_gate: Gate) -> f32 {
+    return max(previous_gate.half_extents.x, previous_gate.half_extents.y) + 1.4;
+}
+
+fn previous_target_gate(index: u32, current_gate: u32, current_lap: u32) -> Gate {
+    let gate_count = max(generated_gate_count(), 1u);
+    if (current_gate > 0u) {
+        return gates.values[env_gate_offset(index) + current_gate - 1u];
+    }
+    if (course_header.loop_enabled != 0u && current_lap > 0u) {
+        return gates.values[env_gate_offset(index) + gate_count - 1u];
+    }
+    return gates.values[env_gate_offset(index)];
+}
+
+fn has_cleared_previous_gate_zone(index: u32, state: EnvState, position: vec3<f32>) -> bool {
+    if (state.current_gate == 0u && state.current_lap == 0u) {
+        return true;
+    }
+    let previous_gate = previous_target_gate(index, state.current_gate, state.current_lap);
+    return distance(position, previous_gate.center.xyz)
+        >= minimum_previous_gate_exit_distance(previous_gate);
+}
+
 fn reset_env(index: u32) {
     let reset = reset_params.values[index];
     let count = generated_gate_count();
     let base_slot = env_gate_offset(index);
+    let family_id = reset.grammar_id % 4u;
 
     let course_angle =
         hash_to_unit(reset.seed ^ 0x12345u) * 6.283185307179586
-        + f32(reset.grammar_id % 4u) * 1.5707963267948966;
-    var cursor_position = vec2<f32>(0.0, 0.0);
-    var cursor_forward = rotate_vec2(vec2<f32>(1.0, 0.0), course_angle);
+        + f32(family_id) * 0.37;
+    let base_total_path_length = path_total_length(family_id, reset.seed, reset.difficulty, 1.0);
+    let path_scale = family_path_scale(count, reset.difficulty, base_total_path_length);
+    let total_path_length = path_total_length(family_id, reset.seed, reset.difficulty, path_scale);
+    let entry_margin = min(1.8, total_path_length * 0.12);
+    let exit_margin = min(1.2, total_path_length * 0.08);
+    let usable_length = max(total_path_length - entry_margin - exit_margin, 0.5);
     var gate_index = 0u;
-    var stage_index = 0u;
 
     loop {
-        if (stage_index >= course_header.stage_count || gate_index >= count) {
+        if (gate_index >= count) {
             break;
         }
 
-        let stage = course_stages.values[stage_index];
-        var local_gate_index = 0u;
+        let gate_t = select(
+            0.5,
+            f32(gate_index) / max(f32(count - 1u), 1.0),
+            count > 1u,
+        );
+        var distance_along_path = entry_margin + gate_t * usable_length;
+        if (gate_index > 0u) {
+            let previous_gate_t = f32(gate_index - 1u) / max(f32(count - 1u), 1.0);
+            let previous_distance = entry_margin + previous_gate_t * usable_length;
+            distance_along_path = max(
+                distance_along_path,
+                previous_distance + minimum_gate_path_spacing(reset.difficulty),
+            );
+            distance_along_path = min(entry_margin + usable_length, distance_along_path);
+        }
+        var gate = sample_family_path(
+            family_id,
+            reset.seed,
+            reset.difficulty,
+            course_angle,
+            distance_along_path,
+            path_scale,
+        );
+        if (gate_index > 0u) {
+            let previous_gate = gates.values[gate_slot(index, gate_index - 1u)];
+            var adjustment = 0u;
+            loop {
+                let gate_spacing = distance(gate.center.xyz, previous_gate.center.xyz);
+                if (gate_spacing >= minimum_gate_separation(reset.difficulty) || adjustment >= 6u) {
+                    break;
+                }
+                let pull_forward = 1.2 + f32(adjustment) * 0.7;
+                distance_along_path = min(entry_margin + usable_length, distance_along_path + pull_forward);
+                gate = sample_family_path(
+                    family_id,
+                    reset.seed,
+                    reset.difficulty,
+                    course_angle,
+                    distance_along_path,
+                    path_scale,
+                );
+                adjustment = adjustment + 1u;
+            }
+        }
+        gates.values[gate_slot(index, gate_index)] = gate;
+        gate_index = gate_index + 1u;
+    }
+
+    if (count > 1u) {
+        let first_gate = gates.values[base_slot];
+        let last_slot = gate_slot(index, count - 1u);
+        var last_gate = gates.values[last_slot];
+        var adjustment = 0u;
         loop {
-            if (local_gate_index >= stage.gate_count || gate_index >= count) {
+            let closure_distance = distance(last_gate.center.xyz, first_gate.center.xyz);
+            if (closure_distance >= 4.2 || adjustment >= 5u) {
                 break;
             }
-
-            let gate = gate_from_stage(
-                stage,
-                cursor_position,
-                cursor_forward,
-                local_gate_index,
-                gate_index,
-                count,
+            let pullback = (f32(adjustment) + 1.0) * 1.9;
+            let adjusted_distance = entry_margin + max(usable_length - pullback, 0.5);
+            last_gate = sample_family_path(
+                family_id,
                 reset.seed,
+                reset.difficulty,
+                course_angle,
+                adjusted_distance,
+                path_scale,
             );
-            gates.values[gate_slot(index, gate_index)] = gate;
-            cursor_position = vec2<f32>(gate.center.x, gate.center.z);
-            gate_index = gate_index + 1u;
-            local_gate_index = local_gate_index + 1u;
+            gates.values[last_slot] = last_gate;
+            adjustment = adjustment + 1u;
         }
-
-        cursor_forward = next_cursor_forward(stage, cursor_forward);
-        stage_index = stage_index + 1u;
     }
 
     loop {
@@ -327,6 +795,64 @@ fn reset_env(index: u32) {
         gates.values[slot].half_extents = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         gates.values[slot].forward = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         gate_index = gate_index + 1u;
+    }
+
+    let obstacle_count = generated_obstacle_count();
+    var obstacle_index = 0u;
+    loop {
+        if (obstacle_index >= obstacle_count) {
+            break;
+        }
+
+        let source_gate_index = min(obstacle_index * 2u, max(count, 1u) - 1u);
+        let next_gate_index = min(source_gate_index + 1u, max(count, 1u) - 1u);
+        let gate_a = gates.values[gate_slot(index, source_gate_index)];
+        let gate_b = gates.values[gate_slot(index, next_gate_index)];
+        let segment = gate_b.center.xyz - gate_a.center.xyz;
+        let horizontal_segment = vec3<f32>(segment.x, 0.0, segment.z);
+        let segment_length = length(horizontal_segment);
+        let travel_forward =
+            normalize(select(gate_a.forward.xyz, horizontal_segment, segment_length > 1e-5));
+        let travel_right = gate_right_axis(travel_forward);
+        let t = 0.35 + hash_to_unit(reset.seed ^ (obstacle_index * 193u + 0x5511u)) * 0.3;
+        let centerline = gate_a.center.xyz + segment * t;
+        let side_sign = select(
+            -1.0,
+            1.0,
+            hash_to_unit(reset.seed ^ (obstacle_index * 313u + 0x33a1u)) > 0.5,
+        );
+        let lateral_offset =
+            (gate_a.half_extents.x + 0.55 + reset.difficulty * 0.85
+                + hash_to_unit(reset.seed ^ (obstacle_index * 733u + 0x91u)) * 0.35)
+            * side_sign;
+        let half_width =
+            0.16 + hash_to_unit(reset.seed ^ (obstacle_index * 151u + 0x1717u)) * 0.1;
+        let half_height =
+            0.22
+            + reset.difficulty * 0.18
+            + hash_to_unit(reset.seed ^ (obstacle_index * 271u + 0x2021u)) * 0.16;
+        let half_depth =
+            0.16 + hash_to_unit(reset.seed ^ (obstacle_index * 419u + 0x0aa1u)) * 0.1;
+        let center =
+            centerline
+            + travel_right * lateral_offset
+            + vec3<f32>(0.0, half_height - 0.02, 0.0);
+        let slot = obstacle_slot(index, obstacle_index);
+        gates.values[slot].center = vec4<f32>(center, 0.0);
+        gates.values[slot].half_extents = vec4<f32>(half_width, half_height, half_depth, 0.0);
+        gates.values[slot].forward = vec4<f32>(travel_forward, 0.0);
+        obstacle_index = obstacle_index + 1u;
+    }
+
+    loop {
+        if (obstacle_index >= params.max_obstacles_per_env) {
+            break;
+        }
+        let slot = obstacle_slot(index, obstacle_index);
+        gates.values[slot].center = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        gates.values[slot].half_extents = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        gates.values[slot].forward = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        obstacle_index = obstacle_index + 1u;
     }
 
     let first_gate = gates.values[base_slot];
@@ -409,6 +935,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    let prev_position = state.position.xyz;
     let action = clamp_motor_command(actions.values[index].motor_command);
     state.motor_thrust = state.motor_thrust
         + (action - state.motor_thrust) * params.motor_response * params.dt_seconds;
@@ -451,14 +978,31 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let gate_count = generated_gate_count();
     let target_position = target_gate.center.xyz;
-    let target_forward = normalize(target_gate.forward.xyz);
+    var target_forward = normalize(target_gate.forward.xyz);
     var delta = target_position - state.position.xyz;
     var distance_to_gate = length(delta);
-    let gate_radius = max(target_gate.half_extents.x, target_gate.half_extents.y) * 1.6;
-    if (distance_to_gate <= gate_radius) {
+    let previous_gate_cleared = has_cleared_previous_gate_zone(index, state, state.position.xyz);
+    let passed_gate =
+        previous_gate_cleared && crossed_gate_plane(prev_position, state.position.xyz, target_gate);
+    let collided_gate = !passed_gate && gate_frame_collision(target_gate, state.position.xyz);
+    var collided_obstacle = false;
+    var obstacle_index = 0u;
+    loop {
+        if (obstacle_index >= generated_obstacle_count()) {
+            break;
+        }
+        let obstacle = gates.values[obstacle_slot(index, obstacle_index)];
+        if (obstacle.half_extents.x > 0.0 && obstacle_collision(obstacle, state.position.xyz)) {
+            collided_obstacle = true;
+            break;
+        }
+        obstacle_index = obstacle_index + 1u;
+    }
+    if (passed_gate) {
         if (state.current_gate + 1u < gate_count) {
             state.current_gate = state.current_gate + 1u;
             target_gate = current_target_gate(index, state.current_gate);
+            target_forward = normalize(target_gate.forward.xyz);
             delta = target_gate.center.xyz - state.position.xyz;
             distance_to_gate = length(delta);
         } else if (course_header.loop_enabled != 0u
@@ -467,20 +1011,24 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             state.current_lap = state.current_lap + 1u;
             state.current_gate = 0u;
             target_gate = current_target_gate(index, 0u);
+            target_forward = normalize(target_gate.forward.xyz);
             delta = target_gate.center.xyz - state.position.xyz;
             distance_to_gate = length(delta);
         } else {
             state.done = 1u;
         }
+    } else if (collided_gate || collided_obstacle) {
+        state.done = 1u;
     }
 
-    let out_of_bounds = abs(state.position.x) > params.bounds
-        || abs(state.position.z) > params.bounds
-        || state.position.y < params.min_altitude
-        || state.position.y > params.max_altitude;
+    let collided_floor = state.position.y <= params.min_altitude + params.drone_radius;
+    let out_of_bounds = abs(state.position.x) > params.bounds - params.drone_radius
+        || abs(state.position.z) > params.bounds - params.drone_radius
+        || state.position.y > params.max_altitude - params.drone_radius;
     let reached_step_limit = state.step_count >= params.max_steps;
     let excessive_tilt = abs(attitude.x) > 1.2 || abs(attitude.y) > 1.2;
-    if (out_of_bounds || reached_step_limit || excessive_tilt) {
+    let collided_world = collided_floor || out_of_bounds;
+    if (collided_world || reached_step_limit || excessive_tilt) {
         state.done = 1u;
     }
 
@@ -505,11 +1053,16 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
 
     let tilt_penalty = abs(attitude.x) + abs(attitude.y);
+    let collision_happened = collided_gate || collided_obstacle || collided_world;
+    let completion_bonus = select(0.0, 4.0, passed_gate);
+    let collision_penalty = select(0.0, params.collision_penalty, collision_happened);
     reward_done.values[index].reward =
         progress * 6.0
         - distance_to_gate * 0.35
         + gate_alignment * 0.15
-        - tilt_penalty * 0.05;
+        - tilt_penalty * 0.05
+        + completion_bonus
+        - collision_penalty;
     reward_done.values[index].done = state.done;
     reward_done.values[index]._pad0 = 0u;
     reward_done.values[index]._pad1 = 0u;
@@ -631,10 +1184,14 @@ struct SimParams {
     linear_drag: f32,
     angular_drag: f32,
     motor_response: f32,
+    drone_radius: f32,
+    gate_frame_thickness: f32,
+    gate_depth_half: f32,
+    collision_penalty: f32,
     env_count: u32,
     max_steps: u32,
     max_gates_per_env: u32,
-    _pad0: u32,
+    max_obstacles_per_env: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -712,16 +1269,21 @@ impl GpuSimulation {
         let mut default_course = CourseSpec::default_drone_course();
         default_course.laps_required = config.laps_required.max(1);
         let compiled_course = default_course.compile();
-        let gate_capacity = config.env_count * config.max_gates_per_env;
+        let max_obstacles_per_env = max_obstacles_per_env(config.max_gates_per_env);
+        let gate_capacity = config.env_count * primitive_capacity_per_env(config.max_gates_per_env);
         let layout_values = build_layout_headers(
             config.env_count,
             config.max_gates_per_env,
+            max_obstacles_per_env,
             compiled_course.header.total_gate_count,
         );
 
         let reset_values = vec![1u32; config.env_count];
         let reset_params_values: Vec<ResetParams> = (0..config.env_count)
-            .map(|env_index| ResetParams::new(env_index as u32, 0, 0.35))
+            .map(|env_index| {
+                let env_index = env_index as u32;
+                ResetParams::new(env_index, env_index % 4, 0.35)
+            })
             .collect();
         let params = SimParams {
             dt_seconds: config.dt_seconds,
@@ -736,10 +1298,14 @@ impl GpuSimulation {
             linear_drag: 0.18,
             angular_drag: 0.3,
             motor_response: 8.0,
+            drone_radius: 0.12,
+            gate_frame_thickness: 0.08,
+            gate_depth_half: 0.04,
+            collision_penalty: 6.0,
             env_count: config.env_count as u32,
             max_steps: config.max_steps,
             max_gates_per_env: config.max_gates_per_env as u32,
-            _pad0: 0,
+            max_obstacles_per_env: max_obstacles_per_env as u32,
         };
 
         let state = renderer
@@ -1043,6 +1609,7 @@ impl GpuSimulation {
         let layout_values = build_layout_headers(
             self.config.env_count,
             self.config.max_gates_per_env,
+            max_obstacles_per_env(self.config.max_gates_per_env),
             header.total_gate_count,
         );
         renderer.write_buffer(self.course_header.handle(), &[header], registry)?;
@@ -1063,7 +1630,7 @@ impl GpuSimulation {
 
     #[must_use]
     pub fn gate_capacity(&self) -> usize {
-        self.config.env_count * self.config.max_gates_per_env
+        self.config.env_count * primitive_capacity_per_env(self.config.max_gates_per_env)
     }
 
     #[must_use]
@@ -1307,14 +1874,24 @@ fn build_readback_graph(
 fn build_layout_headers(
     env_count: usize,
     max_gates_per_env: usize,
+    max_obstacles_per_env: usize,
     gate_count: u32,
 ) -> Vec<EnvLayoutHeader> {
     (0..env_count)
         .map(|env_index| EnvLayoutHeader {
             gate_offset: (env_index * max_gates_per_env) as u32,
             gate_count,
-            obstacle_offset: 0,
+            obstacle_offset: (env_count * max_gates_per_env + env_index * max_obstacles_per_env)
+                as u32,
             obstacle_count: 0,
         })
         .collect()
+}
+
+fn max_obstacles_per_env(max_gates_per_env: usize) -> usize {
+    max_gates_per_env.saturating_div(2).max(1)
+}
+
+fn primitive_capacity_per_env(max_gates_per_env: usize) -> usize {
+    max_gates_per_env + max_obstacles_per_env(max_gates_per_env)
 }
