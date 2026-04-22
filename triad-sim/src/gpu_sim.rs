@@ -11,8 +11,11 @@ const COURSE_STAGE_CAPACITY: usize = 32;
 
 const STEP_SHADER: &str = r#"
 struct EnvState {
-    position: vec2<f32>,
-    velocity: vec2<f32>,
+    position: vec4<f32>,
+    velocity: vec4<f32>,
+    attitude: vec4<f32>,
+    angular_velocity: vec4<f32>,
+    motor_thrust: vec4<f32>,
     step_count: u32,
     done: u32,
     current_gate: u32,
@@ -20,16 +23,17 @@ struct EnvState {
 };
 
 struct Action {
-    accel: vec2<f32>,
-    _pad: vec2<f32>,
+    motor_command: vec4<f32>,
 };
 
 struct Observation {
-    position: vec2<f32>,
-    velocity: vec2<f32>,
-    target_gate_position: vec2<f32>,
-    progress: f32,
-    _pad0: f32,
+    position: vec4<f32>,
+    velocity: vec4<f32>,
+    attitude: vec4<f32>,
+    angular_velocity: vec4<f32>,
+    target_gate_position: vec4<f32>,
+    target_gate_forward_progress: vec4<f32>,
+    metrics: vec4<f32>,
 };
 
 struct RewardDone {
@@ -42,12 +46,20 @@ struct RewardDone {
 struct SimParams {
     dt_seconds: f32,
     bounds: f32,
+    min_altitude: f32,
+    max_altitude: f32,
+    mass: f32,
+    gravity: f32,
+    thrust_scale: f32,
+    arm_length: f32,
+    yaw_torque_scale: f32,
+    linear_drag: f32,
+    angular_drag: f32,
+    motor_response: f32,
     env_count: u32,
     max_steps: u32,
     max_gates_per_env: u32,
     _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
 };
 
 struct ResetParams {
@@ -65,10 +77,9 @@ struct EnvLayoutHeader {
 };
 
 struct Gate {
-    center: vec2<f32>,
-    half_extents: vec2<f32>,
-    forward: vec2<f32>,
-    _pad0: vec2<f32>,
+    center: vec4<f32>,
+    half_extents: vec4<f32>,
+    forward: vec4<f32>,
 };
 
 struct CourseHeader {
@@ -148,6 +159,44 @@ fn rotate_vec2(v: vec2<f32>, angle: f32) -> vec2<f32> {
     return vec2<f32>(c * v.x - s * v.y, s * v.x + c * v.y);
 }
 
+fn rotate_around_axis(v: vec3<f32>, axis: vec3<f32>, angle: f32) -> vec3<f32> {
+    let a = normalize(axis);
+    let s = sin(angle);
+    let c = cos(angle);
+    return v * c + cross(a, v) * s + a * dot(a, v) * (1.0 - c);
+}
+
+fn clamp_motor_command(command: vec4<f32>) -> vec4<f32> {
+    return clamp(command, vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
+fn body_forward(attitude: vec3<f32>) -> vec3<f32> {
+    let yaw = attitude.z;
+    let pitch = attitude.y;
+    let heading = vec3<f32>(cos(yaw), 0.0, sin(yaw));
+    let right = vec3<f32>(heading.z, 0.0, -heading.x);
+    return normalize(rotate_around_axis(heading, right, pitch));
+}
+
+fn body_up(attitude: vec3<f32>) -> vec3<f32> {
+    let yaw = attitude.z;
+    let pitch = attitude.y;
+    let roll = attitude.x;
+    let heading = vec3<f32>(cos(yaw), 0.0, sin(yaw));
+    let right = vec3<f32>(heading.z, 0.0, -heading.x);
+    let tilted_up = rotate_around_axis(vec3<f32>(0.0, 1.0, 0.0), right, pitch);
+    return normalize(rotate_around_axis(tilted_up, heading, -roll));
+}
+
+fn body_right(attitude: vec3<f32>) -> vec3<f32> {
+    return normalize(cross(body_up(attitude), body_forward(attitude)));
+}
+
+fn wrap_angle(angle: f32) -> f32 {
+    let two_pi = 6.283185307179586;
+    return angle - floor((angle + 3.141592653589793) / two_pi) * two_pi;
+}
+
 fn gate_slot(env_index: u32, gate_index: u32) -> u32 {
     return env_index * params.max_gates_per_env + gate_index;
 }
@@ -184,8 +233,10 @@ fn gate_from_stage(
     if (stage.kind == 2u) {
         let t = (f32(local_gate_index) + 1.0) / max(f32(stage.gate_count), 1.0);
         let lateral = sin(t * 6.283185307179586) * stage.lateral_amp;
-        gate.center = cursor_position + cursor_forward * stage.spacing + lateral_axis * lateral;
-        gate.forward = cursor_forward;
+        let center_2d =
+            cursor_position + cursor_forward * stage.spacing + lateral_axis * lateral;
+        gate.center = vec4<f32>(center_2d.x, elevation, center_2d.y, 0.0);
+        gate.forward = vec4<f32>(cursor_forward.x, 0.0, cursor_forward.y, 0.0);
     } else if (stage.kind == 3u) {
         let turn_sign = stage_direction(stage);
         let arc_center = cursor_position + lateral_axis * (turn_sign * stage.radius);
@@ -193,14 +244,16 @@ fn gate_from_stage(
         let angle =
             turn_sign * stage.turn_radians
             * ((f32(local_gate_index) + 1.0) / max(f32(stage.gate_count), 1.0));
-        gate.center = arc_center + rotate_vec2(start_offset, angle);
-        gate.forward = normalize(rotate_vec2(cursor_forward, angle));
+        let center_2d = arc_center + rotate_vec2(start_offset, angle);
+        let forward_2d = normalize(rotate_vec2(cursor_forward, angle));
+        gate.center = vec4<f32>(center_2d.x, elevation, center_2d.y, 0.0);
+        gate.forward = vec4<f32>(forward_2d.x, 0.0, forward_2d.y, 0.0);
     } else {
-        gate.center = cursor_position + cursor_forward * stage.spacing;
-        gate.forward = cursor_forward;
+        let center_2d = cursor_position + cursor_forward * stage.spacing;
+        gate.center = vec4<f32>(center_2d.x, elevation, center_2d.y, 0.0);
+        gate.forward = vec4<f32>(cursor_forward.x, 0.0, cursor_forward.y, 0.0);
     }
-    gate.half_extents = vec2<f32>(stage.hole_half_width, stage.hole_half_height);
-    gate._pad0 = vec2<f32>(elevation, 0.0);
+    gate.half_extents = vec4<f32>(stage.hole_half_width, stage.hole_half_height, 0.0, 0.0);
     return gate;
 }
 
@@ -256,7 +309,7 @@ fn reset_env(index: u32) {
                 reset.seed,
             );
             gates.values[gate_slot(index, gate_index)] = gate;
-            cursor_position = gate.center;
+            cursor_position = vec2<f32>(gate.center.x, gate.center.z);
             gate_index = gate_index + 1u;
             local_gate_index = local_gate_index + 1u;
         }
@@ -270,27 +323,33 @@ fn reset_env(index: u32) {
             break;
         }
         let slot = gate_slot(index, gate_index);
-        gates.values[slot].center = vec2<f32>(0.0, 0.0);
-        gates.values[slot].half_extents = vec2<f32>(0.0, 0.0);
-        gates.values[slot].forward = vec2<f32>(0.0, 0.0);
-        gates.values[slot]._pad0 = vec2<f32>(0.0, 0.0);
+        gates.values[slot].center = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        gates.values[slot].half_extents = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        gates.values[slot].forward = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         gate_index = gate_index + 1u;
     }
 
     let first_gate = gates.values[base_slot];
-    let start_position = first_gate.center - first_gate.forward * 1.0;
-    states.values[index].position = start_position;
-    states.values[index].velocity = vec2<f32>(0.0, 0.0);
+    let start_position = first_gate.center.xyz - first_gate.forward.xyz * 1.2 + vec3<f32>(0.0, 0.2, 0.0);
+    let start_yaw = atan2(first_gate.forward.z, first_gate.forward.x);
+    states.values[index].position = vec4<f32>(start_position, 0.0);
+    states.values[index].velocity = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    states.values[index].attitude = vec4<f32>(0.0, 0.0, start_yaw, 0.0);
+    states.values[index].angular_velocity = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    states.values[index].motor_thrust = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     states.values[index].step_count = 0u;
     states.values[index].done = 0u;
     states.values[index].current_gate = 0u;
     states.values[index].current_lap = 0u;
 
-    observations.values[index].position = start_position;
-    observations.values[index].velocity = vec2<f32>(0.0, 0.0);
+    observations.values[index].position = vec4<f32>(start_position, 0.0);
+    observations.values[index].velocity = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    observations.values[index].attitude = vec4<f32>(0.0, 0.0, start_yaw, 0.0);
+    observations.values[index].angular_velocity = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     observations.values[index].target_gate_position = first_gate.center;
-    observations.values[index].progress = 0.0;
-    observations.values[index]._pad0 = 0.0;
+    observations.values[index].target_gate_forward_progress =
+        vec4<f32>(first_gate.forward.xyz, 0.0);
+    observations.values[index].metrics = vec4<f32>(0.0, 0.0, 1.0, 0.0);
 
     reward_done.values[index].reward = 0.0;
     reward_done.values[index].done = 0u;
@@ -321,30 +380,86 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var target_gate = current_target_gate(index, state.current_gate);
 
     if (state.done != 0u) {
+        let position = state.position.xyz;
+        let target_position = target_gate.center.xyz;
+        let to_gate = target_position - position;
+        let distance_to_gate = length(to_gate);
+        let target_forward = normalize(target_gate.forward.xyz);
+        let gate_alignment = max(
+            dot(normalize(select(target_forward, to_gate, distance_to_gate > 1e-5)), target_forward),
+            -1.0,
+        );
         observations.values[index].position = state.position;
         observations.values[index].velocity = state.velocity;
+        observations.values[index].attitude = state.attitude;
+        observations.values[index].angular_velocity = state.angular_velocity;
         observations.values[index].target_gate_position = target_gate.center;
-        observations.values[index].progress =
-            progress_value(state.current_lap, state.current_gate, generated_gate_count());
+        observations.values[index].target_gate_forward_progress = vec4<f32>(
+            target_forward,
+            progress_value(state.current_lap, state.current_gate, generated_gate_count()),
+        );
+        observations.values[index].metrics = vec4<f32>(
+            progress_value(state.current_lap, state.current_gate, generated_gate_count()),
+            distance_to_gate,
+            gate_alignment,
+            dot(state.motor_thrust, vec4<f32>(0.25)),
+        );
         reward_done.values[index].reward = 0.0;
         reward_done.values[index].done = 1u;
         return;
     }
 
-    let accel = actions.values[index].accel;
-    state.velocity = state.velocity + accel * params.dt_seconds;
-    state.position = state.position + state.velocity * params.dt_seconds;
+    let action = clamp_motor_command(actions.values[index].motor_command);
+    state.motor_thrust = state.motor_thrust
+        + (action - state.motor_thrust) * params.motor_response * params.dt_seconds;
+
+    var attitude = state.attitude.xyz;
+    let forward = body_forward(attitude);
+    let up = body_up(attitude);
+    let right = body_right(attitude);
+    let collective_thrust = dot(state.motor_thrust, vec4<f32>(1.0)) * params.thrust_scale;
+    let acceleration = up * (collective_thrust / params.mass)
+        - vec3<f32>(0.0, params.gravity, 0.0)
+        - state.velocity.xyz * params.linear_drag;
+
+    let roll_torque =
+        ((state.motor_thrust.y + state.motor_thrust.z) - (state.motor_thrust.x + state.motor_thrust.w))
+        * params.arm_length;
+    let pitch_torque =
+        ((state.motor_thrust.z + state.motor_thrust.w) - (state.motor_thrust.x + state.motor_thrust.y))
+        * params.arm_length;
+    let yaw_torque =
+        ((state.motor_thrust.x + state.motor_thrust.z) - (state.motor_thrust.y + state.motor_thrust.w))
+        * params.yaw_torque_scale;
+
+    state.angular_velocity = vec4<f32>(
+        state.angular_velocity.xyz
+            + (vec3<f32>(roll_torque, pitch_torque, yaw_torque)
+                - state.angular_velocity.xyz * params.angular_drag)
+                * params.dt_seconds,
+        0.0,
+    );
+    attitude = attitude + state.angular_velocity.xyz * params.dt_seconds;
+    attitude.x = clamp(attitude.x, -0.9, 0.9);
+    attitude.y = clamp(attitude.y, -0.9, 0.9);
+    attitude.z = wrap_angle(attitude.z);
+    state.attitude = vec4<f32>(attitude, 0.0);
+
+    state.velocity = vec4<f32>(state.velocity.xyz + acceleration * params.dt_seconds, 0.0);
+    state.position = vec4<f32>(state.position.xyz + state.velocity.xyz * params.dt_seconds, 0.0);
     state.step_count = state.step_count + 1u;
 
     let gate_count = generated_gate_count();
-    var delta = target_gate.center - state.position;
+    let target_position = target_gate.center.xyz;
+    let target_forward = normalize(target_gate.forward.xyz);
+    var delta = target_position - state.position.xyz;
     var distance_to_gate = length(delta);
-    let gate_radius = max(target_gate.half_extents.x, target_gate.half_extents.y) * 1.5;
+    let gate_radius = max(target_gate.half_extents.x, target_gate.half_extents.y) * 1.6;
     if (distance_to_gate <= gate_radius) {
         if (state.current_gate + 1u < gate_count) {
             state.current_gate = state.current_gate + 1u;
             target_gate = current_target_gate(index, state.current_gate);
-            delta = target_gate.center - state.position;
+            delta = target_gate.center.xyz - state.position.xyz;
             distance_to_gate = length(delta);
         } else if (course_header.loop_enabled != 0u
             && state.current_lap + 1u < max(course_header.laps_required, 1u))
@@ -352,7 +467,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             state.current_lap = state.current_lap + 1u;
             state.current_gate = 0u;
             target_gate = current_target_gate(index, 0u);
-            delta = target_gate.center - state.position;
+            delta = target_gate.center.xyz - state.position.xyz;
             distance_to_gate = length(delta);
         } else {
             state.done = 1u;
@@ -360,9 +475,12 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let out_of_bounds = abs(state.position.x) > params.bounds
-        || abs(state.position.y) > params.bounds;
+        || abs(state.position.z) > params.bounds
+        || state.position.y < params.min_altitude
+        || state.position.y > params.max_altitude;
     let reached_step_limit = state.step_count >= params.max_steps;
-    if (out_of_bounds || reached_step_limit) {
+    let excessive_tilt = abs(attitude.x) > 1.2 || abs(attitude.y) > 1.2;
+    if (out_of_bounds || reached_step_limit || excessive_tilt) {
         state.done = 1u;
     }
 
@@ -370,12 +488,28 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     observations.values[index].position = state.position;
     observations.values[index].velocity = state.velocity;
+    observations.values[index].attitude = state.attitude;
+    observations.values[index].angular_velocity = state.angular_velocity;
     observations.values[index].target_gate_position = target_gate.center;
-    observations.values[index].progress =
-        progress_value(state.current_lap, state.current_gate, gate_count);
-    observations.values[index]._pad0 = 0.0;
+    let progress = progress_value(state.current_lap, state.current_gate, gate_count);
+    let gate_alignment = max(
+        dot(normalize(select(target_forward, delta, distance_to_gate > 1e-5)), target_forward),
+        -1.0,
+    );
+    observations.values[index].target_gate_forward_progress = vec4<f32>(target_forward, progress);
+    observations.values[index].metrics = vec4<f32>(
+        progress,
+        distance_to_gate,
+        gate_alignment,
+        dot(state.motor_thrust, vec4<f32>(0.25)),
+    );
 
-    reward_done.values[index].reward = observations.values[index].progress * 2.0 - distance_to_gate;
+    let tilt_penalty = abs(attitude.x) + abs(attitude.y);
+    reward_done.values[index].reward =
+        progress * 6.0
+        - distance_to_gate * 0.35
+        + gate_alignment * 0.15
+        - tilt_penalty * 0.05;
     reward_done.values[index].done = state.done;
     reward_done.values[index]._pad0 = 0u;
     reward_done.values[index]._pad1 = 0u;
@@ -385,8 +519,15 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct EnvState {
-    pub position: [f32; 2],
-    pub velocity: [f32; 2],
+    pub position: [f32; 3],
+    pub _pad0: f32,
+    pub velocity: [f32; 3],
+    pub _pad1: f32,
+    pub attitude: [f32; 3],
+    pub _pad2: f32,
+    pub angular_velocity: [f32; 3],
+    pub _pad3: f32,
+    pub motor_thrust: [f32; 4],
     pub step_count: u32,
     pub done: u32,
     pub current_gate: u32,
@@ -396,28 +537,35 @@ pub struct EnvState {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Action {
-    pub accel: [f32; 2],
-    pub _pad: [f32; 2],
+    pub motor_command: [f32; 4],
 }
 
 impl Action {
     #[must_use]
-    pub fn new(accel: [f32; 2]) -> Self {
-        Self {
-            accel,
-            _pad: [0.0; 2],
-        }
+    pub fn new(motor_command: [f32; 4]) -> Self {
+        Self { motor_command }
     }
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Observation {
-    pub position: [f32; 2],
-    pub velocity: [f32; 2],
-    pub target_gate_position: [f32; 2],
+    pub position: [f32; 3],
+    pub _pad0: f32,
+    pub velocity: [f32; 3],
+    pub _pad1: f32,
+    pub attitude: [f32; 3],
+    pub _pad2: f32,
+    pub angular_velocity: [f32; 3],
+    pub _pad3: f32,
+    pub target_gate_position: [f32; 3],
+    pub _pad4: f32,
+    pub target_gate_forward: [f32; 3],
     pub progress: f32,
-    pub _pad: f32,
+    pub distance_to_gate: f32,
+    pub gate_alignment: f32,
+    pub mean_motor_thrust: f32,
+    pub _pad5: f32,
 }
 
 #[repr(C)]
@@ -461,10 +609,11 @@ pub struct EnvLayoutHeader {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Gate {
-    pub center: [f32; 2],
-    pub half_extents: [f32; 2],
-    pub forward: [f32; 2],
-    pub _pad: [f32; 2],
+    pub center: [f32; 3],
+    pub _pad0: f32,
+    pub half_extents: [f32; 4],
+    pub forward: [f32; 3],
+    pub _pad1: f32,
 }
 
 #[repr(C)]
@@ -472,10 +621,20 @@ pub struct Gate {
 struct SimParams {
     dt_seconds: f32,
     bounds: f32,
+    min_altitude: f32,
+    max_altitude: f32,
+    mass: f32,
+    gravity: f32,
+    thrust_scale: f32,
+    arm_length: f32,
+    yaw_torque_scale: f32,
+    linear_drag: f32,
+    angular_drag: f32,
+    motor_response: f32,
     env_count: u32,
     max_steps: u32,
     max_gates_per_env: u32,
-    _pad: [u32; 3],
+    _pad0: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -567,10 +726,20 @@ impl GpuSimulation {
         let params = SimParams {
             dt_seconds: config.dt_seconds,
             bounds: config.bounds,
+            min_altitude: 0.1,
+            max_altitude: config.bounds,
+            mass: 1.0,
+            gravity: 9.81,
+            thrust_scale: 4.2,
+            arm_length: 2.4,
+            yaw_torque_scale: 0.45,
+            linear_drag: 0.18,
+            angular_drag: 0.3,
+            motor_response: 8.0,
             env_count: config.env_count as u32,
             max_steps: config.max_steps,
             max_gates_per_env: config.max_gates_per_env as u32,
-            _pad: [0; 3],
+            _pad0: 0,
         };
 
         let state = renderer

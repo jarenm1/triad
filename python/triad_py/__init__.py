@@ -33,8 +33,13 @@ def _load_library() -> ctypes.CDLL:
 _lib = _load_library()
 
 __all__ = [
+    "ACTION_STRIDE",
+    "OBSERVATION_STRIDE",
+    "BenchmarkResult",
     "CourseSpec",
     "PackedStepResult",
+    "RolloutCollector",
+    "RolloutBatch",
     "SimulationConfig",
     "SimulationCore",
     "StageKind",
@@ -43,7 +48,11 @@ __all__ = [
     "TriadVecEnv",
     "TurnDirection",
     "build_basic_lap_course",
+    "benchmark_rollout",
+    "collect_rollout_numpy",
     "main",
+    "point_to_gate_policy",
+    "zero_policy",
 ]
 
 
@@ -59,6 +68,19 @@ def _last_error_message() -> str:
 def _require(success: bool) -> None:
     if not success:
         raise RuntimeError(_last_error_message())
+
+
+def _motor_action(action: Sequence[float]) -> _TriadAction:
+    if len(action) != ACTION_STRIDE:
+        raise ValueError(
+            f"expected {ACTION_STRIDE} motor commands per action, got {len(action)}"
+        )
+    return _TriadAction(
+        motor_0=float(action[0]),
+        motor_1=float(action[1]),
+        motor_2=float(action[2]),
+        motor_3=float(action[3]),
+    )
 
 
 @lru_cache(maxsize=1)
@@ -119,8 +141,10 @@ class _TriadSimConfig(ctypes.Structure):
 
 class _TriadAction(ctypes.Structure):
     _fields_ = [
-        ("accel_x", ctypes.c_float),
-        ("accel_y", ctypes.c_float),
+        ("motor_0", ctypes.c_float),
+        ("motor_1", ctypes.c_float),
+        ("motor_2", ctypes.c_float),
+        ("motor_3", ctypes.c_float),
     ]
 
 
@@ -136,8 +160,20 @@ class _TriadEnvState(ctypes.Structure):
     _fields_ = [
         ("position_x", ctypes.c_float),
         ("position_y", ctypes.c_float),
+        ("position_z", ctypes.c_float),
         ("velocity_x", ctypes.c_float),
         ("velocity_y", ctypes.c_float),
+        ("velocity_z", ctypes.c_float),
+        ("roll", ctypes.c_float),
+        ("pitch", ctypes.c_float),
+        ("yaw", ctypes.c_float),
+        ("angular_velocity_x", ctypes.c_float),
+        ("angular_velocity_y", ctypes.c_float),
+        ("angular_velocity_z", ctypes.c_float),
+        ("motor_0", ctypes.c_float),
+        ("motor_1", ctypes.c_float),
+        ("motor_2", ctypes.c_float),
+        ("motor_3", ctypes.c_float),
         ("step_count", ctypes.c_uint32),
         ("done", ctypes.c_uint32),
         ("current_gate", ctypes.c_uint32),
@@ -149,11 +185,26 @@ class _TriadObservation(ctypes.Structure):
     _fields_ = [
         ("position_x", ctypes.c_float),
         ("position_y", ctypes.c_float),
+        ("position_z", ctypes.c_float),
         ("velocity_x", ctypes.c_float),
         ("velocity_y", ctypes.c_float),
+        ("velocity_z", ctypes.c_float),
+        ("roll", ctypes.c_float),
+        ("pitch", ctypes.c_float),
+        ("yaw", ctypes.c_float),
+        ("angular_velocity_x", ctypes.c_float),
+        ("angular_velocity_y", ctypes.c_float),
+        ("angular_velocity_z", ctypes.c_float),
         ("target_gate_x", ctypes.c_float),
         ("target_gate_y", ctypes.c_float),
+        ("target_gate_z", ctypes.c_float),
+        ("target_gate_forward_x", ctypes.c_float),
+        ("target_gate_forward_y", ctypes.c_float),
+        ("target_gate_forward_z", ctypes.c_float),
         ("progress", ctypes.c_float),
+        ("distance_to_gate", ctypes.c_float),
+        ("gate_alignment", ctypes.c_float),
+        ("mean_motor_thrust", ctypes.c_float),
     ]
 
 
@@ -530,9 +581,9 @@ class SimulationCore:
         _require(_lib.triad_simulation_set_course(self._handle, course._handle))
         return self
 
-    def set_actions(self, actions: Sequence[tuple[float, float]]) -> "SimulationCore":
+    def set_actions(self, actions: Sequence[Sequence[float]]) -> "SimulationCore":
         ffi_actions = (_TriadAction * len(actions))(
-            *(_TriadAction(accel_x=x, accel_y=y) for x, y in actions)
+            *(_motor_action(action) for action in actions)
         )
         _require(
             _lib.triad_simulation_set_actions(self._handle, ffi_actions, len(actions))
@@ -600,10 +651,10 @@ class SimulationCore:
         return rewards, dones
 
     def step_actions(
-        self, actions: Sequence[tuple[float, float]], steps: int = 1
+        self, actions: Sequence[Sequence[float]], steps: int = 1
     ) -> PackedStepResult:
         ffi_actions = (_TriadAction * len(actions))(
-            *(_TriadAction(accel_x=x, accel_y=y) for x, y in actions)
+            *(_motor_action(action) for action in actions)
         )
         observations = self._allocate_flat_observation_buffer()
         rewards = self._allocate_reward_buffer()
@@ -658,8 +709,28 @@ class SimulationCore:
         )
         return [
             {
-                "position": [float(value.position_x), float(value.position_y)],
-                "velocity": [float(value.velocity_x), float(value.velocity_y)],
+                "position": [
+                    float(value.position_x),
+                    float(value.position_y),
+                    float(value.position_z),
+                ],
+                "velocity": [
+                    float(value.velocity_x),
+                    float(value.velocity_y),
+                    float(value.velocity_z),
+                ],
+                "attitude": [float(value.roll), float(value.pitch), float(value.yaw)],
+                "angular_velocity": [
+                    float(value.angular_velocity_x),
+                    float(value.angular_velocity_y),
+                    float(value.angular_velocity_z),
+                ],
+                "motor_thrust": [
+                    float(value.motor_0),
+                    float(value.motor_1),
+                    float(value.motor_2),
+                    float(value.motor_3),
+                ],
                 "step_count": int(value.step_count),
                 "done": bool(value.done),
                 "current_gate": int(value.current_gate),
@@ -677,13 +748,36 @@ class SimulationCore:
         )
         return [
             {
-                "position": [float(value.position_x), float(value.position_y)],
-                "velocity": [float(value.velocity_x), float(value.velocity_y)],
+                "position": [
+                    float(value.position_x),
+                    float(value.position_y),
+                    float(value.position_z),
+                ],
+                "velocity": [
+                    float(value.velocity_x),
+                    float(value.velocity_y),
+                    float(value.velocity_z),
+                ],
+                "attitude": [float(value.roll), float(value.pitch), float(value.yaw)],
+                "angular_velocity": [
+                    float(value.angular_velocity_x),
+                    float(value.angular_velocity_y),
+                    float(value.angular_velocity_z),
+                ],
                 "target_gate_position": [
                     float(value.target_gate_x),
                     float(value.target_gate_y),
+                    float(value.target_gate_z),
+                ],
+                "target_gate_forward": [
+                    float(value.target_gate_forward_x),
+                    float(value.target_gate_forward_y),
+                    float(value.target_gate_forward_z),
                 ],
                 "progress": float(value.progress),
+                "distance_to_gate": float(value.distance_to_gate),
+                "gate_alignment": float(value.gate_alignment),
+                "mean_motor_thrust": float(value.mean_motor_thrust),
             }
             for value in values
         ]
@@ -711,7 +805,7 @@ class TriadVecEnv:
         return self.sim.get_observations()
 
     def step(
-        self, actions: Sequence[tuple[float, float]]
+        self, actions: Sequence[Sequence[float]]
     ) -> tuple[
         list[dict[str, int | float]],
         list[float],
@@ -782,19 +876,24 @@ class TriadFastVecEnv:
         self._result.observations[:] = reset_obs
         return self._result.observations
 
-    def step(self, actions: Sequence[tuple[float, float]]) -> PackedStepResult:
+    def step(
+        self, actions: Sequence[Sequence[float]] | Sequence[float]
+    ) -> PackedStepResult:
         if len(actions) == len(self._action_values):
             self._action_values[:] = actions
         else:
             if len(actions) != self.sim.env_count:
                 raise ValueError(
-                    f"expected {self.sim.env_count} action pairs or {len(self._action_values)} flat values, got {len(actions)}"
+                    f"expected {self.sim.env_count} motor command rows or {len(self._action_values)} flat values, got {len(actions)}"
                 )
             write_index = 0
-            for accel_x, accel_y in actions:
-                self._action_values[write_index] = accel_x
-                self._action_values[write_index + 1] = accel_y
-                write_index += 2
+            for action in actions:
+                motor_action = _motor_action(action)
+                self._action_values[write_index] = motor_action.motor_0
+                self._action_values[write_index + 1] = motor_action.motor_1
+                self._action_values[write_index + 2] = motor_action.motor_2
+                self._action_values[write_index + 3] = motor_action.motor_3
+                write_index += ACTION_STRIDE
         return self.step_in_place(1)
 
     def step_in_place(self, steps: int = 1) -> PackedStepResult:
@@ -829,6 +928,17 @@ class TriadFastVecEnv:
     def rollout_numpy(self, steps: int) -> tuple[object, object, object]:
         result = self.rollout(steps)
         return result.numpy_views()
+
+
+from .rollout import (
+    BenchmarkResult,
+    RolloutBatch,
+    RolloutCollector,
+    benchmark_rollout,
+    collect_rollout_numpy,
+    point_to_gate_policy,
+    zero_policy,
+)
 
 
 def build_basic_lap_course() -> CourseSpec:
@@ -932,6 +1042,16 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "fast-demo", help="Run the packed-array fast env wrapper for a few steps"
     )
+    rollout_demo = subparsers.add_parser(
+        "rollout-demo", help="Collect a NumPy rollout batch with the fast env"
+    )
+    rollout_demo.add_argument("--horizon", type=int, default=16)
+    benchmark_demo = subparsers.add_parser(
+        "benchmark-demo", help="Benchmark fast rollout collection throughput"
+    )
+    benchmark_demo.add_argument("--horizon", type=int, default=32)
+    benchmark_demo.add_argument("--iterations", type=int, default=10)
+    benchmark_demo.add_argument("--warmup", type=int, default=1)
 
     custom = subparsers.add_parser("custom-course", help="Build a simple custom course")
     custom.add_argument("--name", default="custom-course")
@@ -988,7 +1108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sim = SimulationCore(_demo_config(course))
         try:
             sim.set_course(course).reset_all().step(1)
-            sim.set_actions([(0.0, 0.0)] * sim.env_count).step(4)
+            sim.set_actions([(0.0, 0.0, 0.0, 0.0)] * sim.env_count).step(4)
             _print_json(
                 {
                     "env_count": sim.env_count,
@@ -1007,7 +1127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         env = TriadVecEnv(sim)
         try:
             observations = env.reset()
-            step_result = env.step([(0.0, 0.0)] * sim.env_count)
+            step_result = env.step([(0.0, 0.0, 0.0, 0.0)] * sim.env_count)
             _print_json(
                 {
                     "reset_head": observations[:2],
@@ -1027,7 +1147,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         env = TriadFastVecEnv(sim)
         try:
             observations = env.reset()
-            result = env.step([(0.0, 0.0)] * sim.env_count)
+            result = env.step([(0.0, 0.0, 0.0, 0.0)] * sim.env_count)
             _print_json(
                 {
                     "reset_obs_len": len(observations),
@@ -1037,6 +1157,48 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "obs_head": result.observation_rows()[:2],
                 }
             )
+        finally:
+            sim.close()
+            course.close()
+        return 0
+
+    if args.command == "rollout-demo":
+        course = build_basic_lap_course()
+        sim = SimulationCore(_demo_config(course))
+        env = TriadFastVecEnv(sim)
+        try:
+            env.reset_numpy()
+            batch = collect_rollout_numpy(env, args.horizon, point_to_gate_policy)
+            _print_json(
+                {
+                    "horizon": args.horizon,
+                    "obs_shape": list(batch.observations.shape),
+                    "actions_shape": list(batch.actions.shape),
+                    "rewards_shape": list(batch.rewards.shape),
+                    "dones_shape": list(batch.dones.shape),
+                    "reward_head": batch.rewards[0, :4].tolist(),
+                    "done_head": batch.dones[0, :4].tolist(),
+                }
+            )
+        finally:
+            sim.close()
+            course.close()
+        return 0
+
+    if args.command == "benchmark-demo":
+        course = build_basic_lap_course()
+        sim = SimulationCore(_demo_config(course))
+        env = TriadFastVecEnv(sim)
+        try:
+            env.reset_numpy()
+            result = benchmark_rollout(
+                env,
+                args.horizon,
+                args.iterations,
+                point_to_gate_policy,
+                args.warmup,
+            )
+            _print_json(result.__dict__)
         finally:
             sim.close()
             course.close()

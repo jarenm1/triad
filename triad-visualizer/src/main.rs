@@ -167,7 +167,7 @@ struct UiState {
     gate_count: u32,
     current_gate: u32,
     done: bool,
-    position: [f32; 2],
+    position: [f32; 3],
 }
 
 impl Default for UiState {
@@ -183,7 +183,7 @@ impl Default for UiState {
             gate_count: 0,
             current_gate: 0,
             done: false,
-            position: [0.0, 0.0],
+            position: [0.0, 0.0, 0.0],
         }
     }
 }
@@ -318,7 +318,7 @@ impl VisualizerManager {
             })
             .build(registry)?;
 
-        let zero_actions = vec![Action::new([0.0, 0.0]); sim.env_count()];
+        let zero_actions = vec![Action::new([0.0; 4]); sim.env_count()];
         sim.set_actions(renderer, registry, &zero_actions)?;
 
         Ok(Self {
@@ -457,7 +457,7 @@ impl VisualizerManager {
             ui.gate_count = 0;
             ui.current_gate = 0;
             ui.done = false;
-            ui.position = [0.0, 0.0];
+            ui.position = [0.0, 0.0, 0.0];
         }
     }
 }
@@ -501,7 +501,7 @@ impl RendererManager for VisualizerManager {
         self.refresh_state_cache(renderer, registry)?;
 
         let selected_state_before_step = self.cached_states.get(self.selected_env).copied();
-        self.actions.fill(Action::new([0.0, 0.0]));
+        self.actions.fill(Action::new([0.0; 4]));
         if snapshot.running || snapshot.step_once {
             if let Some(state) = selected_state_before_step {
                 if let Some(target_gate) = self.target_gate(&state) {
@@ -633,8 +633,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         panel.label(format!("Current Gate: {}", ui.current_gate));
                         panel.label(format!("Done: {}", ui.done));
                         panel.label(format!(
-                            "Position: {:.2}, {:.2}",
-                            ui.position[0], ui.position[1]
+                            "Position: {:.2}, {:.2}, {:.2}",
+                            ui.position[0], ui.position[1], ui.position[2]
                         ));
                     });
             });
@@ -689,7 +689,7 @@ fn gate_bar_instances(gate: Gate) -> [RenderInstance; 4] {
     let hole_half_x = gate.half_extents[0].max(0.05);
     let hole_half_z = gate.half_extents[1].max(0.05);
     let thickness = (hole_half_x.min(hole_half_z) * 0.08).max(GATE_THICKNESS_MIN);
-    let center = [gate.center[0], gate._pad[0], gate.center[1]];
+    let center = gate.center;
     let gate_color = [0.96, 0.57, 0.14, 1.0];
 
     [
@@ -737,12 +737,18 @@ fn gate_bar_instances(gate: Gate) -> [RenderInstance; 4] {
 }
 
 fn drone_instance(state: EnvState, target_gate: Option<Gate>) -> RenderInstance {
-    let height = target_gate.map(|gate| gate._pad[0]).unwrap_or(0.0);
+    let yaw = state.attitude[2];
+    let forward = [yaw.cos(), 0.0, yaw.sin()];
+    let right = [forward[2], 0.0, -forward[0]];
+    let up = [0.0, 1.0, 0.0];
+    let height = target_gate
+        .map(|gate| gate.center[1])
+        .unwrap_or(state.position[1]);
     RenderInstance::oriented_box(
-        [state.position[0], height, state.position[1]],
-        [1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [0.0, 1.0, 0.0],
+        [state.position[0], height, state.position[2]],
+        right,
+        forward,
+        up,
         DRONE_HALF_EXTENTS,
         [0.25, 0.8, 0.95, 1.0],
     )
@@ -750,7 +756,7 @@ fn drone_instance(state: EnvState, target_gate: Option<Gate>) -> RenderInstance 
 
 fn target_instance(gate: Gate) -> RenderInstance {
     RenderInstance::oriented_box(
-        [gate.center[0], gate._pad[0], gate.center[1]],
+        [gate.center[0], gate.center[1], gate.center[2]],
         [1.0, 0.0, 0.0],
         [0.0, 0.0, 1.0],
         [0.0, 1.0, 0.0],
@@ -760,24 +766,43 @@ fn target_instance(gate: Gate) -> RenderInstance {
 }
 
 fn autopilot_action(state: EnvState, target_gate: Gate) -> Action {
-    let to_target = [
-        target_gate.center[0] - state.position[0],
-        target_gate.center[1] - state.position[1],
-    ];
-    let accel = [
-        to_target[0] * 2.5 - state.velocity[0] * 1.4,
-        to_target[1] * 2.5 - state.velocity[1] * 1.4,
-    ];
-    Action::new(accel)
+    let delta_x = target_gate.center[0] - state.position[0];
+    let delta_y = target_gate.center[1] - state.position[1];
+    let delta_z = target_gate.center[2] - state.position[2];
+    let yaw = state.attitude[2];
+    let heading = [yaw.cos(), yaw.sin()];
+    let right = [heading[1], -heading[0]];
+    let horizontal_delta = [delta_x, delta_z];
+    let horizontal_velocity = [state.velocity[0], state.velocity[2]];
+    let forward_error = horizontal_delta[0] * heading[0] + horizontal_delta[1] * heading[1];
+    let lateral_error = horizontal_delta[0] * right[0] + horizontal_delta[1] * right[1];
+    let forward_velocity =
+        horizontal_velocity[0] * heading[0] + horizontal_velocity[1] * heading[1];
+    let lateral_velocity = horizontal_velocity[0] * right[0] + horizontal_velocity[1] * right[1];
+    let desired_yaw = target_gate.forward[2].atan2(target_gate.forward[0]);
+    let yaw_error = ((desired_yaw - yaw) + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI;
+
+    let collective = (0.58 + delta_y * 0.22 - state.velocity[1] * 0.08).clamp(0.2, 0.9);
+    let roll_cmd = (-lateral_error * 0.07 + lateral_velocity * 0.04).clamp(-0.25, 0.25);
+    let pitch_cmd = (forward_error * 0.07 - forward_velocity * 0.04).clamp(-0.25, 0.25);
+    let yaw_cmd = (yaw_error * 0.18 - state.angular_velocity[2] * 0.05).clamp(-0.16, 0.16);
+
+    Action::new([
+        (collective - roll_cmd - pitch_cmd + yaw_cmd).clamp(0.0, 1.0),
+        (collective + roll_cmd - pitch_cmd - yaw_cmd).clamp(0.0, 1.0),
+        (collective + roll_cmd + pitch_cmd + yaw_cmd).clamp(0.0, 1.0),
+        (collective - roll_cmd + pitch_cmd - yaw_cmd).clamp(0.0, 1.0),
+    ])
 }
 
-fn normalized_xz(value: [f32; 2]) -> Option<[f32; 3]> {
-    let length_sq = value[0] * value[0] + value[1] * value[1];
+fn normalized_xz(value: [f32; 3]) -> Option<[f32; 3]> {
+    let length_sq = value[0] * value[0] + value[2] * value[2];
     if length_sq <= 1e-6 {
         return None;
     }
     let inv_len = length_sq.sqrt().recip();
-    Some([value[0] * inv_len, 0.0, value[1] * inv_len])
+    Some([value[0] * inv_len, 0.0, value[2] * inv_len])
 }
 
 fn hash_u32(mut value: u32) -> u32 {

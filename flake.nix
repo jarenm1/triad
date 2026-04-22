@@ -30,6 +30,7 @@
           default = pkgs.mkShell {
             packages = [
               rustToolchain.toolchain
+              pkgs.python3
               pkgs.pkg-config
               pkgs.openssl
               pkgs.wayland
@@ -39,6 +40,7 @@
               pkgs.vulkan-loader
               pkgs.llvmPackages.libclang
               pkgs.linuxHeaders
+              pkgs.uv
             ];
 
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";

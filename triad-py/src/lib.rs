@@ -1,4 +1,5 @@
 use std::ffi::{CStr, c_char};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
@@ -15,8 +16,8 @@ const STAGE_KIND_INTRO: u32 = 0;
 const STAGE_KIND_STRAIGHT: u32 = 1;
 const STAGE_KIND_OFFSET: u32 = 2;
 const STAGE_KIND_TURN90: u32 = 3;
-const ACTION_STRIDE: usize = 2;
-const OBSERVATION_STRIDE: usize = 7;
+const ACTION_STRIDE: usize = 4;
+const OBSERVATION_STRIDE: usize = 22;
 
 static LAST_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
 
@@ -32,6 +33,27 @@ fn set_last_error(message: impl Into<String>) {
 
 fn clear_last_error() {
     set_last_error("");
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_owned()
+    }
+}
+
+fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    clear_last_error();
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(value) => value,
+        Err(payload) => {
+            set_last_error(format!("panic in triad-py FFI: {}", panic_message(payload)));
+            default
+        }
+    }
 }
 
 #[repr(C)]
@@ -72,8 +94,10 @@ pub struct TriadSimConfig {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct TriadAction {
-    pub accel_x: f32,
-    pub accel_y: f32,
+    pub motor_0: f32,
+    pub motor_1: f32,
+    pub motor_2: f32,
+    pub motor_3: f32,
 }
 
 #[repr(C)]
@@ -89,8 +113,20 @@ pub struct TriadResetParams {
 pub struct TriadEnvState {
     pub position_x: f32,
     pub position_y: f32,
+    pub position_z: f32,
     pub velocity_x: f32,
     pub velocity_y: f32,
+    pub velocity_z: f32,
+    pub roll: f32,
+    pub pitch: f32,
+    pub yaw: f32,
+    pub angular_velocity_x: f32,
+    pub angular_velocity_y: f32,
+    pub angular_velocity_z: f32,
+    pub motor_0: f32,
+    pub motor_1: f32,
+    pub motor_2: f32,
+    pub motor_3: f32,
     pub step_count: u32,
     pub done: u32,
     pub current_gate: u32,
@@ -102,11 +138,26 @@ pub struct TriadEnvState {
 pub struct TriadObservation {
     pub position_x: f32,
     pub position_y: f32,
+    pub position_z: f32,
     pub velocity_x: f32,
     pub velocity_y: f32,
+    pub velocity_z: f32,
+    pub roll: f32,
+    pub pitch: f32,
+    pub yaw: f32,
+    pub angular_velocity_x: f32,
+    pub angular_velocity_y: f32,
+    pub angular_velocity_z: f32,
     pub target_gate_x: f32,
     pub target_gate_y: f32,
+    pub target_gate_z: f32,
+    pub target_gate_forward_x: f32,
+    pub target_gate_forward_y: f32,
+    pub target_gate_forward_z: f32,
     pub progress: f32,
+    pub distance_to_gate: f32,
+    pub gate_alignment: f32,
+    pub mean_motor_thrust: f32,
 }
 
 #[repr(C)]
@@ -174,7 +225,7 @@ impl TriadSimulation {
         let mut registry = ResourceRegistry::default();
         let simulation = GpuSimulation::new(&renderer, &mut registry, config.into())
             .map_err(|error| format!("simulation init failed: {error}"))?;
-        let zero_actions = vec![Action::new([0.0, 0.0]); simulation.env_count()];
+        let zero_actions = vec![Action::new([0.0; 4]); simulation.env_count()];
         simulation
             .set_actions(&renderer, &registry, &zero_actions)
             .map_err(|error| format!("failed to zero actions: {error}"))?;
@@ -262,7 +313,14 @@ fn copy_vec_to_out<T: Copy>(values: &[T], out: *mut T, out_len: usize) -> Result
 fn convert_actions(actions: &[TriadAction]) -> Vec<Action> {
     actions
         .iter()
-        .map(|action| Action::new([action.accel_x, action.accel_y]))
+        .map(|action| {
+            Action::new([
+                action.motor_0,
+                action.motor_1,
+                action.motor_2,
+                action.motor_3,
+            ])
+        })
         .collect()
 }
 
@@ -287,7 +345,7 @@ fn write_flat_actions_into_scratch(
     }
 
     for (index, chunk) in action_values.chunks_exact(ACTION_STRIDE).enumerate() {
-        scratch[index] = Action::new([chunk[0], chunk[1]]);
+        scratch[index] = Action::new([chunk[0], chunk[1], chunk[2], chunk[3]]);
     }
     Ok(())
 }
@@ -303,8 +361,20 @@ fn convert_state(state: &EnvState) -> TriadEnvState {
     TriadEnvState {
         position_x: state.position[0],
         position_y: state.position[1],
+        position_z: state.position[2],
         velocity_x: state.velocity[0],
         velocity_y: state.velocity[1],
+        velocity_z: state.velocity[2],
+        roll: state.attitude[0],
+        pitch: state.attitude[1],
+        yaw: state.attitude[2],
+        angular_velocity_x: state.angular_velocity[0],
+        angular_velocity_y: state.angular_velocity[1],
+        angular_velocity_z: state.angular_velocity[2],
+        motor_0: state.motor_thrust[0],
+        motor_1: state.motor_thrust[1],
+        motor_2: state.motor_thrust[2],
+        motor_3: state.motor_thrust[3],
         step_count: state.step_count,
         done: state.done,
         current_gate: state.current_gate,
@@ -316,11 +386,26 @@ fn convert_observation(observation: &Observation) -> TriadObservation {
     TriadObservation {
         position_x: observation.position[0],
         position_y: observation.position[1],
+        position_z: observation.position[2],
         velocity_x: observation.velocity[0],
         velocity_y: observation.velocity[1],
+        velocity_z: observation.velocity[2],
+        roll: observation.attitude[0],
+        pitch: observation.attitude[1],
+        yaw: observation.attitude[2],
+        angular_velocity_x: observation.angular_velocity[0],
+        angular_velocity_y: observation.angular_velocity[1],
+        angular_velocity_z: observation.angular_velocity[2],
         target_gate_x: observation.target_gate_position[0],
         target_gate_y: observation.target_gate_position[1],
+        target_gate_z: observation.target_gate_position[2],
+        target_gate_forward_x: observation.target_gate_forward[0],
+        target_gate_forward_y: observation.target_gate_forward[1],
+        target_gate_forward_z: observation.target_gate_forward[2],
         progress: observation.progress,
+        distance_to_gate: observation.distance_to_gate,
+        gate_alignment: observation.gate_alignment,
+        mean_motor_thrust: observation.mean_motor_thrust,
     }
 }
 
@@ -337,11 +422,26 @@ fn flatten_observations(observations: &[Observation]) -> Vec<f32> {
         flat.extend_from_slice(&[
             observation.position[0],
             observation.position[1],
+            observation.position[2],
             observation.velocity[0],
             observation.velocity[1],
+            observation.velocity[2],
+            observation.attitude[0],
+            observation.attitude[1],
+            observation.attitude[2],
+            observation.angular_velocity[0],
+            observation.angular_velocity[1],
+            observation.angular_velocity[2],
             observation.target_gate_position[0],
             observation.target_gate_position[1],
+            observation.target_gate_position[2],
+            observation.target_gate_forward[0],
+            observation.target_gate_forward[1],
+            observation.target_gate_forward[2],
             observation.progress,
+            observation.distance_to_gate,
+            observation.gate_alignment,
+            observation.mean_motor_thrust,
         ]);
     }
     flat
@@ -512,35 +612,36 @@ pub extern "C" fn triad_observation_stride() -> usize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn triad_simulation_create(config: TriadSimConfig) -> *mut TriadSimulation {
-    clear_last_error();
-    match TriadSimulation::new(config) {
+    ffi_guard(ptr::null_mut(), || match TriadSimulation::new(config) {
         Ok(simulation) => Box::into_raw(Box::new(simulation)),
         Err(error) => {
             set_last_error(error);
             ptr::null_mut()
         }
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn triad_simulation_destroy(simulation: *mut TriadSimulation) {
-    clear_last_error();
-    if simulation.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(simulation));
-    }
+    ffi_guard((), || {
+        if simulation.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(simulation));
+        }
+    });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn triad_simulation_env_count(simulation: *mut TriadSimulation) -> u32 {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return 0;
-    };
-    simulation.simulation.env_count() as u32
+    ffi_guard(0, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
+            return 0;
+        };
+        simulation.simulation.env_count() as u32
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -548,25 +649,26 @@ pub extern "C" fn triad_simulation_set_course(
     simulation: *mut TriadSimulation,
     course: *mut CourseSpec,
 ) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    let Some(course) = course_from_ptr(course) else {
-        set_last_error("course pointer was null");
-        return false;
-    };
-    match simulation
-        .simulation
-        .set_course(&simulation.renderer, &simulation.registry, course)
-    {
-        Ok(()) => true,
-        Err(error) => {
-            set_last_error(format!("failed to set course: {error}"));
-            false
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
+            return false;
+        };
+        let Some(course) = course_from_ptr(course) else {
+            set_last_error("course pointer was null");
+            return false;
+        };
+        match simulation
+            .simulation
+            .set_course(&simulation.renderer, &simulation.registry, course)
+        {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(format!("failed to set course: {error}"));
+                false
+            }
         }
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -575,27 +677,29 @@ pub extern "C" fn triad_simulation_set_actions(
     actions: *const TriadAction,
     action_count: usize,
 ) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    if actions.is_null() {
-        set_last_error("actions pointer was null");
-        return false;
-    }
-    let actions = unsafe { std::slice::from_raw_parts(actions, action_count) };
-    let converted = convert_actions(actions);
-    match simulation
-        .simulation
-        .set_actions(&simulation.renderer, &simulation.registry, &converted)
-    {
-        Ok(()) => true,
-        Err(error) => {
-            set_last_error(format!("failed to set actions: {error}"));
-            false
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
+            return false;
+        };
+        if actions.is_null() {
+            set_last_error("actions pointer was null");
+            return false;
         }
-    }
+        let actions = unsafe { std::slice::from_raw_parts(actions, action_count) };
+        let converted = convert_actions(actions);
+        match simulation.simulation.set_actions(
+            &simulation.renderer,
+            &simulation.registry,
+            &converted,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(format!("failed to set actions: {error}"));
+                false
+            }
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -604,47 +708,49 @@ pub extern "C" fn triad_simulation_set_reset_params(
     reset_params: *const TriadResetParams,
     reset_param_count: usize,
 ) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    if reset_params.is_null() {
-        set_last_error("reset params pointer was null");
-        return false;
-    }
-    let reset_params = unsafe { std::slice::from_raw_parts(reset_params, reset_param_count) };
-    let converted = convert_reset_params(reset_params);
-    match simulation.simulation.set_reset_params(
-        &simulation.renderer,
-        &simulation.registry,
-        &converted,
-    ) {
-        Ok(()) => true,
-        Err(error) => {
-            set_last_error(format!("failed to set reset params: {error}"));
-            false
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
+            return false;
+        };
+        if reset_params.is_null() {
+            set_last_error("reset params pointer was null");
+            return false;
         }
-    }
+        let reset_params = unsafe { std::slice::from_raw_parts(reset_params, reset_param_count) };
+        let converted = convert_reset_params(reset_params);
+        match simulation.simulation.set_reset_params(
+            &simulation.renderer,
+            &simulation.registry,
+            &converted,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(format!("failed to set reset params: {error}"));
+                false
+            }
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn triad_simulation_reset_all(simulation: *mut TriadSimulation) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    match simulation
-        .simulation
-        .reset_all(&simulation.renderer, &simulation.registry)
-    {
-        Ok(()) => true,
-        Err(error) => {
-            set_last_error(format!("failed to reset simulation: {error}"));
-            false
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
+            return false;
+        };
+        match simulation
+            .simulation
+            .reset_all(&simulation.renderer, &simulation.registry)
+        {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(format!("failed to reset simulation: {error}"));
+                false
+            }
         }
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -653,44 +759,46 @@ pub extern "C" fn triad_simulation_request_resets(
     env_indices: *const u32,
     env_index_count: usize,
 ) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    if env_indices.is_null() {
-        set_last_error("env indices pointer was null");
-        return false;
-    }
-    let env_indices = unsafe { std::slice::from_raw_parts(env_indices, env_index_count) };
-    let env_indices = env_indices
-        .iter()
-        .map(|value| *value as usize)
-        .collect::<Vec<_>>();
-    match simulation.simulation.request_resets(
-        &simulation.renderer,
-        &simulation.registry,
-        &env_indices,
-    ) {
-        Ok(()) => true,
-        Err(error) => {
-            set_last_error(format!("failed to request resets: {error}"));
-            false
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
+            return false;
+        };
+        if env_indices.is_null() {
+            set_last_error("env indices pointer was null");
+            return false;
         }
-    }
+        let env_indices = unsafe { std::slice::from_raw_parts(env_indices, env_index_count) };
+        let env_indices = env_indices
+            .iter()
+            .map(|value| *value as usize)
+            .collect::<Vec<_>>();
+        match simulation.simulation.request_resets(
+            &simulation.renderer,
+            &simulation.registry,
+            &env_indices,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(format!("failed to request resets: {error}"));
+                false
+            }
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn triad_simulation_step(simulation: *mut TriadSimulation, steps: usize) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    simulation
-        .simulation
-        .step_n(&simulation.renderer, &simulation.registry, steps.max(1));
-    true
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
+            return false;
+        };
+        simulation
+            .simulation
+            .step_n(&simulation.renderer, &simulation.registry, steps.max(1));
+        true
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -699,29 +807,30 @@ pub extern "C" fn triad_simulation_readback_state(
     out_states: *mut TriadEnvState,
     out_count: usize,
 ) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    let values = match simulation
-        .simulation
-        .readback_state(&simulation.renderer, &simulation.registry)
-    {
-        Ok(values) => values,
-        Err(error) => {
-            set_last_error(format!("failed to read back state: {error}"));
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
             return false;
+        };
+        let values = match simulation
+            .simulation
+            .readback_state(&simulation.renderer, &simulation.registry)
+        {
+            Ok(values) => values,
+            Err(error) => {
+                set_last_error(format!("failed to read back state: {error}"));
+                return false;
+            }
+        };
+        let converted = values.iter().map(convert_state).collect::<Vec<_>>();
+        match copy_vec_to_out(&converted, out_states, out_count) {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(error);
+                false
+            }
         }
-    };
-    let converted = values.iter().map(convert_state).collect::<Vec<_>>();
-    match copy_vec_to_out(&converted, out_states, out_count) {
-        Ok(()) => true,
-        Err(error) => {
-            set_last_error(error);
-            false
-        }
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -730,29 +839,30 @@ pub extern "C" fn triad_simulation_readback_observations(
     out_observations: *mut TriadObservation,
     out_count: usize,
 ) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    let values = match simulation
-        .simulation
-        .readback_observations(&simulation.renderer, &simulation.registry)
-    {
-        Ok(values) => values,
-        Err(error) => {
-            set_last_error(format!("failed to read back observations: {error}"));
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
             return false;
+        };
+        let values = match simulation
+            .simulation
+            .readback_observations(&simulation.renderer, &simulation.registry)
+        {
+            Ok(values) => values,
+            Err(error) => {
+                set_last_error(format!("failed to read back observations: {error}"));
+                return false;
+            }
+        };
+        let converted = values.iter().map(convert_observation).collect::<Vec<_>>();
+        match copy_vec_to_out(&converted, out_observations, out_count) {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(error);
+                false
+            }
         }
-    };
-    let converted = values.iter().map(convert_observation).collect::<Vec<_>>();
-    match copy_vec_to_out(&converted, out_observations, out_count) {
-        Ok(()) => true,
-        Err(error) => {
-            set_last_error(error);
-            false
-        }
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -761,29 +871,30 @@ pub extern "C" fn triad_simulation_readback_observations_flat(
     out_observations: *mut f32,
     out_count: usize,
 ) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    let values = match simulation
-        .simulation
-        .readback_observations(&simulation.renderer, &simulation.registry)
-    {
-        Ok(values) => values,
-        Err(error) => {
-            set_last_error(format!("failed to read back observations: {error}"));
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
             return false;
+        };
+        let values = match simulation
+            .simulation
+            .readback_observations(&simulation.renderer, &simulation.registry)
+        {
+            Ok(values) => values,
+            Err(error) => {
+                set_last_error(format!("failed to read back observations: {error}"));
+                return false;
+            }
+        };
+        let flat = flatten_observations(&values);
+        match copy_vec_to_out(&flat, out_observations, out_count) {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(error);
+                false
+            }
         }
-    };
-    let flat = flatten_observations(&values);
-    match copy_vec_to_out(&flat, out_observations, out_count) {
-        Ok(()) => true,
-        Err(error) => {
-            set_last_error(error);
-            false
-        }
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -792,29 +903,30 @@ pub extern "C" fn triad_simulation_readback_reward_done(
     out_reward_done: *mut TriadRewardDone,
     out_count: usize,
 ) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    let values = match simulation
-        .simulation
-        .readback_reward_done(&simulation.renderer, &simulation.registry)
-    {
-        Ok(values) => values,
-        Err(error) => {
-            set_last_error(format!("failed to read back reward_done: {error}"));
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
             return false;
+        };
+        let values = match simulation
+            .simulation
+            .readback_reward_done(&simulation.renderer, &simulation.registry)
+        {
+            Ok(values) => values,
+            Err(error) => {
+                set_last_error(format!("failed to read back reward_done: {error}"));
+                return false;
+            }
+        };
+        let converted = values.iter().map(convert_reward_done).collect::<Vec<_>>();
+        match copy_vec_to_out(&converted, out_reward_done, out_count) {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(error);
+                false
+            }
         }
-    };
-    let converted = values.iter().map(convert_reward_done).collect::<Vec<_>>();
-    match copy_vec_to_out(&converted, out_reward_done, out_count) {
-        Ok(()) => true,
-        Err(error) => {
-            set_last_error(error);
-            false
-        }
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -825,33 +937,34 @@ pub extern "C" fn triad_simulation_readback_reward_done_flat(
     out_dones: *mut u8,
     done_count: usize,
 ) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    let values = match simulation
-        .simulation
-        .readback_reward_done(&simulation.renderer, &simulation.registry)
-    {
-        Ok(values) => values,
-        Err(error) => {
-            set_last_error(format!("failed to read back reward_done: {error}"));
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
+            return false;
+        };
+        let values = match simulation
+            .simulation
+            .readback_reward_done(&simulation.renderer, &simulation.registry)
+        {
+            Ok(values) => values,
+            Err(error) => {
+                set_last_error(format!("failed to read back reward_done: {error}"));
+                return false;
+            }
+        };
+        let (rewards, dones) = flatten_reward_done(&values);
+        if let Err(error) = copy_vec_to_out(&rewards, out_rewards, reward_count) {
+            set_last_error(error);
             return false;
         }
-    };
-    let (rewards, dones) = flatten_reward_done(&values);
-    if let Err(error) = copy_vec_to_out(&rewards, out_rewards, reward_count) {
-        set_last_error(error);
-        return false;
-    }
-    match copy_vec_to_out(&dones, out_dones, done_count) {
-        Ok(()) => true,
-        Err(error) => {
-            set_last_error(error);
-            false
+        match copy_vec_to_out(&dones, out_dones, done_count) {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(error);
+                false
+            }
         }
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -867,67 +980,69 @@ pub extern "C" fn triad_simulation_step_actions_readback(
     out_dones: *mut u8,
     done_count: usize,
 ) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    if actions.is_null() {
-        set_last_error("actions pointer was null");
-        return false;
-    }
-    let actions = unsafe { std::slice::from_raw_parts(actions, action_count) };
-    let converted = convert_actions(actions);
-    if let Err(error) =
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
+            return false;
+        };
+        if actions.is_null() {
+            set_last_error("actions pointer was null");
+            return false;
+        }
+        let actions = unsafe { std::slice::from_raw_parts(actions, action_count) };
+        let converted = convert_actions(actions);
+        if let Err(error) = simulation.simulation.set_actions(
+            &simulation.renderer,
+            &simulation.registry,
+            &converted,
+        ) {
+            set_last_error(format!("failed to set actions: {error}"));
+            return false;
+        }
         simulation
             .simulation
-            .set_actions(&simulation.renderer, &simulation.registry, &converted)
-    {
-        set_last_error(format!("failed to set actions: {error}"));
-        return false;
-    }
-    simulation
-        .simulation
-        .step_n(&simulation.renderer, &simulation.registry, steps.max(1));
+            .step_n(&simulation.renderer, &simulation.registry, steps.max(1));
 
-    let observations = match simulation
-        .simulation
-        .readback_observations(&simulation.renderer, &simulation.registry)
-    {
-        Ok(values) => values,
-        Err(error) => {
-            set_last_error(format!("failed to read back observations: {error}"));
-            return false;
-        }
-    };
-    let flat_observations = flatten_observations(&observations);
-    if let Err(error) = copy_vec_to_out(&flat_observations, out_observations, observation_count) {
-        set_last_error(error);
-        return false;
-    }
-
-    let reward_done = match simulation
-        .simulation
-        .readback_reward_done(&simulation.renderer, &simulation.registry)
-    {
-        Ok(values) => values,
-        Err(error) => {
-            set_last_error(format!("failed to read back reward_done: {error}"));
-            return false;
-        }
-    };
-    let (rewards, dones) = flatten_reward_done(&reward_done);
-    if let Err(error) = copy_vec_to_out(&rewards, out_rewards, reward_count) {
-        set_last_error(error);
-        return false;
-    }
-    match copy_vec_to_out(&dones, out_dones, done_count) {
-        Ok(()) => true,
-        Err(error) => {
+        let observations = match simulation
+            .simulation
+            .readback_observations(&simulation.renderer, &simulation.registry)
+        {
+            Ok(values) => values,
+            Err(error) => {
+                set_last_error(format!("failed to read back observations: {error}"));
+                return false;
+            }
+        };
+        let flat_observations = flatten_observations(&observations);
+        if let Err(error) = copy_vec_to_out(&flat_observations, out_observations, observation_count)
+        {
             set_last_error(error);
-            false
+            return false;
         }
-    }
+
+        let reward_done = match simulation
+            .simulation
+            .readback_reward_done(&simulation.renderer, &simulation.registry)
+        {
+            Ok(values) => values,
+            Err(error) => {
+                set_last_error(format!("failed to read back reward_done: {error}"));
+                return false;
+            }
+        };
+        let (rewards, dones) = flatten_reward_done(&reward_done);
+        if let Err(error) = copy_vec_to_out(&rewards, out_rewards, reward_count) {
+            set_last_error(error);
+            return false;
+        }
+        match copy_vec_to_out(&dones, out_dones, done_count) {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(error);
+                false
+            }
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -943,72 +1058,75 @@ pub extern "C" fn triad_simulation_step_flat_actions_readback(
     out_dones: *mut u8,
     done_count: usize,
 ) -> bool {
-    clear_last_error();
-    let Some(simulation) = simulation_from_ptr(simulation) else {
-        set_last_error("simulation pointer was null");
-        return false;
-    };
-    if action_values.is_null() {
-        set_last_error("action values pointer was null");
-        return false;
-    }
-    let action_values = unsafe { std::slice::from_raw_parts(action_values, action_value_count) };
-    if let Err(error) =
-        write_flat_actions_into_scratch(&mut simulation.action_scratch, action_values)
-    {
-        set_last_error(error);
-        return false;
-    }
-    if let Err(error) = simulation.simulation.set_actions(
-        &simulation.renderer,
-        &simulation.registry,
-        &simulation.action_scratch,
-    ) {
-        set_last_error(format!("failed to set actions: {error}"));
-        return false;
-    }
-    simulation
-        .simulation
-        .step_n(&simulation.renderer, &simulation.registry, steps.max(1));
-
-    let observations = match simulation
-        .simulation
-        .readback_observations(&simulation.renderer, &simulation.registry)
-    {
-        Ok(values) => values,
-        Err(error) => {
-            set_last_error(format!("failed to read back observations: {error}"));
+    ffi_guard(false, || {
+        let Some(simulation) = simulation_from_ptr(simulation) else {
+            set_last_error("simulation pointer was null");
+            return false;
+        };
+        if action_values.is_null() {
+            set_last_error("action values pointer was null");
             return false;
         }
-    };
-    let flat_observations = flatten_observations(&observations);
-    if let Err(error) = copy_vec_to_out(&flat_observations, out_observations, observation_count) {
-        set_last_error(error);
-        return false;
-    }
-
-    let reward_done = match simulation
-        .simulation
-        .readback_reward_done(&simulation.renderer, &simulation.registry)
-    {
-        Ok(values) => values,
-        Err(error) => {
-            set_last_error(format!("failed to read back reward_done: {error}"));
-            return false;
-        }
-    };
-    let (rewards, dones) = flatten_reward_done(&reward_done);
-    if let Err(error) = copy_vec_to_out(&rewards, out_rewards, reward_count) {
-        set_last_error(error);
-        return false;
-    }
-    match copy_vec_to_out(&dones, out_dones, done_count) {
-        Ok(()) => true,
-        Err(error) => {
+        let action_values =
+            unsafe { std::slice::from_raw_parts(action_values, action_value_count) };
+        if let Err(error) =
+            write_flat_actions_into_scratch(&mut simulation.action_scratch, action_values)
+        {
             set_last_error(error);
-            false
+            return false;
         }
-    }
+        if let Err(error) = simulation.simulation.set_actions(
+            &simulation.renderer,
+            &simulation.registry,
+            &simulation.action_scratch,
+        ) {
+            set_last_error(format!("failed to set actions: {error}"));
+            return false;
+        }
+        simulation
+            .simulation
+            .step_n(&simulation.renderer, &simulation.registry, steps.max(1));
+
+        let observations = match simulation
+            .simulation
+            .readback_observations(&simulation.renderer, &simulation.registry)
+        {
+            Ok(values) => values,
+            Err(error) => {
+                set_last_error(format!("failed to read back observations: {error}"));
+                return false;
+            }
+        };
+        let flat_observations = flatten_observations(&observations);
+        if let Err(error) = copy_vec_to_out(&flat_observations, out_observations, observation_count)
+        {
+            set_last_error(error);
+            return false;
+        }
+
+        let reward_done = match simulation
+            .simulation
+            .readback_reward_done(&simulation.renderer, &simulation.registry)
+        {
+            Ok(values) => values,
+            Err(error) => {
+                set_last_error(format!("failed to read back reward_done: {error}"));
+                return false;
+            }
+        };
+        let (rewards, dones) = flatten_reward_done(&reward_done);
+        if let Err(error) = copy_vec_to_out(&rewards, out_rewards, reward_count) {
+            set_last_error(error);
+            return false;
+        }
+        match copy_vec_to_out(&dones, out_dones, done_count) {
+            Ok(()) => true,
+            Err(error) => {
+                set_last_error(error);
+                false
+            }
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
