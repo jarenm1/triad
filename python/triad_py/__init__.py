@@ -37,6 +37,8 @@ __all__ = [
     "OBSERVATION_STRIDE",
     "BenchmarkResult",
     "CourseSpec",
+    "CurriculumPhase",
+    "CurriculumSchedule",
     "PackedStepResult",
     "RolloutCollector",
     "RolloutBatch",
@@ -49,10 +51,12 @@ __all__ = [
     "TriadVecEnv",
     "TurnDirection",
     "build_basic_lap_course",
+    "build_teacher_curriculum_schedule",
     "benchmark_rollout",
     "collect_rollout_numpy",
     "main",
     "point_to_gate_policy",
+    "sample_curriculum_reset_params",
     "zero_policy",
 ]
 
@@ -347,6 +351,13 @@ _lib.triad_simulation_step_flat_actions_readback.restype = ctypes.c_bool
 
 ACTION_STRIDE = int(_lib.triad_action_stride())
 OBSERVATION_STRIDE = int(_lib.triad_observation_stride())
+
+from .curriculum import (  # noqa: E402
+    CurriculumPhase,
+    CurriculumSchedule,
+    build_teacher_curriculum_schedule,
+    sample_curriculum_reset_params,
+)
 
 
 @dataclass
@@ -1087,6 +1098,12 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     benchmark_demo.add_argument("--horizon", type=int, default=32)
     benchmark_demo.add_argument("--iterations", type=int, default=10)
     benchmark_demo.add_argument("--warmup", type=int, default=1)
+    curriculum_demo = subparsers.add_parser(
+        "curriculum-demo", help="Sample reset params from the default curriculum"
+    )
+    curriculum_demo.add_argument("--progress", type=float, default=0.0)
+    curriculum_demo.add_argument("--env-count", type=int, default=8)
+    curriculum_demo.add_argument("--seed", type=int, default=0)
 
     custom = subparsers.add_parser("custom-course", help="Build a simple custom course")
     custom.add_argument("--name", default="custom-course")
@@ -1237,6 +1254,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         finally:
             sim.close()
             course.close()
+        return 0
+
+    if args.command == "curriculum-demo":
+        schedule = build_teacher_curriculum_schedule()
+        phase = schedule.phase_for_progress(args.progress)
+        _print_json(
+            {
+                "progress": max(0.0, min(1.0, float(args.progress))),
+                "phase": phase.name,
+                "curriculum_stage": int(phase.curriculum_stage),
+                "difficulty_range": [
+                    phase.difficulty_min,
+                    phase.difficulty_max,
+                ],
+                "grammar_ids": list(phase.grammar_ids),
+                "reset_params_head": sample_curriculum_reset_params(
+                    args.env_count,
+                    args.progress,
+                    args.seed,
+                    schedule,
+                )[: min(args.env_count, 4)],
+            }
+        )
         return 0
 
     course = (
