@@ -22,7 +22,12 @@ use triad_window::{
 const WINDOW_TITLE: &str = "Triad Visualizer";
 const GATE_DEPTH_HALF: f32 = 0.015;
 const GATE_THICKNESS_MIN: f32 = 0.035;
-const DRONE_HALF_EXTENTS: [f32; 3] = [0.08, 0.08, 0.05];
+const DRONE_CORE_HALF_EXTENTS: [f32; 3] = [0.06, 0.025, 0.035];
+const DRONE_ARM_HALF_EXTENTS: [f32; 3] = [0.14, 0.015, 0.015];
+const DRONE_MOTOR_HALF_EXTENTS: [f32; 3] = [0.028, 0.018, 0.028];
+const DRONE_ARM_OFFSET: f32 = 0.11;
+const DRONE_MOTOR_OFFSET: f32 = 0.22;
+const DRONE_MODEL_INSTANCE_COUNT: usize = 9;
 const TARGET_HALF_EXTENTS: [f32; 3] = [0.05, 0.05, 0.05];
 const VISUALIZER_ENV_COUNT: usize = 128;
 const DONE_REASON_COMPLETE: u32 = 1 << 0;
@@ -699,9 +704,11 @@ impl VisualizerManager {
 
         if let Some(state) = selected_state {
             let target_gate = self.target_gate_for_env(self.selected_env, &state);
-            if let Some(slot) = self.instances.get_mut(write_index) {
-                *slot = drone_instance(state, target_gate);
-                write_index += 1;
+            for instance in drone_instances(state) {
+                if let Some(slot) = self.instances.get_mut(write_index) {
+                    *slot = instance;
+                    write_index += 1;
+                }
             }
             if let Some(target_gate) = target_gate {
                 if let Some(slot) = self.instances.get_mut(write_index) {
@@ -1064,7 +1071,10 @@ fn init_logging() {
 }
 
 fn visible_instance_capacity(max_gates_per_env: usize) -> usize {
-    max_gates_per_env * 4 + max_obstacles_per_env(max_gates_per_env) + 2
+    max_gates_per_env * 4
+        + max_obstacles_per_env(max_gates_per_env)
+        + DRONE_MODEL_INSTANCE_COUNT
+        + 1
 }
 
 fn required_gate_capacity(course: &CourseSpec) -> usize {
@@ -1213,19 +1223,81 @@ fn obstacle_instance(obstacle: Gate) -> RenderInstance {
     )
 }
 
-fn drone_instance(state: EnvState, _target_gate: Option<Gate>) -> RenderInstance {
+fn drone_instances(state: EnvState) -> Vec<RenderInstance> {
     let yaw = state.attitude[2];
-    let forward = [yaw.cos(), 0.0, yaw.sin()];
-    let right = [forward[2], 0.0, -forward[0]];
-    let up = [0.0, 1.0, 0.0];
-    RenderInstance::oriented_box(
-        [state.position[0], state.position[1], state.position[2]],
+    let (roll, pitch) = (state.attitude[0], state.attitude[1]);
+    let (cy, sy) = (yaw.cos(), yaw.sin());
+    let (cr, sr) = (roll.cos(), roll.sin());
+    let (cp, sp) = (pitch.cos(), pitch.sin());
+    let forward = [cy * cp, sp, sy * cp];
+    let right = [cy * sp * sr + sy * cr, cp * sr, sy * sp * sr - cy * cr];
+    let up = [cy * sp * cr - sy * sr, cp * cr, sy * sp * cr + cy * sr];
+
+    let center = [state.position[0], state.position[1], state.position[2]];
+    let mut parts = Vec::with_capacity(DRONE_MODEL_INSTANCE_COUNT);
+    parts.push(RenderInstance::oriented_box(
+        center,
         right,
         forward,
         up,
-        DRONE_HALF_EXTENTS,
-        [0.25, 0.8, 0.95, 1.0],
-    )
+        DRONE_CORE_HALF_EXTENTS,
+        [0.20, 0.77, 0.95, 1.0],
+    ));
+
+    let arm_dirs: [[f32; 3]; 4] = [
+        [1.0, 0.0, 1.0],
+        [-1.0, 0.0, 1.0],
+        [1.0, 0.0, -1.0],
+        [-1.0, 0.0, -1.0],
+    ];
+    for axis in arm_dirs {
+        let inv_len = (axis[0] * axis[0] + axis[2] * axis[2]).sqrt().recip();
+        let dir = [axis[0] * inv_len, 0.0, axis[2] * inv_len];
+        let arm_right = [
+            right[0] * dir[0] + forward[0] * dir[2],
+            right[1] * dir[0] + forward[1] * dir[2],
+            right[2] * dir[0] + forward[2] * dir[2],
+        ];
+        let arm_offset = [
+            arm_right[0] * DRONE_ARM_OFFSET,
+            arm_right[1] * DRONE_ARM_OFFSET,
+            arm_right[2] * DRONE_ARM_OFFSET,
+        ];
+        let motor_offset = [
+            arm_right[0] * DRONE_MOTOR_OFFSET,
+            arm_right[1] * DRONE_MOTOR_OFFSET,
+            arm_right[2] * DRONE_MOTOR_OFFSET,
+        ];
+        let arm_center = [
+            center[0] + arm_offset[0],
+            center[1] + arm_offset[1],
+            center[2] + arm_offset[2],
+        ];
+        let motor_center = [
+            center[0] + motor_offset[0],
+            center[1] + motor_offset[1],
+            center[2] + motor_offset[2],
+        ];
+
+        parts.push(RenderInstance::oriented_box(
+            arm_center,
+            arm_right,
+            up,
+            forward,
+            DRONE_ARM_HALF_EXTENTS,
+            [0.24, 0.84, 0.97, 1.0],
+        ));
+        parts.push(RenderInstance::oriented_box(
+            motor_center,
+            right,
+            up,
+            forward,
+            DRONE_MOTOR_HALF_EXTENTS,
+            [0.92, 0.35, 0.30, 1.0],
+        ));
+    }
+
+    parts
 }
 
 fn target_instance(gate: Gate) -> RenderInstance {

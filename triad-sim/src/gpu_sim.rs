@@ -73,7 +73,7 @@ struct SimParams {
     linear_drag: f32,
     angular_drag: f32,
     motor_response: f32,
-    drone_radius: f32,
+    drone_half_extents: vec4<f32>,
     gate_frame_thickness: f32,
     gate_depth_half: f32,
     collision_penalty: f32,
@@ -81,6 +81,7 @@ struct SimParams {
     max_steps: u32,
     max_gates_per_env: u32,
     max_obstacles_per_env: u32,
+    _pad_uniform: u32,
 };
 
 struct ResetParams {
@@ -409,32 +410,56 @@ fn gate_right_axis(forward: vec3<f32>) -> vec3<f32> {
     return normalize(cross(gate_up_axis(), horizontal_forward));
 }
 
-fn gate_hole_contains(gate: Gate, offset: vec3<f32>) -> bool {
+fn drone_half_extents() -> vec3<f32> {
+    return params.drone_half_extents.xyz;
+}
+
+fn drone_support_extent(axis: vec3<f32>, attitude: vec3<f32>) -> f32 {
+    let extents = drone_half_extents();
+    let body_x = body_right(attitude);
+    let body_y = body_up(attitude);
+    let body_z = body_forward(attitude);
+    return abs(dot(axis, body_x)) * extents.x
+        + abs(dot(axis, body_y)) * extents.y
+        + abs(dot(axis, body_z)) * extents.z;
+}
+
+fn gate_hole_contains(gate: Gate, offset: vec3<f32>, attitude: vec3<f32>) -> bool {
     let gate_forward = normalize(gate.forward.xyz);
     let gate_right = gate_right_axis(gate_forward);
     let right_distance = abs(dot(offset, gate_right));
     let up_distance = abs(dot(offset, gate_up_axis()));
-    let hole_half_width = max(gate.half_extents.x - params.drone_radius, 0.0);
-    let hole_half_height = max(gate.half_extents.y - params.drone_radius, 0.0);
+    let right_support = drone_support_extent(gate_right, attitude);
+    let up_support = drone_support_extent(gate_up_axis(), attitude);
+    let hole_half_width = max(gate.half_extents.x - right_support, 0.0);
+    let hole_half_height = max(gate.half_extents.y - up_support, 0.0);
     return right_distance <= hole_half_width && up_distance <= hole_half_height;
 }
 
-fn gate_frame_collision(gate: Gate, position: vec3<f32>) -> bool {
+fn gate_frame_collision(gate: Gate, position: vec3<f32>, attitude: vec3<f32>) -> bool {
     let gate_forward = normalize(gate.forward.xyz);
     let gate_right = gate_right_axis(gate_forward);
     let offset = position - gate.center.xyz;
     let plane_distance = abs(dot(offset, gate_forward));
     let right_distance = abs(dot(offset, gate_right));
     let up_distance = abs(dot(offset, gate_up_axis()));
-    let outer_half_width = gate.half_extents.x + params.gate_frame_thickness + params.drone_radius;
-    let outer_half_height = gate.half_extents.y + params.gate_frame_thickness + params.drone_radius;
-    let within_outer = plane_distance <= params.gate_depth_half + params.drone_radius
+    let forward_support = drone_support_extent(gate_forward, attitude);
+    let right_support = drone_support_extent(gate_right, attitude);
+    let up_support = drone_support_extent(gate_up_axis(), attitude);
+    let outer_half_width = gate.half_extents.x + params.gate_frame_thickness + right_support;
+    let outer_half_height = gate.half_extents.y + params.gate_frame_thickness + up_support;
+    let within_outer = plane_distance <= params.gate_depth_half + forward_support
         && right_distance <= outer_half_width
         && up_distance <= outer_half_height;
-    return within_outer && !gate_hole_contains(gate, offset);
+    return within_outer && !gate_hole_contains(gate, offset, attitude);
 }
 
-fn crossed_gate_plane(prev_position: vec3<f32>, next_position: vec3<f32>, gate: Gate) -> bool {
+fn crossed_gate_plane(
+    prev_position: vec3<f32>,
+    next_position: vec3<f32>,
+    gate: Gate,
+    attitude: vec3<f32>,
+) -> bool {
     let gate_forward = normalize(gate.forward.xyz);
     let prev_distance = dot(prev_position - gate.center.xyz, gate_forward);
     let next_distance = dot(next_position - gate.center.xyz, gate_forward);
@@ -449,10 +474,10 @@ fn crossed_gate_plane(prev_position: vec3<f32>, next_position: vec3<f32>, gate: 
         abs(denominator) > 1e-5,
     );
     let hit_position = prev_position + (next_position - prev_position) * interpolation;
-    return gate_hole_contains(gate, hit_position - gate.center.xyz);
+    return gate_hole_contains(gate, hit_position - gate.center.xyz, attitude);
 }
 
-fn obstacle_collision(obstacle: Gate, position: vec3<f32>) -> bool {
+fn obstacle_collision(obstacle: Gate, position: vec3<f32>, attitude: vec3<f32>) -> bool {
     let obstacle_forward = normalize(obstacle.forward.xyz);
     let obstacle_right = gate_right_axis(obstacle_forward);
     let offset = position - obstacle.center.xyz;
@@ -461,9 +486,14 @@ fn obstacle_collision(obstacle: Gate, position: vec3<f32>) -> bool {
         dot(offset, gate_up_axis()),
         dot(offset, obstacle_forward),
     );
-    let clamped = clamp(local, -obstacle.half_extents.xyz, obstacle.half_extents.xyz);
+    let support_x = drone_support_extent(obstacle_right, attitude);
+    let support_y = drone_support_extent(gate_up_axis(), attitude);
+    let support_z = drone_support_extent(obstacle_forward, attitude);
+    let expanded_half_extents =
+        obstacle.half_extents.xyz + vec3<f32>(support_x, support_y, support_z);
+    let clamped = clamp(local, -expanded_half_extents, expanded_half_extents);
     let delta = local - clamped;
-    return dot(delta, delta) <= params.drone_radius * params.drone_radius;
+    return dot(delta, delta) <= 1e-8;
 }
 
 fn family_segment_count(curriculum_stage: u32, grammar_id: u32) -> u32 {
@@ -1331,9 +1361,15 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var delta = target_position - state.position.xyz;
     var distance_to_gate = length(delta);
     let previous_gate_cleared = has_cleared_previous_gate_zone(index, state, state.position.xyz);
-    let passed_gate =
-        previous_gate_cleared && crossed_gate_plane(prev_position, state.position.xyz, target_gate);
-    let collided_gate = !passed_gate && gate_frame_collision(target_gate, state.position.xyz);
+    let passed_gate = previous_gate_cleared
+        && crossed_gate_plane(
+            prev_position,
+            state.position.xyz,
+            target_gate,
+            state.attitude.xyz,
+        );
+    let collided_gate =
+        !passed_gate && gate_frame_collision(target_gate, state.position.xyz, state.attitude.xyz);
     var collided_obstacle = false;
     var done_reason = DONE_REASON_NONE;
     var obstacle_index = 0u;
@@ -1342,7 +1378,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             break;
         }
         let obstacle = gates.values[obstacle_slot(index, obstacle_index)];
-        if (obstacle.half_extents.x > 0.0 && obstacle_collision(obstacle, state.position.xyz)) {
+        if (obstacle.half_extents.x > 0.0
+            && obstacle_collision(obstacle, state.position.xyz, state.attitude.xyz))
+        {
             collided_obstacle = true;
             break;
         }
@@ -1379,10 +1417,16 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    let collided_floor = state.position.y <= params.min_altitude + params.drone_radius;
-    let out_of_bounds = abs(state.position.x) > params.bounds - params.drone_radius
-        || abs(state.position.z) > params.bounds - params.drone_radius
-        || state.position.y > params.max_altitude - params.drone_radius;
+    let world_x = vec3<f32>(1.0, 0.0, 0.0);
+    let world_y = vec3<f32>(0.0, 1.0, 0.0);
+    let world_z = vec3<f32>(0.0, 0.0, 1.0);
+    let clearance_x = drone_support_extent(world_x, state.attitude.xyz);
+    let clearance_y = drone_support_extent(world_y, state.attitude.xyz);
+    let clearance_z = drone_support_extent(world_z, state.attitude.xyz);
+    let collided_floor = state.position.y <= params.min_altitude + clearance_y;
+    let out_of_bounds = abs(state.position.x) > params.bounds - clearance_x
+        || abs(state.position.z) > params.bounds - clearance_z
+        || state.position.y > params.max_altitude - clearance_y;
     let reached_step_limit = state.step_count >= params.max_steps;
     let excessive_tilt = abs(attitude.x) > 1.2 || abs(attitude.y) > 1.2;
     if (collided_floor) {
@@ -1576,7 +1620,7 @@ struct SimParams {
     linear_drag: f32,
     angular_drag: f32,
     motor_response: f32,
-    drone_radius: f32,
+    drone_half_extents: [f32; 4],
     gate_frame_thickness: f32,
     gate_depth_half: f32,
     collision_penalty: f32,
@@ -1584,6 +1628,7 @@ struct SimParams {
     max_steps: u32,
     max_gates_per_env: u32,
     max_obstacles_per_env: u32,
+    _pad_uniform: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1690,7 +1735,7 @@ impl GpuSimulation {
             linear_drag: 0.18,
             angular_drag: 0.3,
             motor_response: 8.0,
-            drone_radius: 0.12,
+            drone_half_extents: [0.10, 0.045, 0.10, 0.0],
             gate_frame_thickness: 0.08,
             gate_depth_half: 0.04,
             collision_penalty: 6.0,
@@ -1698,6 +1743,7 @@ impl GpuSimulation {
             max_steps: config.max_steps,
             max_gates_per_env: config.max_gates_per_env as u32,
             max_obstacles_per_env: max_obstacles_per_env as u32,
+            _pad_uniform: 0,
         };
 
         let state = renderer
