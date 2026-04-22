@@ -479,14 +479,16 @@ fn flatten_observations(observations: &[Observation]) -> Vec<f32> {
     flat
 }
 
-fn flatten_reward_done(reward_done: &[RewardDone]) -> (Vec<f32>, Vec<u8>) {
+fn flatten_reward_done(reward_done: &[RewardDone]) -> (Vec<f32>, Vec<u8>, Vec<u32>) {
     let mut rewards = Vec::with_capacity(reward_done.len());
     let mut dones = Vec::with_capacity(reward_done.len());
+    let mut done_reasons = Vec::with_capacity(reward_done.len());
     for item in reward_done {
         rewards.push(item.reward);
         dones.push(u8::from(item.done != 0));
+        done_reasons.push(item.done_reason);
     }
-    (rewards, dones)
+    (rewards, dones, done_reasons)
 }
 
 #[unsafe(no_mangle)]
@@ -984,7 +986,7 @@ pub extern "C" fn triad_simulation_readback_reward_done_flat(
                 return false;
             }
         };
-        let (rewards, dones) = flatten_reward_done(&values);
+        let (rewards, dones, _) = flatten_reward_done(&values);
         if let Err(error) = copy_vec_to_out(&rewards, out_rewards, reward_count) {
             set_last_error(error);
             return false;
@@ -1011,6 +1013,8 @@ pub extern "C" fn triad_simulation_step_actions_readback(
     reward_count: usize,
     out_dones: *mut u8,
     done_count: usize,
+    out_done_reasons: *mut u32,
+    done_reason_count: usize,
 ) -> bool {
     ffi_guard(false, || {
         let Some(simulation) = simulation_from_ptr(simulation) else {
@@ -1062,12 +1066,16 @@ pub extern "C" fn triad_simulation_step_actions_readback(
                 return false;
             }
         };
-        let (rewards, dones) = flatten_reward_done(&reward_done);
+        let (rewards, dones, done_reasons) = flatten_reward_done(&reward_done);
         if let Err(error) = copy_vec_to_out(&rewards, out_rewards, reward_count) {
             set_last_error(error);
             return false;
         }
-        match copy_vec_to_out(&dones, out_dones, done_count) {
+        if let Err(error) = copy_vec_to_out(&dones, out_dones, done_count) {
+            set_last_error(error);
+            return false;
+        }
+        match copy_vec_to_out(&done_reasons, out_done_reasons, done_reason_count) {
             Ok(()) => true,
             Err(error) => {
                 set_last_error(error);
@@ -1089,6 +1097,8 @@ pub extern "C" fn triad_simulation_step_flat_actions_readback(
     reward_count: usize,
     out_dones: *mut u8,
     done_count: usize,
+    out_done_reasons: *mut u32,
+    done_reason_count: usize,
 ) -> bool {
     ffi_guard(false, || {
         let Some(simulation) = simulation_from_ptr(simulation) else {
@@ -1146,12 +1156,16 @@ pub extern "C" fn triad_simulation_step_flat_actions_readback(
                 return false;
             }
         };
-        let (rewards, dones) = flatten_reward_done(&reward_done);
+        let (rewards, dones, done_reasons) = flatten_reward_done(&reward_done);
         if let Err(error) = copy_vec_to_out(&rewards, out_rewards, reward_count) {
             set_last_error(error);
             return false;
         }
-        match copy_vec_to_out(&dones, out_dones, done_count) {
+        if let Err(error) = copy_vec_to_out(&dones, out_dones, done_count) {
+            set_last_error(error);
+            return false;
+        }
+        match copy_vec_to_out(&done_reasons, out_done_reasons, done_reason_count) {
             Ok(()) => true,
             Err(error) => {
                 set_last_error(error);

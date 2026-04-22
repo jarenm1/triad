@@ -175,6 +175,27 @@ fn hash_to_unit(seed: u32) -> f32 {
     return f32(masked) / 16777215.0;
 }
 
+fn hash_to_signed(seed: u32) -> f32 {
+    return hash_to_unit(seed) * 2.0 - 1.0;
+}
+
+fn curriculum_dynamics_scale(curriculum_stage: u32) -> f32 {
+    if (curriculum_stage == 0u) {
+        return 0.35;
+    }
+    if (curriculum_stage == 1u) {
+        return 0.55;
+    }
+    if (curriculum_stage == 2u) {
+        return 0.8;
+    }
+    return 1.0;
+}
+
+fn randomized_positive_scale(seed: u32, salt: u32, magnitude: f32) -> f32 {
+    return max(0.25, 1.0 + hash_to_signed(seed ^ salt) * magnitude);
+}
+
 fn rotate_vec2(v: vec2<f32>, angle: f32) -> vec2<f32> {
     let s = sin(angle);
     let c = cos(angle);
@@ -1225,18 +1246,42 @@ fn reset_env(index: u32) {
     }
 
     let first_gate = gates.values[base_slot];
-    let start_yaw = atan2(first_gate.forward.z, first_gate.forward.x);
+    let gate_forward = normalize(first_gate.forward.xyz);
+    let gate_right = gate_right_axis(gate_forward);
+    let spawn_offset_scale = 0.08 + reset.difficulty * 0.18;
+    let lateral_spawn_offset =
+        (hash_to_unit(reset.seed ^ 0x611u) - 0.5) * 2.0 * spawn_offset_scale;
+    let vertical_spawn_offset = (hash_to_unit(reset.seed ^ 0x977u) - 0.5) * 0.12;
+    let yaw_offset = (hash_to_unit(reset.seed ^ 0x1551u) - 0.5) * 0.5;
+    let start_yaw = atan2(first_gate.forward.z, first_gate.forward.x) + yaw_offset;
     var start_position =
-        first_gate.center.xyz - first_gate.forward.xyz * 1.2 + vec3<f32>(0.0, 0.2, 0.0);
+        first_gate.center.xyz
+        - gate_forward * 1.2
+        + gate_right * lateral_spawn_offset
+        + vec3<f32>(0.0, 0.2 + vertical_spawn_offset, 0.0);
     let spawn_floor_clearance =
         params.min_altitude
         + drone_support_extent(gate_up_axis(), vec3<f32>(0.0, 0.0, start_yaw))
         + 0.08;
     start_position.y = max(start_position.y, spawn_floor_clearance);
+    let start_forward = vec3<f32>(cos(start_yaw), 0.0, sin(start_yaw));
+    let start_right = vec3<f32>(start_forward.z, 0.0, -start_forward.x);
+    let forward_velocity = (hash_to_unit(reset.seed ^ 0x2001u) - 0.5) * 0.5;
+    let lateral_velocity = (hash_to_unit(reset.seed ^ 0x2003u) - 0.5) * 0.35;
+    let vertical_velocity = (hash_to_unit(reset.seed ^ 0x2005u) - 0.5) * 0.2;
+    let roll_rate = (hash_to_unit(reset.seed ^ 0x3001u) - 0.5) * 0.3;
+    let pitch_rate = (hash_to_unit(reset.seed ^ 0x3003u) - 0.5) * 0.3;
+    let yaw_rate = (hash_to_unit(reset.seed ^ 0x3005u) - 0.5) * 0.35;
     states.values[index].position = vec4<f32>(start_position, 0.0);
-    states.values[index].velocity = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    states.values[index].velocity = vec4<f32>(
+        start_forward * forward_velocity
+            + start_right * lateral_velocity
+            + vec3<f32>(0.0, vertical_velocity, 0.0),
+        0.0,
+    );
     states.values[index].attitude = vec4<f32>(0.0, 0.0, start_yaw, 0.0);
-    states.values[index].angular_velocity = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    states.values[index].angular_velocity =
+        vec4<f32>(roll_rate, pitch_rate, yaw_rate, 0.0);
     states.values[index].motor_thrust = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     states.values[index].step_count = 0u;
     states.values[index].done = 0u;
@@ -1244,9 +1289,15 @@ fn reset_env(index: u32) {
     states.values[index].current_lap = 0u;
 
     observations.values[index].position = vec4<f32>(start_position, 0.0);
-    observations.values[index].velocity = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    observations.values[index].velocity = vec4<f32>(
+        start_forward * forward_velocity
+            + start_right * lateral_velocity
+            + vec3<f32>(0.0, vertical_velocity, 0.0),
+        0.0,
+    );
     observations.values[index].attitude = vec4<f32>(0.0, 0.0, start_yaw, 0.0);
-    observations.values[index].angular_velocity = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    observations.values[index].angular_velocity =
+        vec4<f32>(roll_rate, pitch_rate, yaw_rate, 0.0);
     observations.values[index].target_gate_position = first_gate.center;
     observations.values[index].target_gate_forward_progress =
         vec4<f32>(first_gate.forward.xyz, 0.0);
@@ -1285,6 +1336,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    let reset = reset_params.values[index];
     var state = states.values[index];
     var target_gate = current_target_gate(index, state.current_gate);
 
@@ -1322,32 +1374,79 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let prev_position = state.position.xyz;
     let action = clamp_motor_command(actions.values[index].motor_command);
+    let dynamics_strength =
+        (0.04 + clamp(reset.difficulty, 0.0, 1.0) * 0.18)
+        * curriculum_dynamics_scale(reset.curriculum_stage);
+    let mass =
+        params.mass * randomized_positive_scale(reset.seed, 0x4001u, dynamics_strength * 0.35);
+    let gravity =
+        params.gravity * randomized_positive_scale(reset.seed, 0x4003u, dynamics_strength * 0.05);
+    let thrust_scale =
+        params.thrust_scale
+        * randomized_positive_scale(reset.seed, 0x4005u, dynamics_strength * 0.35);
+    let arm_length =
+        params.arm_length
+        * randomized_positive_scale(reset.seed, 0x4007u, dynamics_strength * 0.12);
+    let yaw_torque_scale =
+        params.yaw_torque_scale
+        * randomized_positive_scale(reset.seed, 0x4009u, dynamics_strength * 0.18);
+    let linear_drag =
+        params.linear_drag
+        * randomized_positive_scale(reset.seed, 0x4011u, dynamics_strength * 0.45);
+    let angular_drag =
+        params.angular_drag
+        * randomized_positive_scale(reset.seed, 0x4013u, dynamics_strength * 0.45);
+    let motor_response =
+        params.motor_response
+        * randomized_positive_scale(reset.seed, 0x4015u, dynamics_strength * 0.35);
+    let motor_gain = vec4<f32>(
+        randomized_positive_scale(reset.seed, 0x6001u, dynamics_strength * 0.25),
+        randomized_positive_scale(reset.seed, 0x6003u, dynamics_strength * 0.25),
+        randomized_positive_scale(reset.seed, 0x6005u, dynamics_strength * 0.25),
+        randomized_positive_scale(reset.seed, 0x6007u, dynamics_strength * 0.25),
+    );
     state.motor_thrust = state.motor_thrust
-        + (action - state.motor_thrust) * params.motor_response * params.dt_seconds;
+        + (action - state.motor_thrust) * motor_response * params.dt_seconds;
 
     var attitude = state.attitude.xyz;
     let forward = body_forward(attitude);
     let up = body_up(attitude);
     let right = body_right(attitude);
-    let collective_thrust = dot(state.motor_thrust, vec4<f32>(1.0)) * params.thrust_scale;
-    let acceleration = up * (collective_thrust / params.mass)
-        - vec3<f32>(0.0, params.gravity, 0.0)
-        - state.velocity.xyz * params.linear_drag;
+    let effective_motor_thrust = clamp(
+        state.motor_thrust * motor_gain,
+        vec4<f32>(0.0),
+        vec4<f32>(1.25),
+    );
+    let collective_thrust = dot(effective_motor_thrust, vec4<f32>(1.0)) * thrust_scale;
+    let quadratic_drag = linear_drag * (0.02 + dynamics_strength * 0.08);
+    let speed = length(state.velocity.xyz);
+    let acceleration = up * (collective_thrust / mass)
+        - vec3<f32>(0.0, gravity, 0.0)
+        - state.velocity.xyz * linear_drag
+        - state.velocity.xyz * speed * quadratic_drag;
 
     let roll_torque =
-        ((state.motor_thrust.y + state.motor_thrust.z) - (state.motor_thrust.x + state.motor_thrust.w))
-        * params.arm_length;
+        ((effective_motor_thrust.y + effective_motor_thrust.z)
+            - (effective_motor_thrust.x + effective_motor_thrust.w))
+        * arm_length;
     let pitch_torque =
-        ((state.motor_thrust.z + state.motor_thrust.w) - (state.motor_thrust.x + state.motor_thrust.y))
-        * params.arm_length;
+        ((effective_motor_thrust.z + effective_motor_thrust.w)
+            - (effective_motor_thrust.x + effective_motor_thrust.y))
+        * arm_length;
     let yaw_torque =
-        ((state.motor_thrust.x + state.motor_thrust.z) - (state.motor_thrust.y + state.motor_thrust.w))
-        * params.yaw_torque_scale;
+        ((effective_motor_thrust.x + effective_motor_thrust.z)
+            - (effective_motor_thrust.y + effective_motor_thrust.w))
+        * yaw_torque_scale;
+    let angular_inertia = vec3<f32>(
+        max(0.12, mass * arm_length * arm_length * 0.15),
+        max(0.12, mass * arm_length * arm_length * 0.15),
+        max(0.08, mass * arm_length * arm_length * 0.24),
+    );
 
     state.angular_velocity = vec4<f32>(
         state.angular_velocity.xyz
-            + (vec3<f32>(roll_torque, pitch_torque, yaw_torque)
-                - state.angular_velocity.xyz * params.angular_drag)
+            + ((vec3<f32>(roll_torque, pitch_torque, yaw_torque) / angular_inertia)
+                - state.angular_velocity.xyz * angular_drag)
                 * params.dt_seconds,
         0.0,
     );
@@ -1651,7 +1750,7 @@ impl Default for GpuSimulationConfig {
     fn default() -> Self {
         Self {
             env_count: 1024,
-            dt_seconds: 1.0 / 60.0,
+            dt_seconds: 1.0 / 120.0,
             bounds: 8.0,
             max_steps: 1024,
             max_gates_per_env: 24,

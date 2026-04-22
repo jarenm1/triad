@@ -364,6 +364,8 @@ _lib.triad_simulation_step_actions_readback.argtypes = [
     ctypes.c_size_t,
     ctypes.POINTER(ctypes.c_uint8),
     ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_uint32),
+    ctypes.c_size_t,
 ]
 _lib.triad_simulation_step_actions_readback.restype = ctypes.c_bool
 _lib.triad_simulation_step_flat_actions_readback.argtypes = [
@@ -376,6 +378,8 @@ _lib.triad_simulation_step_flat_actions_readback.argtypes = [
     ctypes.POINTER(ctypes.c_float),
     ctypes.c_size_t,
     ctypes.POINTER(ctypes.c_uint8),
+    ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_uint32),
     ctypes.c_size_t,
 ]
 _lib.triad_simulation_step_flat_actions_readback.restype = ctypes.c_bool
@@ -542,6 +546,7 @@ class PackedStepResult:
     observations: ctypes.Array[ctypes.c_float]
     rewards: ctypes.Array[ctypes.c_float]
     dones: ctypes.Array[ctypes.c_uint8]
+    done_reasons: ctypes.Array[ctypes.c_uint32]
     env_count: int
     observation_stride: int = OBSERVATION_STRIDE
 
@@ -560,6 +565,9 @@ class PackedStepResult:
     def done_list(self) -> list[bool]:
         return [bool(self.dones[index]) for index in range(self.env_count)]
 
+    def done_reason_list(self) -> list[int]:
+        return [int(self.done_reasons[index]) for index in range(self.env_count)]
+
     def observation_buffer(self) -> memoryview:
         return memoryview(self.observations)
 
@@ -568,6 +576,9 @@ class PackedStepResult:
 
     def done_buffer(self) -> memoryview:
         return memoryview(self.dones)
+
+    def done_reason_buffer(self) -> memoryview:
+        return memoryview(self.done_reasons)
 
     def action_buffer(self) -> memoryview:
         raise RuntimeError("PackedStepResult does not own an action buffer")
@@ -584,6 +595,10 @@ class PackedStepResult:
     def numpy_bool_dones(self) -> object:
         np = _numpy_module()
         return np.ctypeslib.as_array(self.dones).astype(bool)
+
+    def numpy_done_reasons(self) -> object:
+        np = _numpy_module()
+        return np.ctypeslib.as_array(self.done_reasons)
 
     def to_numpy(self) -> tuple[object, object, object]:
         observations, rewards, _ = self.numpy_views()
@@ -637,6 +652,9 @@ class SimulationCore:
 
     def _allocate_done_buffer(self) -> ctypes.Array[ctypes.c_uint8]:
         return (ctypes.c_uint8 * self.env_count)()
+
+    def _allocate_done_reason_buffer(self) -> ctypes.Array[ctypes.c_uint32]:
+        return (ctypes.c_uint32 * self.env_count)()
 
     def set_course(self, course: CourseSpec) -> "SimulationCore":
         _require(_lib.triad_simulation_set_course(self._handle, course._handle))
@@ -734,6 +752,7 @@ class SimulationCore:
         observations = self._allocate_flat_observation_buffer()
         rewards = self._allocate_reward_buffer()
         dones = self._allocate_done_buffer()
+        done_reasons = self._allocate_done_reason_buffer()
         _require(
             _lib.triad_simulation_step_actions_readback(
                 self._handle,
@@ -746,12 +765,15 @@ class SimulationCore:
                 len(rewards),
                 dones,
                 len(dones),
+                done_reasons,
+                len(done_reasons),
             )
         )
         return PackedStepResult(
             observations=observations,
             rewards=rewards,
             dones=dones,
+            done_reasons=done_reasons,
             env_count=self.env_count,
         )
 
@@ -773,6 +795,8 @@ class SimulationCore:
                 len(result.rewards),
                 result.dones,
                 len(result.dones),
+                result.done_reasons,
+                len(result.done_reasons),
             )
         )
         return result
@@ -961,6 +985,7 @@ class TriadFastVecEnv:
             observations=self.sim._allocate_flat_observation_buffer(),
             rewards=self.sim._allocate_reward_buffer(),
             dones=self.sim._allocate_done_buffer(),
+            done_reasons=self.sim._allocate_done_reason_buffer(),
             env_count=self.sim.env_count,
         )
 
@@ -1186,6 +1211,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--horizon", type=int, default=128)
     ppo_train.add_argument("--total-updates", type=int, default=500)
     ppo_train.add_argument("--warmup-updates", type=int, default=25)
+    ppo_train.add_argument("--max-episode-steps", type=int, default=2048)
     ppo_train.add_argument("--learning-rate", type=float, default=3.0e-4)
     ppo_train.add_argument("--gamma", type=float, default=0.99)
     ppo_train.add_argument("--gae-lambda", type=float, default=0.95)
@@ -1203,6 +1229,20 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--log-interval", type=int, default=10)
     ppo_train.add_argument("--checkpoint", default=None)
     ppo_train.add_argument("--checkpoint-interval", type=int, default=0)
+    ppo_train.add_argument("--curriculum-eval-interval", type=int, default=10)
+    ppo_train.add_argument("--curriculum-eval-env-count", type=int, default=64)
+    ppo_train.add_argument("--curriculum-mastery-window", type=int, default=3)
+    ppo_train.add_argument("--curriculum-min-stage-updates", type=int, default=20)
+    ppo_train.add_argument(
+        "--curriculum-completion-threshold", type=float, default=0.6
+    )
+    ppo_train.add_argument(
+        "--curriculum-progress-threshold", type=float, default=0.9
+    )
+    ppo_train.add_argument("--curriculum-current-weight", type=float, default=0.7)
+    ppo_train.add_argument("--curriculum-previous-weight", type=float, default=0.2)
+    ppo_train.add_argument("--curriculum-easy-weight", type=float, default=0.1)
+    ppo_train.add_argument("--curriculum-holdout-seed", type=int, default=131071)
     ppo_train.add_argument(
         "--no-lr-anneal", action="store_true", help="Disable learning rate annealing"
     )
@@ -1414,6 +1454,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             horizon=args.horizon,
             total_updates=args.total_updates,
             warmup_updates=args.warmup_updates,
+            max_episode_steps=args.max_episode_steps,
             learning_rate=args.learning_rate,
             anneal_learning_rate=not args.no_lr_anneal,
             gamma=args.gamma,
@@ -1435,9 +1476,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             log_interval=args.log_interval,
             checkpoint_path=args.checkpoint,
             checkpoint_interval=args.checkpoint_interval,
+            curriculum_eval_interval=args.curriculum_eval_interval,
+            curriculum_eval_env_count=args.curriculum_eval_env_count,
+            curriculum_mastery_window=args.curriculum_mastery_window,
+            curriculum_min_stage_updates=args.curriculum_min_stage_updates,
+            curriculum_completion_threshold=args.curriculum_completion_threshold,
+            curriculum_progress_threshold=args.curriculum_progress_threshold,
+            curriculum_current_weight=args.curriculum_current_weight,
+            curriculum_previous_weight=args.curriculum_previous_weight,
+            curriculum_easy_weight=args.curriculum_easy_weight,
+            curriculum_holdout_seed=args.curriculum_holdout_seed,
         )
-        result = train_ppo(config)
-        _print_json(result.__dict__)
+        train_ppo(config)
         return 0
 
     if args.command == "ppo-policy-server":

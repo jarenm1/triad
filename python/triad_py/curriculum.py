@@ -53,6 +53,20 @@ class CurriculumSchedule:
                 return phase
         return self.phases[-1]
 
+    def phase_index_for_progress(self, progress: float) -> int:
+        clamped = max(0.0, min(1.0, float(progress)))
+        for phase_index, phase in enumerate(self.phases):
+            if clamped <= phase.progress_end:
+                return phase_index
+        return len(self.phases) - 1
+
+    def phase_at_index(self, phase_index: int) -> CurriculumPhase:
+        if phase_index < 0 or phase_index >= len(self.phases):
+            raise IndexError(
+                f"phase_index out of range: {phase_index} not in [0, {len(self.phases)})"
+            )
+        return self.phases[phase_index]
+
     def sample_reset_params(
         self,
         env_count: int,
@@ -68,6 +82,85 @@ class CurriculumSchedule:
         for env_index in range(env_count):
             env_seed = rng.getrandbits(32)
             env_rng = Random(env_seed ^ env_index)
+            reset_params.append(
+                (
+                    env_seed,
+                    phase.sample_grammar_id(env_rng),
+                    phase.sample_difficulty(env_rng),
+                    int(phase.curriculum_stage),
+                )
+            )
+        return reset_params
+
+    def sample_reset_params_for_phase(
+        self,
+        env_count: int,
+        phase_index: int,
+        base_seed: int = 0,
+    ) -> list[tuple[int, int, float, int]]:
+        if env_count <= 0:
+            raise ValueError(f"env_count must be positive, got {env_count}")
+
+        phase = self.phase_at_index(phase_index)
+        rng = Random(base_seed)
+        reset_params: list[tuple[int, int, float, int]] = []
+        for env_index in range(env_count):
+            env_seed = rng.getrandbits(32)
+            env_rng = Random(env_seed ^ env_index ^ (phase_index * 0x9E3779B9))
+            reset_params.append(
+                (
+                    env_seed,
+                    phase.sample_grammar_id(env_rng),
+                    phase.sample_difficulty(env_rng),
+                    int(phase.curriculum_stage),
+                )
+            )
+        return reset_params
+
+    def sample_reset_params_mixture(
+        self,
+        env_count: int,
+        phase_indices: Sequence[int],
+        weights: Sequence[float],
+        base_seed: int = 0,
+    ) -> list[tuple[int, int, float, int]]:
+        if env_count <= 0:
+            raise ValueError(f"env_count must be positive, got {env_count}")
+        if len(phase_indices) != len(weights):
+            raise ValueError("phase_indices and weights must have the same length")
+        if not phase_indices:
+            raise ValueError("phase_indices must not be empty")
+
+        filtered: list[tuple[int, float]] = []
+        for phase_index, weight in zip(phase_indices, weights, strict=True):
+            if weight <= 0.0:
+                continue
+            self.phase_at_index(int(phase_index))
+            filtered.append((int(phase_index), float(weight)))
+        if not filtered:
+            raise ValueError("at least one curriculum mixture weight must be positive")
+
+        total_weight = sum(weight for _, weight in filtered)
+        cumulative_weights: list[tuple[int, float]] = []
+        running = 0.0
+        for phase_index, weight in filtered:
+            running += weight / total_weight
+            cumulative_weights.append((phase_index, running))
+
+        rng = Random(base_seed)
+        reset_params: list[tuple[int, int, float, int]] = []
+        for env_index in range(env_count):
+            draw = rng.random()
+            selected_phase_index = cumulative_weights[-1][0]
+            for phase_index, threshold in cumulative_weights:
+                if draw <= threshold:
+                    selected_phase_index = phase_index
+                    break
+            phase = self.phase_at_index(selected_phase_index)
+            env_seed = rng.getrandbits(32)
+            env_rng = Random(
+                env_seed ^ env_index ^ (selected_phase_index * 0x9E3779B9)
+            )
             reset_params.append(
                 (
                     env_seed,

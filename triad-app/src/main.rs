@@ -749,7 +749,7 @@ impl ParticleRendererManager {
             .create_gpu_buffer::<SimParams>()
             .label("simulation params")
             .with_data(&[SimParams {
-                dt_seconds: 1.0 / 60.0,
+                dt_seconds: 1.0 / 120.0,
                 _reserved0: 0.0,
                 particle_radius: PARTICLE_RADIUS,
                 _reserved1: 0.0,

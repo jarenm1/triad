@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 import math
 import random
@@ -15,10 +16,9 @@ from . import (
     SimulationConfig,
     SimulationCore,
     TriadFastVecEnv,
-    apply_curriculum_update,
-    build_teacher_curriculum_progression,
     build_teacher_curriculum_schedule,
 )
+from .training_log import DoneReasonTracker, PPOTrainingLogger
 
 try:
     import torch
@@ -53,6 +53,7 @@ class PPOConfig:
     horizon: int = 128
     total_updates: int = 500
     warmup_updates: int = 25
+    max_episode_steps: int = 2048
     learning_rate: float = 3.0e-4
     anneal_learning_rate: bool = True
     gamma: float = 0.99
@@ -74,6 +75,16 @@ class PPOConfig:
     log_interval: int = 10
     checkpoint_path: str | None = None
     checkpoint_interval: int = 0
+    curriculum_eval_interval: int = 10
+    curriculum_eval_env_count: int = 64
+    curriculum_mastery_window: int = 3
+    curriculum_min_stage_updates: int = 20
+    curriculum_completion_threshold: float = 0.6
+    curriculum_progress_threshold: float = 0.9
+    curriculum_current_weight: float = 0.7
+    curriculum_previous_weight: float = 0.2
+    curriculum_easy_weight: float = 0.1
+    curriculum_holdout_seed: int = 131071
 
 
 @dataclass
@@ -81,11 +92,18 @@ class PPOUpdateStats:
     update_index: int
     progress: float
     phase: str
+    phase_index: int
+    phase_updates: int
     mean_reward: float
     mean_done_rate: float
     completed_episodes: int
     mean_episode_return: float
     mean_episode_length: float
+    eval_completion_rate: float
+    eval_mean_progress: float
+    eval_mean_episode_return: float
+    eval_mean_episode_length: float
+    phase_advanced: bool
     policy_loss: float
     value_loss: float
     entropy: float
@@ -101,11 +119,22 @@ class PPOTrainResult:
     final_update: int
     final_progress: float
     final_phase: str
+    final_phase_index: int
     device: str
     env_count: int
     horizon: int
     total_env_steps: int
     checkpoint_path: str | None
+
+
+@dataclass
+class CurriculumEvalStats:
+    phase_index: int
+    phase: str
+    completion_rate: float
+    mean_progress: float
+    mean_episode_return: float
+    mean_episode_length: float
 
 
 @dataclass
@@ -229,9 +258,16 @@ def _default_training_course() -> CourseSpec:
 def _training_sim_config(course: CourseSpec, config: PPOConfig) -> SimulationConfig:
     sim_config = SimulationConfig.default()
     sim_config.env_count = config.env_count
+    sim_config.max_steps = max(sim_config.max_steps, config.max_episode_steps)
     sim_config.max_gates_per_env = max(
         sim_config.max_gates_per_env, int(course.stats["total_gate_count"])
     )
+    return sim_config
+
+
+def _evaluation_sim_config(course: CourseSpec, config: PPOConfig) -> SimulationConfig:
+    sim_config = _training_sim_config(course, config)
+    sim_config.env_count = max(1, min(config.curriculum_eval_env_count, config.env_count))
     return sim_config
 
 
@@ -363,6 +399,190 @@ class EpisodeTracker:
         )
 
 
+class MasteryCurriculumController:
+    def __init__(self, schedule, config: PPOConfig):
+        self.schedule = schedule
+        self.config = config
+        self.current_phase_index = 0
+        self.phase_update_count = 0
+        self.latest_eval_stats: CurriculumEvalStats | None = None
+        self._history = {
+            phase_index: deque(maxlen=config.curriculum_mastery_window)
+            for phase_index in range(len(schedule.phases))
+        }
+
+    def current_phase(self):
+        return self.schedule.phase_at_index(self.current_phase_index)
+
+    def progress(self) -> float:
+        if len(self.schedule.phases) <= 1:
+            return 1.0
+        return self.current_phase_index / float(len(self.schedule.phases) - 1)
+
+    def note_update(self) -> int:
+        self.phase_update_count += 1
+        return self.phase_update_count
+
+    def training_phase_mix(self) -> dict[str, float]:
+        if self.current_phase_index <= 0:
+            return {self.current_phase().name: 1.0}
+
+        raw_mix: dict[int, float] = {}
+
+        def add_weight(phase_index: int, weight: float) -> None:
+            if phase_index < 0 or weight <= 0.0:
+                return
+            raw_mix[phase_index] = raw_mix.get(phase_index, 0.0) + weight
+
+        add_weight(self.current_phase_index, self.config.curriculum_current_weight)
+        add_weight(self.current_phase_index - 1, self.config.curriculum_previous_weight)
+        add_weight(0, self.config.curriculum_easy_weight)
+
+        total = sum(raw_mix.values())
+        if total <= 0.0:
+            return {self.current_phase().name: 1.0}
+
+        return {
+            self.schedule.phase_at_index(phase_index).name: weight / total
+            for phase_index, weight in sorted(raw_mix.items())
+        }
+
+    def sample_training_reset_params(
+        self, env_count: int, base_seed: int
+    ) -> list[tuple[int, int, float, int]]:
+        if self.current_phase_index <= 0:
+            return self.schedule.sample_reset_params_for_phase(
+                env_count=env_count,
+                phase_index=0,
+                base_seed=base_seed,
+            )
+
+        phase_mix = self.training_phase_mix()
+        phase_indices = [
+            phase_index
+            for phase_index, phase in enumerate(self.schedule.phases)
+            if phase.name in phase_mix
+        ]
+        weights = [phase_mix[self.schedule.phase_at_index(i).name] for i in phase_indices]
+        return self.schedule.sample_reset_params_mixture(
+            env_count=env_count,
+            phase_indices=phase_indices,
+            weights=weights,
+            base_seed=base_seed,
+        )
+
+    def should_evaluate(self, update_index: int, total_updates: int) -> bool:
+        if self.config.curriculum_eval_interval <= 0:
+            return update_index == total_updates - 1
+        return (
+            (update_index + 1) % self.config.curriculum_eval_interval == 0
+            or update_index == total_updates - 1
+        )
+
+    def record_eval(self, eval_stats: CurriculumEvalStats, update_index: int) -> bool:
+        self.latest_eval_stats = eval_stats
+        history = self._history[eval_stats.phase_index]
+        history.append(eval_stats)
+
+        if self.current_phase_index >= len(self.schedule.phases) - 1:
+            return False
+        if update_index < self.config.warmup_updates:
+            return False
+        if self.phase_update_count < self.config.curriculum_min_stage_updates:
+            return False
+        if len(history) < self.config.curriculum_mastery_window:
+            return False
+
+        mean_completion = float(np.mean([item.completion_rate for item in history]))
+        mean_progress = float(np.mean([item.mean_progress for item in history]))
+        if (
+            mean_completion < self.config.curriculum_completion_threshold
+            or mean_progress < self.config.curriculum_progress_threshold
+        ):
+            return False
+
+        self.current_phase_index += 1
+        self.phase_update_count = 0
+        return True
+
+
+COMPLETE_DONE_REASON = 1 << 0
+PROGRESS_OBSERVATION_INDEX = 18
+
+
+def _evaluate_curriculum_phase(
+    env: TriadFastVecEnv,
+    model: ActorCritic,
+    *,
+    device: str,
+    observation_normalizer: RunningMeanStd | None,
+    schedule,
+    phase_index: int,
+    base_seed: int,
+    max_episode_steps: int,
+) -> CurriculumEvalStats:
+    torch_module, _ = _require_torch()
+    reset_params = schedule.sample_reset_params_for_phase(
+        env_count=env.sim.env_count,
+        phase_index=phase_index,
+        base_seed=base_seed,
+    )
+    env.sim.set_reset_params(reset_params)
+    observations = env.reset_numpy().copy()
+
+    active = np.ones(env.sim.env_count, dtype=bool)
+    completed = np.zeros(env.sim.env_count, dtype=bool)
+    returns = np.zeros(env.sim.env_count, dtype=np.float32)
+    lengths = np.zeros(env.sim.env_count, dtype=np.int32)
+    best_progress = observations[:, PROGRESS_OBSERVATION_INDEX].copy()
+
+    for _ in range(max_episode_steps):
+        obs_tensor = _observations_to_tensor(
+            observations,
+            device=device,
+            observation_normalizer=observation_normalizer,
+        )
+        with torch_module.no_grad():
+            actions, _ = model.act_deterministic(obs_tensor)
+
+        action_values = actions.detach().cpu().numpy()
+        action_values[~active] = 0.0
+        env.numpy_action_view()[:, :] = action_values
+
+        step_result = env.step_in_place()
+        next_observations, rewards, dones = step_result.numpy_views()
+        done_flags = dones.astype(bool, copy=False)
+        done_reasons = step_result.numpy_done_reasons()
+
+        returns[active] += rewards[active]
+        lengths[active] += 1
+        best_progress = np.maximum(
+            best_progress,
+            next_observations[:, PROGRESS_OBSERVATION_INDEX],
+        )
+
+        newly_done = active & done_flags
+        if np.any(newly_done):
+            completed[newly_done] = (
+                done_reasons[newly_done] & np.uint32(COMPLETE_DONE_REASON)
+            ) != 0
+            active[newly_done] = False
+
+        observations = next_observations.copy()
+        if not np.any(active):
+            break
+
+    phase = schedule.phase_at_index(phase_index)
+    return CurriculumEvalStats(
+        phase_index=phase_index,
+        phase=phase.name,
+        completion_rate=float(np.mean(completed)),
+        mean_progress=float(np.mean(best_progress)),
+        mean_episode_return=float(np.mean(returns)),
+        mean_episode_length=float(np.mean(lengths)),
+    )
+
+
 def _observations_to_tensor(
     observations: np.ndarray,
     *,
@@ -385,6 +605,7 @@ def _collect_rollout(
     storage: dict[str, np.ndarray],
     observation_normalizer: RunningMeanStd | None,
     episode_tracker: EpisodeTracker,
+    done_reason_tracker: DoneReasonTracker,
 ):
     torch_module, _ = _require_torch()
 
@@ -402,7 +623,8 @@ def _collect_rollout(
 
         action_values = actions.detach().cpu().numpy()
         env.numpy_action_view()[:, :] = action_values
-        next_observations, rewards, dones = env.step_in_place().numpy_views()
+        step_result = env.step_in_place()
+        next_observations, rewards, dones = step_result.numpy_views()
 
         storage["actions"][step_index] = action_values
         storage["log_probs"][step_index] = log_probs.detach().cpu().numpy()
@@ -411,6 +633,7 @@ def _collect_rollout(
         done_flags = dones.astype(bool, copy=False)
         storage["dones"][step_index] = done_flags.astype(np.float32)
         episode_tracker.record_step(rewards, done_flags)
+        done_reason_tracker.record_step(done_flags, step_result.numpy_done_reasons())
 
         observations = next_observations.copy()
 
@@ -590,15 +813,16 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
     device = _resolve_device(config.device)
 
     schedule = build_teacher_curriculum_schedule()
-    progression = build_teacher_curriculum_progression(
-        total_updates=config.total_updates,
-        warmup_updates=config.warmup_updates,
-    )
+    curriculum = MasteryCurriculumController(schedule, config)
 
     course = _default_training_course()
     sim = SimulationCore(_training_sim_config(course, config))
     sim.set_course(course)
     env = TriadFastVecEnv(sim)
+    eval_course = _default_training_course()
+    eval_sim = SimulationCore(_evaluation_sim_config(eval_course, config))
+    eval_sim.set_course(eval_course)
+    eval_env = TriadFastVecEnv(eval_sim, auto_reset=False)
 
     checkpoint_path = Path(config.checkpoint_path) if config.checkpoint_path else None
 
@@ -618,14 +842,13 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
             else None
         )
         episode_tracker = EpisodeTracker(sim.env_count)
-
-        reset_params = apply_curriculum_update(
-            sim,
-            update_index=0,
-            progression=progression,
+        done_reason_tracker = DoneReasonTracker()
+        training_logger = PPOTrainingLogger(asdict(config))
+        reset_params = curriculum.sample_training_reset_params(
+            env_count=sim.env_count,
             base_seed=config.seed,
-            schedule=schedule,
         )
+        sim.set_reset_params(reset_params)
         del reset_params
         observations = env.reset_numpy().copy()
 
@@ -637,13 +860,15 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
         )
 
         total_env_steps = 0
-        final_phase = schedule.phase_for_progress(0.0).name
-        final_progress = 0.0
+        final_phase = curriculum.current_phase().name
+        final_progress = curriculum.progress()
+        training_logger.emit_started(initial_phase=final_phase)
 
         for update_index in range(config.total_updates):
             started_at = perf_counter()
-            progress = progression.progress_for_update(update_index)
-            phase = schedule.phase_for_progress(progress)
+            phase_index = curriculum.current_phase_index
+            phase = curriculum.current_phase()
+            progress = curriculum.progress()
             final_phase = phase.name
             final_progress = progress
 
@@ -658,14 +883,15 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
             else:
                 current_learning_rate = config.learning_rate
 
-            apply_curriculum_update(
-                sim,
-                update_index=update_index,
-                progression=progression,
-                base_seed=config.seed + update_index,
-                schedule=schedule,
+            sim.set_reset_params(
+                curriculum.sample_training_reset_params(
+                    env_count=sim.env_count,
+                    base_seed=config.seed + update_index,
+                )
             )
+            phase_updates = curriculum.note_update()
             episode_tracker.begin_rollout()
+            done_reason_tracker.reset_rollout()
 
             observations, next_value = _collect_rollout(
                 env,
@@ -676,6 +902,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                 storage,
                 observation_normalizer,
                 episode_tracker,
+                done_reason_tracker,
             )
             _compute_gae(storage, next_value, config.gamma, config.gae_lambda)
 
@@ -801,16 +1028,41 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
             completed_episodes, mean_episode_return, mean_episode_length = (
                 episode_tracker.rollout_stats()
             )
+            eval_stats = curriculum.latest_eval_stats
+            phase_advanced = False
+            if curriculum.should_evaluate(update_index, config.total_updates):
+                eval_stats = _evaluate_curriculum_phase(
+                    eval_env,
+                    model,
+                    device=device,
+                    observation_normalizer=observation_normalizer,
+                    schedule=schedule,
+                    phase_index=phase_index,
+                    base_seed=config.curriculum_holdout_seed + phase_index * 104729,
+                    max_episode_steps=config.max_episode_steps,
+                )
+                phase_advanced = curriculum.record_eval(eval_stats, update_index)
 
             stats = PPOUpdateStats(
                 update_index=update_index,
                 progress=progress,
                 phase=phase.name,
+                phase_index=phase_index,
+                phase_updates=phase_updates,
                 mean_reward=float(storage["rewards"].mean()),
                 mean_done_rate=float(storage["dones"].mean()),
                 completed_episodes=completed_episodes,
                 mean_episode_return=mean_episode_return,
                 mean_episode_length=mean_episode_length,
+                eval_completion_rate=0.0 if eval_stats is None else eval_stats.completion_rate,
+                eval_mean_progress=0.0 if eval_stats is None else eval_stats.mean_progress,
+                eval_mean_episode_return=0.0
+                if eval_stats is None
+                else eval_stats.mean_episode_return,
+                eval_mean_episode_length=0.0
+                if eval_stats is None
+                else eval_stats.mean_episode_length,
+                phase_advanced=phase_advanced,
                 policy_loss=float(np.mean(policy_losses)) if policy_losses else 0.0,
                 value_loss=float(np.mean(value_losses)) if value_losses else 0.0,
                 entropy=float(np.mean(entropy_values)) if entropy_values else 0.0,
@@ -827,7 +1079,25 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                 update_index % config.log_interval == 0
                 or update_index == config.total_updates - 1
             ):
-                print(json.dumps(asdict(stats), sort_keys=True))
+                training_logger.emit_update(
+                    asdict(stats),
+                    done_reasons=done_reason_tracker.summary(),
+                    curriculum={
+                        "phase_index": phase_index,
+                        "phase_updates": phase_updates,
+                        "phase_mix": curriculum.training_phase_mix(),
+                        "eval": None
+                        if eval_stats is None
+                        else {
+                            "completion_rate": eval_stats.completion_rate,
+                            "mean_progress": eval_stats.mean_progress,
+                            "mean_episode_return": eval_stats.mean_episode_return,
+                            "mean_episode_length": eval_stats.mean_episode_length,
+                        },
+                        "phase_advanced": phase_advanced,
+                        "next_phase": curriculum.current_phase().name,
+                    },
+                )
 
             if (
                 checkpoint_path is not None
@@ -843,6 +1113,11 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                     update_index=update_index,
                     total_env_steps=total_env_steps,
                 )
+                training_logger.emit_checkpoint_saved(
+                    checkpoint_path=str(checkpoint_path),
+                    update_index=update_index,
+                    total_env_steps=total_env_steps,
+                )
 
         if checkpoint_path is not None:
             _save_checkpoint(
@@ -854,17 +1129,27 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                 update_index=config.total_updates - 1,
                 total_env_steps=total_env_steps,
             )
+            training_logger.emit_checkpoint_saved(
+                checkpoint_path=str(checkpoint_path),
+                update_index=config.total_updates - 1,
+                total_env_steps=total_env_steps,
+            )
 
-        return PPOTrainResult(
+        result = PPOTrainResult(
             final_update=config.total_updates - 1,
-            final_progress=final_progress,
-            final_phase=final_phase,
+            final_progress=curriculum.progress(),
+            final_phase=curriculum.current_phase().name,
+            final_phase_index=curriculum.current_phase_index,
             device=device,
             env_count=sim.env_count,
             horizon=config.horizon,
             total_env_steps=total_env_steps,
             checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
         )
+        training_logger.emit_completed(asdict(result))
+        return result
     finally:
+        eval_sim.close()
+        eval_course.close()
         sim.close()
         course.close()
