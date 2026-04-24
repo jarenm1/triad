@@ -4,7 +4,7 @@ import argparse
 import ctypes
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import IntEnum, IntFlag
 from functools import lru_cache
 from pathlib import Path
@@ -67,6 +67,7 @@ __all__ = [
     "serve_ppo_policy",
     "train_ppo",
     "load_ppo_policy",
+    "evaluate_ppo_checkpoint",
     "zero_policy",
 ]
 
@@ -169,6 +170,9 @@ class _TriadSimConfig(ctypes.Structure):
         ("max_steps", ctypes.c_uint32),
         ("max_gates_per_env", ctypes.c_uint32),
         ("laps_required", ctypes.c_uint32),
+        ("dynamics_randomization_scale", ctypes.c_float),
+        ("actuator_randomization_scale", ctypes.c_float),
+        ("spawn_randomization_scale", ctypes.c_float),
     ]
 
 
@@ -239,6 +243,7 @@ class _TriadObservation(ctypes.Structure):
         ("distance_to_gate", ctypes.c_float),
         ("gate_alignment", ctypes.c_float),
         ("mean_motor_thrust", ctypes.c_float),
+        ("_pad5", ctypes.c_float),
     ]
 
 
@@ -248,11 +253,11 @@ class _TriadRewardDone(ctypes.Structure):
         ("done", ctypes.c_uint32),
         ("done_reason", ctypes.c_uint32),
         ("_pad0", ctypes.c_uint32),
-        ("progress_reward", ctypes.c_float),
-        ("distance_penalty", ctypes.c_float),
-        ("alignment_reward", ctypes.c_float),
-        ("tilt_penalty", ctypes.c_float),
-        ("completion_bonus", ctypes.c_float),
+        ("shaping_reward", ctypes.c_float),
+        ("_unused_reward0", ctypes.c_float),
+        ("_unused_reward1", ctypes.c_float),
+        ("time_penalty", ctypes.c_float),
+        ("sparse_objective_reward", ctypes.c_float),
         ("collision_penalty", ctypes.c_float),
         ("_pad1", ctypes.c_float),
         ("_pad2", ctypes.c_float),
@@ -462,6 +467,9 @@ class SimulationConfig:
     max_steps: int
     max_gates_per_env: int
     laps_required: int
+    dynamics_randomization_scale: float
+    actuator_randomization_scale: float
+    spawn_randomization_scale: float
 
     @classmethod
     def default(cls) -> "SimulationConfig":
@@ -473,6 +481,9 @@ class SimulationConfig:
             max_steps=config.max_steps,
             max_gates_per_env=config.max_gates_per_env,
             laps_required=config.laps_required,
+            dynamics_randomization_scale=config.dynamics_randomization_scale,
+            actuator_randomization_scale=config.actuator_randomization_scale,
+            spawn_randomization_scale=config.spawn_randomization_scale,
         )
 
     def as_ffi(self) -> _TriadSimConfig:
@@ -483,6 +494,9 @@ class SimulationConfig:
             max_steps=self.max_steps,
             max_gates_per_env=self.max_gates_per_env,
             laps_required=self.laps_required,
+            dynamics_randomization_scale=self.dynamics_randomization_scale,
+            actuator_randomization_scale=self.actuator_randomization_scale,
+            spawn_randomization_scale=self.spawn_randomization_scale,
         )
 
 
@@ -899,11 +913,9 @@ class SimulationCore:
                     if reason is not DoneReason.NONE
                     and int(value.done_reason) & int(reason)
                 ],
-                "progress_reward": float(value.progress_reward),
-                "distance_penalty": float(value.distance_penalty),
-                "alignment_reward": float(value.alignment_reward),
-                "tilt_penalty": float(value.tilt_penalty),
-                "completion_bonus": float(value.completion_bonus),
+                "shaping_reward": float(value.shaping_reward),
+                "time_penalty": float(value.time_penalty),
+                "sparse_objective_reward": float(value.sparse_objective_reward),
                 "collision_penalty": float(value.collision_penalty),
             }
             for value in values
@@ -1077,7 +1089,14 @@ class TriadFastVecEnv:
         return result.numpy_views()
 
 
-from .ppo import PPOConfig, PPOTrainResult, load_ppo_policy, serve_ppo_policy, train_ppo
+from .ppo import (
+    PPOConfig,
+    PPOTrainResult,
+    evaluate_ppo_checkpoint,
+    load_ppo_policy,
+    serve_ppo_policy,
+    train_ppo,
+)
 from .rollout import (
     BenchmarkResult,
     RolloutBatch,
@@ -1212,6 +1231,9 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--total-updates", type=int, default=500)
     ppo_train.add_argument("--warmup-updates", type=int, default=25)
     ppo_train.add_argument("--max-episode-steps", type=int, default=2048)
+    ppo_train.add_argument("--dynamics-randomization-scale", type=float, default=1.0)
+    ppo_train.add_argument("--actuator-randomization-scale", type=float, default=1.0)
+    ppo_train.add_argument("--spawn-randomization-scale", type=float, default=1.0)
     ppo_train.add_argument("--learning-rate", type=float, default=3.0e-4)
     ppo_train.add_argument("--gamma", type=float, default=0.99)
     ppo_train.add_argument("--gae-lambda", type=float, default=0.95)
@@ -1227,6 +1249,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--device", default="auto")
     ppo_train.add_argument("--seed", type=int, default=0)
     ppo_train.add_argument("--log-interval", type=int, default=10)
+    ppo_train.add_argument("--run-name", default=None)
+    ppo_train.add_argument("--tensorboard-dir", default="runs")
     ppo_train.add_argument("--checkpoint", default=None)
     ppo_train.add_argument("--checkpoint-interval", type=int, default=0)
     ppo_train.add_argument("--curriculum-eval-interval", type=int, default=10)
@@ -1257,6 +1281,21 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         help="Disable running observation normalization",
     )
     ppo_train.add_argument(
+        "--no-pretty-log",
+        action="store_true",
+        help="Disable concise human-readable training summaries",
+    )
+    ppo_train.add_argument(
+        "--no-json-log",
+        action="store_true",
+        help="Disable structured JSON event output",
+    )
+    ppo_train.add_argument(
+        "--no-tensorboard",
+        action="store_true",
+        help="Disable TensorBoard event logging",
+    )
+    ppo_train.add_argument(
         "--observation-clip",
         type=float,
         default=10.0,
@@ -1267,6 +1306,40 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     )
     ppo_policy_server.add_argument("--checkpoint", required=True)
     ppo_policy_server.add_argument("--device", default="auto")
+    ppo_eval = subparsers.add_parser(
+        "ppo-eval", help="Evaluate a PPO checkpoint on curriculum phases"
+    )
+    ppo_eval.add_argument("--checkpoint", required=True)
+    ppo_eval.add_argument("--device", default="auto")
+    ppo_eval.add_argument(
+        "--phase-index",
+        type=int,
+        default=None,
+        help="Evaluate a single curriculum phase. Default evaluates all phases.",
+    )
+    ppo_eval.add_argument(
+        "--eval-env-count",
+        type=int,
+        default=None,
+        help="Override evaluation environment count from the checkpoint config.",
+    )
+    ppo_eval.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=None,
+        help="Override evaluation episode length from the checkpoint config.",
+    )
+    ppo_eval.add_argument(
+        "--base-seed",
+        type=int,
+        default=None,
+        help="Override the holdout seed used for evaluation.",
+    )
+    ppo_eval.add_argument(
+        "--per-env",
+        action="store_true",
+        help="Include a per-environment terminal breakdown in the eval output.",
+    )
     curriculum_demo = subparsers.add_parser(
         "curriculum-demo", help="Sample reset params from the default curriculum"
     )
@@ -1455,6 +1528,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             total_updates=args.total_updates,
             warmup_updates=args.warmup_updates,
             max_episode_steps=args.max_episode_steps,
+            dynamics_randomization_scale=args.dynamics_randomization_scale,
+            actuator_randomization_scale=args.actuator_randomization_scale,
+            spawn_randomization_scale=args.spawn_randomization_scale,
             learning_rate=args.learning_rate,
             anneal_learning_rate=not args.no_lr_anneal,
             gamma=args.gamma,
@@ -1474,6 +1550,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             device=args.device,
             seed=args.seed,
             log_interval=args.log_interval,
+            pretty_log=not args.no_pretty_log,
+            json_log=not args.no_json_log,
+            tensorboard_dir=None if args.no_tensorboard else args.tensorboard_dir,
+            run_name=args.run_name,
             checkpoint_path=args.checkpoint,
             checkpoint_interval=args.checkpoint_interval,
             curriculum_eval_interval=args.curriculum_eval_interval,
@@ -1492,6 +1572,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "ppo-policy-server":
         return serve_ppo_policy(args.checkpoint, device=args.device)
+
+    if args.command == "ppo-eval":
+        result = evaluate_ppo_checkpoint(
+            args.checkpoint,
+            device=args.device,
+            phase_index=args.phase_index,
+            eval_env_count=args.eval_env_count,
+            max_episode_steps=args.max_episode_steps,
+            base_seed=args.base_seed,
+            per_env=args.per_env,
+        )
+        _print_json(asdict(result))
+        return 0
 
     course = (
         CourseSpec(args.name)

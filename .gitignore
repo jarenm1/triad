@@ -12,3 +12,6 @@ bear.ply
 __pycache__/
 *.py[cod]
 triad-headless-output.png
+checkpoints/
+runs/
+.codex

@@ -5,6 +5,7 @@ python/triad_py/__main__.py
 python/triad_py/curriculum.py
 python/triad_py/ppo.py
 python/triad_py/rollout.py
+python/triad_py/training_log.py
 python/triad_py.egg-info/PKG-INFO
 python/triad_py.egg-info/SOURCES.txt
 python/triad_py.egg-info/dependency_links.txt

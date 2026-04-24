@@ -87,7 +87,7 @@ def point_to_gate_policy(
     altitude_error = target_delta[:, 1]
     vertical_velocity = velocity[:, 1]
 
-    collective = 0.58 + altitude_error * 0.22 - vertical_velocity * 0.08
+    collective = 0.48 + altitude_error * 0.22 - vertical_velocity * 0.08
     roll_cmd = np.clip(-lateral_error * 0.07 + lateral_velocity * 0.04, -0.25, 0.25)
     pitch_cmd = np.clip(forward_error * 0.07 - forward_velocity * 0.04, -0.25, 0.25)
     yaw_cmd = np.clip(yaw_error * 0.18 - angular_velocity[:, 2] * 0.05, -0.16, 0.16)

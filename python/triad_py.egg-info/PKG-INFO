@@ -6,3 +6,4 @@ Requires-Python: >=3.11
 Requires-Dist: numpy>=1.26
 Provides-Extra: training
 Requires-Dist: torch>=2.4; extra == "training"
+Requires-Dist: tensorboard; extra == "training"

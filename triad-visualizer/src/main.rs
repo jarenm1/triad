@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::error::Error;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -20,8 +21,12 @@ use triad_window::{
 };
 
 const WINDOW_TITLE: &str = "Triad Visualizer";
-const GATE_DEPTH_HALF: f32 = 0.015;
-const GATE_THICKNESS_MIN: f32 = 0.035;
+// Keep this in sync with the sim default until min_altitude is exposed publicly.
+const FLOOR_ALTITUDE: f32 = 0.1;
+const FLOOR_HALF_THICKNESS: f32 = 0.02;
+const FLOOR_INSTANCE_COUNT: usize = 1;
+const GATE_DEPTH_HALF: f32 = 0.04;
+const GATE_FRAME_THICKNESS: f32 = 0.08;
 const DRONE_CORE_HALF_EXTENTS: [f32; 3] = [0.06, 0.025, 0.035];
 const DRONE_ARM_HALF_EXTENTS: [f32; 3] = [0.14, 0.015, 0.015];
 const DRONE_MOTOR_HALF_EXTENTS: [f32; 3] = [0.028, 0.018, 0.028];
@@ -29,6 +34,19 @@ const DRONE_ARM_OFFSET: f32 = 0.11;
 const DRONE_MOTOR_OFFSET: f32 = 0.22;
 const DRONE_MODEL_INSTANCE_COUNT: usize = 9;
 const TARGET_HALF_EXTENTS: [f32; 3] = [0.05, 0.05, 0.05];
+const TRAIL_MAX_POINTS: usize = 96;
+const TRAIL_INSTANCE_COUNT: usize = TRAIL_MAX_POINTS - 1;
+const TRAIL_MIN_POINT_DISTANCE: f32 = 0.04;
+const TRAIL_RESET_DISTANCE: f32 = 2.5;
+const TRAIL_HALF_WIDTH: f32 = 0.012;
+const TRAIL_HALF_HEIGHT: f32 = 0.006;
+const ARROW_INSTANCE_COUNT: usize = 3;
+const ARROW_FORWARD_OFFSET: f32 = 0.12;
+const ARROW_VERTICAL_OFFSET: f32 = 0.055;
+const ARROW_SHAFT_HALF_LENGTH: f32 = 0.10;
+const ARROW_SHAFT_HALF_WIDTH: f32 = 0.010;
+const ARROW_HEAD_HALF_LENGTH: f32 = 0.055;
+const ARROW_HEAD_HALF_WIDTH: f32 = 0.008;
 const VISUALIZER_ENV_COUNT: usize = 128;
 const DONE_REASON_COMPLETE: u32 = 1 << 0;
 const DONE_REASON_GATE_COLLISION: u32 = 1 << 1;
@@ -195,11 +213,9 @@ struct UiState {
     distance_to_gate: f32,
     gate_alignment: f32,
     mean_motor_thrust: f32,
-    progress_reward: f32,
-    distance_penalty: f32,
-    alignment_reward: f32,
-    tilt_penalty: f32,
-    completion_bonus: f32,
+    shaping_reward: f32,
+    time_penalty: f32,
+    sparse_objective_reward: f32,
     collision_penalty: f32,
     last_value_estimate: f32,
 }
@@ -229,11 +245,9 @@ impl Default for UiState {
             distance_to_gate: 0.0,
             gate_alignment: 0.0,
             mean_motor_thrust: 0.0,
-            progress_reward: 0.0,
-            distance_penalty: 0.0,
-            alignment_reward: 0.0,
-            tilt_penalty: 0.0,
-            completion_bonus: 0.0,
+            shaping_reward: 0.0,
+            time_penalty: 0.0,
+            sparse_objective_reward: 0.0,
             collision_penalty: 0.0,
             last_value_estimate: 0.0,
         }
@@ -384,6 +398,7 @@ struct VisualizerManager {
     cached_reward_done: Vec<RewardDone>,
     actions: Vec<Action>,
     instances: Vec<RenderInstance>,
+    trail_points: Vec<VecDeque<[f32; 3]>>,
     checkpoint_client: Option<PpoPolicyClient>,
     last_value_estimates: Vec<f32>,
     selected_env: usize,
@@ -494,6 +509,9 @@ impl VisualizerManager {
             .build(registry)?;
 
         let zero_actions = vec![Action::new([0.0; 4]); sim.env_count()];
+        let trail_points = (0..sim.env_count())
+            .map(|_| VecDeque::with_capacity(TRAIL_MAX_POINTS))
+            .collect();
         sim.set_actions(renderer, registry, &zero_actions)?;
 
         Ok(Self {
@@ -512,6 +530,7 @@ impl VisualizerManager {
             cached_reward_done: Vec::new(),
             actions: zero_actions,
             instances: hidden_instances,
+            trail_points,
             checkpoint_client: None,
             last_value_estimates: vec![0.0; VISUALIZER_ENV_COUNT],
             selected_env: 0,
@@ -674,6 +693,10 @@ impl VisualizerManager {
         };
 
         let mut write_index = 0usize;
+        if let Some(slot) = self.instances.get_mut(write_index) {
+            *slot = floor_instance(self.sim.config().bounds);
+            write_index += 1;
+        }
         for gate_index in 0..layout.gate_count as usize {
             if let Some(gate) = self
                 .cached_gates
@@ -704,7 +727,21 @@ impl VisualizerManager {
 
         if let Some(state) = selected_state {
             let target_gate = self.target_gate_for_env(self.selected_env, &state);
+            if let Some(trail) = self.trail_points.get(self.selected_env) {
+                for instance in trail_instances(trail) {
+                    if let Some(slot) = self.instances.get_mut(write_index) {
+                        *slot = instance;
+                        write_index += 1;
+                    }
+                }
+            }
             for instance in drone_instances(state) {
+                if let Some(slot) = self.instances.get_mut(write_index) {
+                    *slot = instance;
+                    write_index += 1;
+                }
+            }
+            for instance in direction_arrow_instances(state) {
                 if let Some(slot) = self.instances.get_mut(write_index) {
                     *slot = instance;
                     write_index += 1;
@@ -758,21 +795,62 @@ impl VisualizerManager {
         if let Some(reward_done) = selected_reward_done {
             ui.reward = reward_done.reward;
             ui.done_reason_bits = reward_done.done_reason;
-            ui.progress_reward = reward_done.progress_reward;
-            ui.distance_penalty = reward_done.distance_penalty;
-            ui.alignment_reward = reward_done.alignment_reward;
-            ui.tilt_penalty = reward_done.tilt_penalty;
-            ui.completion_bonus = reward_done.completion_bonus;
+            ui.shaping_reward = reward_done.shaping_reward;
+            ui.time_penalty = reward_done.time_penalty;
+            ui.sparse_objective_reward = reward_done.sparse_objective_reward;
             ui.collision_penalty = reward_done.collision_penalty;
         } else {
             ui.reward = 0.0;
             ui.done_reason_bits = 0;
-            ui.progress_reward = 0.0;
-            ui.distance_penalty = 0.0;
-            ui.alignment_reward = 0.0;
-            ui.tilt_penalty = 0.0;
-            ui.completion_bonus = 0.0;
+            ui.shaping_reward = 0.0;
+            ui.time_penalty = 0.0;
+            ui.sparse_objective_reward = 0.0;
             ui.collision_penalty = 0.0;
+        }
+    }
+
+    fn clear_trail(&mut self, env_index: usize) {
+        if let Some(trail) = self.trail_points.get_mut(env_index) {
+            trail.clear();
+        }
+    }
+
+    fn clear_all_trails(&mut self) {
+        for trail in &mut self.trail_points {
+            trail.clear();
+        }
+    }
+
+    fn update_trails(&mut self) {
+        for (env_index, state) in self.cached_states.iter().enumerate() {
+            let Some(trail) = self.trail_points.get_mut(env_index) else {
+                continue;
+            };
+            let position = state.position;
+            let point = vec3_from_array(position);
+
+            match trail.back().copied() {
+                None => {
+                    trail.push_back(position);
+                }
+                Some(last_position) => {
+                    if state.done != 0 {
+                        continue;
+                    }
+
+                    let distance = (point - vec3_from_array(last_position)).length();
+                    if distance <= TRAIL_MIN_POINT_DISTANCE {
+                        continue;
+                    }
+                    if distance >= TRAIL_RESET_DISTANCE {
+                        trail.clear();
+                    }
+                    if trail.len() == TRAIL_MAX_POINTS {
+                        trail.pop_front();
+                    }
+                    trail.push_back(position);
+                }
+            }
         }
     }
 }
@@ -821,6 +899,7 @@ impl RendererManager for VisualizerManager {
             );
             self.sim.set_reset_params(renderer, registry, &params)?;
             self.sim.reset_all(renderer, registry)?;
+            self.clear_all_trails();
             self.sim.step(renderer, registry);
             self.layouts_dirty = true;
             forced_reset_step = true;
@@ -829,6 +908,7 @@ impl RendererManager for VisualizerManager {
         } else if snapshot.reset_selected {
             self.sim
                 .request_resets(renderer, registry, &[self.selected_env])?;
+            self.clear_trail(self.selected_env);
             self.sim.step(renderer, registry);
             forced_reset_step = true;
         } else if snapshot.reset_all {
@@ -839,6 +919,7 @@ impl RendererManager for VisualizerManager {
             );
             self.sim.set_reset_params(renderer, registry, &params)?;
             self.sim.reset_all(renderer, registry)?;
+            self.clear_all_trails();
             self.sim.step(renderer, registry);
             self.layouts_dirty = true;
             forced_reset_step = true;
@@ -851,6 +932,7 @@ impl RendererManager for VisualizerManager {
         self.refresh_state_cache(renderer, registry)?;
         self.refresh_observation_cache(renderer, registry)?;
         self.refresh_reward_done_cache(renderer, registry)?;
+        self.update_trails();
 
         if snapshot.replay_active {
             let apply_result = if snapshot.use_checkpoint_policy {
@@ -867,6 +949,7 @@ impl RendererManager for VisualizerManager {
                     self.refresh_state_cache(renderer, registry)?;
                     self.refresh_observation_cache(renderer, registry)?;
                     self.refresh_reward_done_cache(renderer, registry)?;
+                    self.update_trails();
                 }
                 Err(error) => {
                     {
@@ -1041,11 +1124,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
                         panel.separator();
                         panel.label("Reward Breakdown");
-                        panel.label(format!("  progress: +{:.3}", ui.progress_reward));
-                        panel.label(format!("  distance: -{:.3}", ui.distance_penalty));
-                        panel.label(format!("  alignment: +{:.3}", ui.alignment_reward));
-                        panel.label(format!("  tilt: -{:.3}", ui.tilt_penalty));
-                        panel.label(format!("  completion: +{:.3}", ui.completion_bonus));
+                        panel.label(format!("  shaping: {:+.3}", ui.shaping_reward));
+                        panel.label(format!(
+                            "  sparse objective: +{:.3}",
+                            ui.sparse_objective_reward
+                        ));
+                        panel.label(format!("  time: -{:.3}", ui.time_penalty));
                         panel.label(format!("  collision: -{:.3}", ui.collision_penalty));
                     });
             });
@@ -1071,9 +1155,12 @@ fn init_logging() {
 }
 
 fn visible_instance_capacity(max_gates_per_env: usize) -> usize {
-    max_gates_per_env * 4
+    FLOOR_INSTANCE_COUNT
+        + max_gates_per_env * 4
         + max_obstacles_per_env(max_gates_per_env)
+        + TRAIL_INSTANCE_COUNT
         + DRONE_MODEL_INSTANCE_COUNT
+        + ARROW_INSTANCE_COUNT
         + 1
 }
 
@@ -1148,8 +1235,8 @@ fn gate_bar_instances(gate: Gate) -> [RenderInstance; 4] {
     let up = [0.0, 1.0, 0.0];
     let hole_half_width = gate.half_extents[0].max(0.1);
     let hole_half_height = gate.half_extents[1].max(0.1);
-    let depth_half = gate.half_extents[2].max(GATE_DEPTH_HALF);
-    let thickness = (hole_half_width.min(hole_half_height) * 0.16).max(GATE_THICKNESS_MIN);
+    let depth_half = GATE_DEPTH_HALF;
+    let thickness = GATE_FRAME_THICKNESS;
     let center = gate.center;
     let gate_color = [0.96, 0.57, 0.14, 1.0];
 
@@ -1205,6 +1292,17 @@ fn gate_bar_instances(gate: Gate) -> [RenderInstance; 4] {
     ]
 }
 
+fn floor_instance(bounds: f32) -> RenderInstance {
+    RenderInstance::oriented_box(
+        [0.0, FLOOR_ALTITUDE - FLOOR_HALF_THICKNESS, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [bounds, FLOOR_HALF_THICKNESS, bounds],
+        [0.18, 0.19, 0.23, 1.0],
+    )
+}
+
 fn obstacle_instance(obstacle: Gate) -> RenderInstance {
     let forward = normalized_xz(obstacle.forward).unwrap_or([0.0, 0.0, 1.0]);
     let right = [forward[2], 0.0, -forward[0]];
@@ -1224,15 +1322,7 @@ fn obstacle_instance(obstacle: Gate) -> RenderInstance {
 }
 
 fn drone_instances(state: EnvState) -> Vec<RenderInstance> {
-    let yaw = state.attitude[2];
-    let (roll, pitch) = (state.attitude[0], state.attitude[1]);
-    let (cy, sy) = (yaw.cos(), yaw.sin());
-    let (cr, sr) = (roll.cos(), roll.sin());
-    let (cp, sp) = (pitch.cos(), pitch.sin());
-    let forward = [cy * cp, sp, sy * cp];
-    let right = [cy * sp * sr + sy * cr, cp * sr, sy * sp * sr - cy * cr];
-    let up = [cy * sp * cr - sy * sr, cp * cr, sy * sp * cr + cy * sr];
-
+    let (forward, right, up) = drone_basis(state);
     let center = [state.position[0], state.position[1], state.position[2]];
     let mut parts = Vec::with_capacity(DRONE_MODEL_INSTANCE_COUNT);
     parts.push(RenderInstance::oriented_box(
@@ -1300,6 +1390,95 @@ fn drone_instances(state: EnvState) -> Vec<RenderInstance> {
     parts
 }
 
+fn trail_instances(points: &VecDeque<[f32; 3]>) -> Vec<RenderInstance> {
+    let segment_count = points.len().saturating_sub(1);
+    let mut instances = Vec::with_capacity(segment_count.min(TRAIL_INSTANCE_COUNT));
+    for (index, (start, end)) in points.iter().zip(points.iter().skip(1)).enumerate() {
+        let progress = (index + 1) as f32 / segment_count.max(1) as f32;
+        let color = [
+            0.18 + progress * 0.30,
+            0.72 + progress * 0.18,
+            0.98,
+            1.0,
+        ];
+        if let Some(instance) = segment_instance(
+            vec3_from_array(*start),
+            vec3_from_array(*end),
+            TRAIL_HALF_WIDTH,
+            TRAIL_HALF_HEIGHT,
+            color,
+        ) {
+            instances.push(instance);
+        }
+    }
+    instances
+}
+
+fn direction_arrow_instances(state: EnvState) -> [RenderInstance; ARROW_INSTANCE_COUNT] {
+    let (forward, _, _) = drone_basis(state);
+    let forward = normalized_xz(forward).unwrap_or([1.0, 0.0, 0.0]);
+    let right = [forward[2], 0.0, -forward[0]];
+    let up = [0.0, 1.0, 0.0];
+    let center = vec3_from_array(state.position);
+    let arrow_origin = center
+        + vec3_from_array(forward) * ARROW_FORWARD_OFFSET
+        + vec3_from_array(up) * ARROW_VERTICAL_OFFSET;
+    let color = [0.99, 0.92, 0.24, 1.0];
+    let shaft_center = arrow_origin + vec3_from_array(forward) * ARROW_SHAFT_HALF_LENGTH;
+    let tip = arrow_origin + vec3_from_array(forward) * (ARROW_SHAFT_HALF_LENGTH * 2.0 + 0.02);
+
+    let left_dir = safe_normalize(
+        -vec3_from_array(forward) - vec3_from_array(right) * 0.72,
+        -vec3_from_array(forward),
+    );
+    let right_dir = safe_normalize(
+        -vec3_from_array(forward) + vec3_from_array(right) * 0.72,
+        -vec3_from_array(forward),
+    );
+    let left_side = safe_normalize(vec3_from_array(up).cross(left_dir), vec3_from_array(right));
+    let right_side =
+        safe_normalize(vec3_from_array(up).cross(right_dir), -vec3_from_array(right));
+
+    [
+        RenderInstance::oriented_box(
+            vec3_to_array(shaft_center),
+            right,
+            forward,
+            up,
+            [
+                ARROW_SHAFT_HALF_WIDTH,
+                ARROW_SHAFT_HALF_LENGTH,
+                ARROW_SHAFT_HALF_WIDTH,
+            ],
+            color,
+        ),
+        RenderInstance::oriented_box(
+            vec3_to_array(tip + left_dir * ARROW_HEAD_HALF_LENGTH),
+            vec3_to_array(left_side),
+            vec3_to_array(left_dir),
+            up,
+            [
+                ARROW_HEAD_HALF_WIDTH,
+                ARROW_HEAD_HALF_LENGTH,
+                ARROW_HEAD_HALF_WIDTH,
+            ],
+            color,
+        ),
+        RenderInstance::oriented_box(
+            vec3_to_array(tip + right_dir * ARROW_HEAD_HALF_LENGTH),
+            vec3_to_array(right_side),
+            vec3_to_array(right_dir),
+            up,
+            [
+                ARROW_HEAD_HALF_WIDTH,
+                ARROW_HEAD_HALF_LENGTH,
+                ARROW_HEAD_HALF_WIDTH,
+            ],
+            color,
+        ),
+    ]
+}
+
 fn target_instance(gate: Gate) -> RenderInstance {
     RenderInstance::oriented_box(
         [gate.center[0], gate.center[1], gate.center[2]],
@@ -1349,6 +1528,67 @@ fn normalized_xz(value: [f32; 3]) -> Option<[f32; 3]> {
     }
     let inv_len = length_sq.sqrt().recip();
     Some([value[0] * inv_len, 0.0, value[2] * inv_len])
+}
+
+fn drone_basis(state: EnvState) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let yaw = state.attitude[2];
+    let (roll, pitch) = (state.attitude[0], state.attitude[1]);
+    let (cy, sy) = (yaw.cos(), yaw.sin());
+    let (cr, sr) = (roll.cos(), roll.sin());
+    let (cp, sp) = (pitch.cos(), pitch.sin());
+    let forward = [cy * cp, sp, sy * cp];
+    let right = [cy * sp * sr + sy * cr, cp * sr, sy * sp * sr - cy * cr];
+    let up = [cy * sp * cr - sy * sr, cp * cr, sy * sp * cr + cy * sr];
+    (forward, right, up)
+}
+
+fn segment_instance(
+    start: Vec3,
+    end: Vec3,
+    half_width: f32,
+    half_height: f32,
+    color: [f32; 4],
+) -> Option<RenderInstance> {
+    let delta = end - start;
+    let length = delta.length();
+    if length <= 1e-5 {
+        return None;
+    }
+
+    let forward = delta / length;
+    let right = safe_normalize(
+        forward.cross(Vec3::Y),
+        if forward.y.abs() < 0.95 {
+            Vec3::Z
+        } else {
+            Vec3::X
+        },
+    );
+    let up = safe_normalize(right.cross(forward), Vec3::Y);
+    Some(RenderInstance::oriented_box(
+        vec3_to_array((start + end) * 0.5),
+        vec3_to_array(right),
+        vec3_to_array(forward),
+        vec3_to_array(up),
+        [half_width, length * 0.5, half_height],
+        color,
+    ))
+}
+
+fn safe_normalize(value: Vec3, fallback: Vec3) -> Vec3 {
+    if value.length_squared() <= 1e-6 {
+        fallback.normalize_or_zero()
+    } else {
+        value.normalize()
+    }
+}
+
+fn vec3_from_array(value: [f32; 3]) -> Vec3 {
+    Vec3::new(value[0], value[1], value[2])
+}
+
+fn vec3_to_array(value: Vec3) -> [f32; 3] {
+    [value.x, value.y, value.z]
 }
 
 fn hash_u32(mut value: u32) -> u32 {

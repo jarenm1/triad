@@ -93,6 +93,9 @@ pub struct TriadSimConfig {
     pub max_steps: u32,
     pub max_gates_per_env: u32,
     pub laps_required: u32,
+    pub dynamics_randomization_scale: f32,
+    pub actuator_randomization_scale: f32,
+    pub spawn_randomization_scale: f32,
 }
 
 #[repr(C)]
@@ -172,11 +175,11 @@ pub struct TriadRewardDone {
     pub done: u32,
     pub done_reason: u32,
     pub _pad0: u32,
-    pub progress_reward: f32,
-    pub distance_penalty: f32,
-    pub alignment_reward: f32,
-    pub tilt_penalty: f32,
-    pub completion_bonus: f32,
+    pub shaping_reward: f32,
+    pub _unused_reward0: f32,
+    pub _unused_reward1: f32,
+    pub time_penalty: f32,
+    pub sparse_objective_reward: f32,
     pub collision_penalty: f32,
     pub _pad1: f32,
     pub _pad2: f32,
@@ -208,6 +211,9 @@ impl From<GpuSimulationConfig> for TriadSimConfig {
             max_steps: config.max_steps,
             max_gates_per_env: config.max_gates_per_env as u32,
             laps_required: config.laps_required,
+            dynamics_randomization_scale: config.dynamics_randomization_scale,
+            actuator_randomization_scale: config.actuator_randomization_scale,
+            spawn_randomization_scale: config.spawn_randomization_scale,
         }
     }
 }
@@ -221,6 +227,9 @@ impl From<TriadSimConfig> for GpuSimulationConfig {
             max_steps: config.max_steps,
             max_gates_per_env: config.max_gates_per_env as usize,
             laps_required: config.laps_required,
+            dynamics_randomization_scale: config.dynamics_randomization_scale,
+            actuator_randomization_scale: config.actuator_randomization_scale,
+            spawn_randomization_scale: config.spawn_randomization_scale,
         }
     }
 }
@@ -437,11 +446,11 @@ fn convert_reward_done(reward_done: &RewardDone) -> TriadRewardDone {
         done: reward_done.done,
         done_reason: reward_done.done_reason,
         _pad0: reward_done._pad,
-        progress_reward: reward_done.progress_reward,
-        distance_penalty: reward_done.distance_penalty,
-        alignment_reward: reward_done.alignment_reward,
-        tilt_penalty: reward_done.tilt_penalty,
-        completion_bonus: reward_done.completion_bonus,
+        shaping_reward: reward_done.shaping_reward,
+        _unused_reward0: reward_done._unused_reward0,
+        _unused_reward1: reward_done._unused_reward1,
+        time_penalty: reward_done.time_penalty,
+        sparse_objective_reward: reward_done.sparse_objective_reward,
         collision_penalty: reward_done.collision_penalty,
         _pad1: reward_done._pad1,
         _pad2: reward_done._pad2,

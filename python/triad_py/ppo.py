@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import datetime
 import json
 import math
 import random
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from time import perf_counter
 
@@ -18,7 +19,7 @@ from . import (
     TriadFastVecEnv,
     build_teacher_curriculum_schedule,
 )
-from .training_log import DoneReasonTracker, PPOTrainingLogger
+from .training_log import DONE_REASON_BITS, DoneReasonTracker, PPOTrainingLogger
 
 try:
     import torch
@@ -34,6 +35,24 @@ def _require_torch():
             "PyTorch is required for PPO training. Install with `uv sync --extra training`."
         )
     return torch, nn
+
+
+def _create_tensorboard_writer(config: "PPOConfig"):
+    if config.tensorboard_dir is None:
+        return None, None
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError as error:  # pragma: no cover - runtime dependency
+        raise RuntimeError(
+            "TensorBoard logging requires `tensorboard`. Install with `uv sync --extra training`."
+        ) from error
+
+    checkpoint_stem = Path(config.checkpoint_path).stem if config.checkpoint_path else "ppo"
+    run_name = config.run_name or f"{checkpoint_stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_dir = Path(config.tensorboard_dir) / run_name
+    log_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(log_dir))
+    return writer, log_dir
 
 
 def _resolve_device(requested: str) -> str:
@@ -54,6 +73,9 @@ class PPOConfig:
     total_updates: int = 500
     warmup_updates: int = 25
     max_episode_steps: int = 2048
+    dynamics_randomization_scale: float = 1.0
+    actuator_randomization_scale: float = 1.0
+    spawn_randomization_scale: float = 1.0
     learning_rate: float = 3.0e-4
     anneal_learning_rate: bool = True
     gamma: float = 0.99
@@ -73,6 +95,10 @@ class PPOConfig:
     seed: int = 0
     device: str = "auto"
     log_interval: int = 10
+    pretty_log: bool = True
+    json_log: bool = True
+    tensorboard_dir: str | None = "runs"
+    run_name: str | None = None
     checkpoint_path: str | None = None
     checkpoint_interval: int = 0
     curriculum_eval_interval: int = 10
@@ -135,6 +161,50 @@ class CurriculumEvalStats:
     mean_progress: float
     mean_episode_return: float
     mean_episode_length: float
+    per_env: list["CurriculumEvalEnvResult"] | None = None
+
+
+@dataclass
+class CurriculumEvalEnvResult:
+    env_index: int
+    seed: int
+    grammar_id: int
+    difficulty: float
+    curriculum_stage: int
+    completed: bool
+    done: bool
+    done_reason: int
+    done_reason_labels: list[str]
+    episode_return: float
+    episode_length: int
+    best_progress: float
+    final_progress: float
+    current_gate: int
+    current_lap: int
+    step_count: int
+    position: list[float]
+    velocity: list[float]
+    attitude: list[float]
+    target_gate_position: list[float]
+    distance_to_gate: float
+    gate_alignment: float
+    reward: float
+    shaping_reward: float
+    time_penalty: float
+    sparse_objective_reward: float
+    collision_penalty: float
+
+
+@dataclass
+class PPOEvalResult:
+    checkpoint_path: str
+    checkpoint_update_index: int | None
+    checkpoint_total_env_steps: int | None
+    device: str
+    eval_env_count: int
+    max_episode_steps: int
+    per_env: bool
+    results: list[CurriculumEvalStats]
 
 
 @dataclass
@@ -262,6 +332,9 @@ def _training_sim_config(course: CourseSpec, config: PPOConfig) -> SimulationCon
     sim_config.max_gates_per_env = max(
         sim_config.max_gates_per_env, int(course.stats["total_gate_count"])
     )
+    sim_config.dynamics_randomization_scale = config.dynamics_randomization_scale
+    sim_config.actuator_randomization_scale = config.actuator_randomization_scale
+    sim_config.spawn_randomization_scale = config.spawn_randomization_scale
     return sim_config
 
 
@@ -269,6 +342,119 @@ def _evaluation_sim_config(course: CourseSpec, config: PPOConfig) -> SimulationC
     sim_config = _training_sim_config(course, config)
     sim_config.env_count = max(1, min(config.curriculum_eval_env_count, config.env_count))
     return sim_config
+
+
+def _hash_to_unit(seed: int) -> float:
+    mixed = (seed * 747796405 + 2891336453) & 0xFFFFFFFF
+    masked = mixed & 0x00FFFFFF
+    return masked / 16777215.0
+
+
+def _hash_to_signed(seed: int) -> float:
+    return _hash_to_unit(seed) * 2.0 - 1.0
+
+
+def _curriculum_dynamics_scale(curriculum_stage: int) -> float:
+    if curriculum_stage == 0:
+        return 0.35
+    if curriculum_stage == 1:
+        return 0.55
+    if curriculum_stage == 2:
+        return 0.8
+    return 1.0
+
+
+def _randomized_positive_scale(seed: int, salt: int, magnitude: float) -> float:
+    return max(0.25, 1.0 + _hash_to_signed((seed ^ salt) & 0xFFFFFFFF) * magnitude)
+
+
+def _summarize_array(values: np.ndarray) -> dict[str, float]:
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "min": float(array.min()),
+        "max": float(array.max()),
+        "mean": float(array.mean()),
+    }
+
+
+def _randomization_preview(
+    reset_params: list[tuple[int, int, float, int]],
+    config: PPOConfig,
+) -> dict[str, object]:
+    if not reset_params:
+        return {}
+
+    seeds = np.asarray([item[0] for item in reset_params], dtype=np.uint32)
+    difficulties = np.asarray([item[2] for item in reset_params], dtype=np.float32)
+    curriculum_stages = np.asarray([item[3] for item in reset_params], dtype=np.uint32)
+
+    dynamics_strength = (
+        0.04 + np.clip(difficulties, 0.0, 1.0) * 0.18
+    ) * np.asarray(
+        [_curriculum_dynamics_scale(int(stage)) for stage in curriculum_stages],
+        dtype=np.float32,
+    ) * float(config.dynamics_randomization_scale)
+    actuator_strength = dynamics_strength * 0.25 * float(config.actuator_randomization_scale)
+
+    def scales(salt: int, multiplier: float = 1.0) -> np.ndarray:
+        return np.asarray(
+            [
+                _randomized_positive_scale(int(seed), salt, float(strength) * multiplier)
+                for seed, strength in zip(seeds, dynamics_strength, strict=True)
+            ],
+            dtype=np.float32,
+        )
+
+    def actuator_scales(salt: int) -> np.ndarray:
+        return np.asarray(
+            [
+                _randomized_positive_scale(int(seed), salt, float(strength))
+                for seed, strength in zip(seeds, actuator_strength, strict=True)
+            ],
+            dtype=np.float32,
+        )
+
+    motor_scales = np.stack(
+        (
+            actuator_scales(0x6001),
+            actuator_scales(0x6003),
+            actuator_scales(0x6005),
+            actuator_scales(0x6007),
+        ),
+        axis=1,
+    )
+
+    spawn_scale = float(config.spawn_randomization_scale)
+    lateral_spawn_offset = np.asarray(
+        [
+            _hash_to_signed(int(seed) ^ 0x611) * (0.08 + float(diff) * 0.18) * spawn_scale
+            for seed, diff in zip(seeds, difficulties, strict=True)
+        ],
+        dtype=np.float32,
+    )
+    yaw_offset = np.asarray(
+        [
+            _hash_to_signed(int(seed) ^ 0x1551) * 0.25 * spawn_scale
+            for seed in seeds
+        ],
+        dtype=np.float32,
+    )
+
+    return {
+        "difficulty": _summarize_array(difficulties),
+        "dynamics_strength": _summarize_array(dynamics_strength),
+        "mass_scale": _summarize_array(scales(0x4001, 0.35)),
+        "gravity_scale": _summarize_array(scales(0x4003, 0.05)),
+        "thrust_scale": _summarize_array(scales(0x4005, 0.35)),
+        "arm_length_scale": _summarize_array(scales(0x4007, 0.12)),
+        "yaw_torque_scale": _summarize_array(scales(0x4009, 0.18)),
+        "linear_drag_scale": _summarize_array(scales(0x4011, 0.45)),
+        "angular_drag_scale": _summarize_array(scales(0x4013, 0.45)),
+        "motor_response_scale": _summarize_array(scales(0x4015, 0.35)),
+        "motor_gain_scale": _summarize_array(motor_scales.reshape(-1)),
+        "spawn_lateral_offset_m": _summarize_array(lateral_spawn_offset),
+        "spawn_yaw_offset_rad": _summarize_array(yaw_offset),
+    }
 
 
 def _allocate_rollout_arrays(
@@ -510,6 +696,11 @@ COMPLETE_DONE_REASON = 1 << 0
 PROGRESS_OBSERVATION_INDEX = 18
 
 
+def _done_reason_labels(done_reason: int) -> list[str]:
+    labels = [label for bit, label in DONE_REASON_BITS if done_reason & int(bit) != 0]
+    return labels or ["none"]
+
+
 def _evaluate_curriculum_phase(
     env: TriadFastVecEnv,
     model: ActorCritic,
@@ -520,6 +711,7 @@ def _evaluate_curriculum_phase(
     phase_index: int,
     base_seed: int,
     max_episode_steps: int,
+    include_per_env: bool = False,
 ) -> CurriculumEvalStats:
     torch_module, _ = _require_torch()
     reset_params = schedule.sample_reset_params_for_phase(
@@ -573,6 +765,54 @@ def _evaluate_curriculum_phase(
             break
 
     phase = schedule.phase_at_index(phase_index)
+    per_env = None
+    if include_per_env:
+        final_states = env.sim.get_state()
+        final_observations = env.sim.get_observations()
+        final_reward_done = env.sim.get_reward_done()
+        per_env = [
+            CurriculumEvalEnvResult(
+                env_index=env_index,
+                seed=int(seed),
+                grammar_id=int(grammar_id),
+                difficulty=float(difficulty),
+                curriculum_stage=int(curriculum_stage),
+                completed=bool(completed[env_index]),
+                done=bool(final_states[env_index]["done"]),
+                done_reason=int(final_reward_done[env_index]["done_reason"]),
+                done_reason_labels=_done_reason_labels(
+                    int(final_reward_done[env_index]["done_reason"])
+                ),
+                episode_return=float(returns[env_index]),
+                episode_length=int(lengths[env_index]),
+                best_progress=float(best_progress[env_index]),
+                final_progress=float(final_observations[env_index]["progress"]),
+                current_gate=int(final_states[env_index]["current_gate"]),
+                current_lap=int(final_states[env_index]["current_lap"]),
+                step_count=int(final_states[env_index]["step_count"]),
+                position=list(final_states[env_index]["position"]),
+                velocity=list(final_states[env_index]["velocity"]),
+                attitude=list(final_states[env_index]["attitude"]),
+                target_gate_position=list(
+                    final_observations[env_index]["target_gate_position"]
+                ),
+                distance_to_gate=float(final_observations[env_index]["distance_to_gate"]),
+                gate_alignment=float(final_observations[env_index]["gate_alignment"]),
+                reward=float(final_reward_done[env_index]["reward"]),
+                shaping_reward=float(final_reward_done[env_index]["shaping_reward"]),
+                time_penalty=float(final_reward_done[env_index]["time_penalty"]),
+                sparse_objective_reward=float(
+                    final_reward_done[env_index]["sparse_objective_reward"]
+                ),
+                collision_penalty=float(final_reward_done[env_index]["collision_penalty"]),
+            )
+            for env_index, (
+                grammar_id,
+                curriculum_stage,
+                difficulty,
+                seed,
+            ) in enumerate(reset_params)
+        ]
     return CurriculumEvalStats(
         phase_index=phase_index,
         phase=phase.name,
@@ -580,6 +820,7 @@ def _evaluate_curriculum_phase(
         mean_progress=float(np.mean(best_progress)),
         mean_episode_return=float(np.mean(returns)),
         mean_episode_length=float(np.mean(lengths)),
+        per_env=per_env,
     )
 
 
@@ -779,6 +1020,87 @@ def load_ppo_policy(
     )
 
 
+def _config_from_mapping(config_data: dict[str, object]) -> PPOConfig:
+    valid_fields = {field.name for field in fields(PPOConfig)}
+    overrides = {
+        key: value for key, value in config_data.items() if key in valid_fields
+    }
+    return PPOConfig(**overrides)
+
+
+def evaluate_ppo_checkpoint(
+    checkpoint_path: str | Path,
+    *,
+    device: str = "auto",
+    phase_index: int | None = None,
+    eval_env_count: int | None = None,
+    max_episode_steps: int | None = None,
+    base_seed: int | None = None,
+    per_env: bool = False,
+) -> PPOEvalResult:
+    policy = load_ppo_policy(checkpoint_path, device=device)
+    torch_module, _ = _require_torch()
+    checkpoint = torch_module.load(
+        Path(checkpoint_path), map_location=policy.device, weights_only=False
+    )
+    config = _config_from_mapping(policy.config)
+    if eval_env_count is not None:
+        config.curriculum_eval_env_count = eval_env_count
+    if max_episode_steps is not None:
+        config.max_episode_steps = max_episode_steps
+
+    schedule = build_teacher_curriculum_schedule()
+    phase_indices: list[int]
+    if phase_index is None:
+        phase_indices = list(range(len(schedule.phases)))
+    else:
+        if phase_index < 0 or phase_index >= len(schedule.phases):
+            raise ValueError(
+                f"phase_index must be between 0 and {len(schedule.phases) - 1}, got {phase_index}"
+            )
+        phase_indices = [phase_index]
+
+    eval_course = _default_training_course()
+    eval_sim = SimulationCore(_evaluation_sim_config(eval_course, config))
+    eval_sim.set_course(eval_course)
+    eval_env = TriadFastVecEnv(eval_sim, auto_reset=False)
+    resolved_eval_env_count = eval_sim.env_count
+
+    resolved_base_seed = (
+        config.curriculum_holdout_seed if base_seed is None else int(base_seed)
+    )
+
+    try:
+        results = [
+            _evaluate_curriculum_phase(
+                eval_env,
+                policy.model,
+                device=policy.device,
+                observation_normalizer=policy.observation_normalizer,
+                schedule=schedule,
+                phase_index=current_phase_index,
+                base_seed=resolved_base_seed + current_phase_index * 104729,
+                max_episode_steps=config.max_episode_steps,
+                include_per_env=per_env,
+            )
+            for current_phase_index in phase_indices
+        ]
+    finally:
+        eval_sim.close()
+        eval_course.close()
+
+    return PPOEvalResult(
+        checkpoint_path=str(checkpoint_path),
+        checkpoint_update_index=checkpoint.get("update_index"),
+        checkpoint_total_env_steps=checkpoint.get("total_env_steps"),
+        device=policy.device,
+        eval_env_count=resolved_eval_env_count,
+        max_episode_steps=config.max_episode_steps,
+        per_env=per_env,
+        results=results,
+    )
+
+
 def serve_ppo_policy(checkpoint_path: str | Path, device: str = "auto") -> int:
     policy = load_ppo_policy(checkpoint_path, device=device)
     for line in sys.stdin:
@@ -843,7 +1165,16 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
         )
         episode_tracker = EpisodeTracker(sim.env_count)
         done_reason_tracker = DoneReasonTracker()
-        training_logger = PPOTrainingLogger(asdict(config))
+        tensorboard_writer, tensorboard_log_dir = _create_tensorboard_writer(config)
+        training_logger = PPOTrainingLogger(
+            asdict(config),
+            json_output=config.json_log,
+            pretty_output=config.pretty_log,
+            tensorboard_writer=tensorboard_writer,
+            tensorboard_log_dir=(
+                None if tensorboard_log_dir is None else str(tensorboard_log_dir)
+            ),
+        )
         reset_params = curriculum.sample_training_reset_params(
             env_count=sim.env_count,
             base_seed=config.seed,
@@ -883,12 +1214,11 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
             else:
                 current_learning_rate = config.learning_rate
 
-            sim.set_reset_params(
-                curriculum.sample_training_reset_params(
-                    env_count=sim.env_count,
-                    base_seed=config.seed + update_index,
-                )
+            reset_params = curriculum.sample_training_reset_params(
+                env_count=sim.env_count,
+                base_seed=config.seed + update_index,
             )
+            sim.set_reset_params(reset_params)
             phase_updates = curriculum.note_update()
             episode_tracker.begin_rollout()
             done_reason_tracker.reset_rollout()
@@ -1086,6 +1416,9 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                         "phase_index": phase_index,
                         "phase_updates": phase_updates,
                         "phase_mix": curriculum.training_phase_mix(),
+                        "randomization_preview": _randomization_preview(
+                            reset_params, config
+                        ),
                         "eval": None
                         if eval_stats is None
                         else {
@@ -1149,6 +1482,8 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
         training_logger.emit_completed(asdict(result))
         return result
     finally:
+        if "tensorboard_writer" in locals() and tensorboard_writer is not None:
+            tensorboard_writer.close()
         eval_sim.close()
         eval_course.close()
         sim.close()
