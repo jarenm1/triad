@@ -339,7 +339,7 @@ fn apply_intent(pose: &mut CameraPose, intent: CameraIntent) {
 }
 
 /// Orbit camera controller with center-point based controls.
-/// 
+///
 /// Controls:
 /// - Left mouse drag: Orbit camera around the center point
 /// - Shift + Left mouse drag: Pan (move center point and camera together)

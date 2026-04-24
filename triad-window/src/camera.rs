@@ -52,8 +52,8 @@ impl CameraPose {
         let right = glam::Quat::from_euler(glam::EulerRot::YXZ, self.yaw, 0.0, 0.0) * Vec3::X;
         let up = Vec3::Y;
         let distance = (self.position - self.center).length();
-        let pan = (-delta.x * sensitivity * distance) * right
-            + (delta.y * sensitivity * distance) * up;
+        let pan =
+            (-delta.x * sensitivity * distance) * right + (delta.y * sensitivity * distance) * up;
         self.center += pan;
         self.position += pan;
     }
@@ -127,7 +127,12 @@ impl Projection {
 
     /// Get the projection matrix.
     pub fn matrix(&self) -> Mat4 {
-        Mat4::perspective_rh(self.fov, self.width as f32 / self.height as f32, self.near, self.far)
+        Mat4::perspective_rh(
+            self.fov,
+            self.width as f32 / self.height as f32,
+            self.near,
+            self.far,
+        )
     }
 
     /// Update the projection size.

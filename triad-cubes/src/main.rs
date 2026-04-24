@@ -8,9 +8,9 @@ use std::time::Instant;
 
 use tracing::{error, info};
 use triad_gpu::{
-    BindingType, BufferUsage, DepthLoadOp, DrawIndexedIndirectArgs, ExecutableFrameGraph, FrameGraph,
-    FrameGraphError, FrameTextureView, Handle, RenderPassBuilder, Renderer, ResourceRegistry, ShaderStage,
-    wgpu,
+    BindingType, BufferUsage, DepthLoadOp, DrawIndexedIndirectArgs, ExecutableFrameGraph,
+    FrameGraph, FrameGraphError, FrameTextureView, Handle, RenderPassBuilder, Renderer,
+    ResourceRegistry, ShaderStage, wgpu,
 };
 
 /// `'static` vertex layouts for [`wgpu::RenderPipelineDescriptor`] (no temporary `vertex_attr_array!`).
@@ -129,72 +129,42 @@ fn build_cube_mesh(h: f32) -> (Vec<MeshVertex>, Vec<u16>) {
     push_quad(
         &mut verts,
         &mut indices,
-        [
-            [n, n, p],
-            [p, n, p],
-            [p, p, p],
-            [n, p, p],
-        ],
+        [[n, n, p], [p, n, p], [p, p, p], [n, p, p]],
         [0.0, 0.0, 1.0],
     );
     // -Z
     push_quad(
         &mut verts,
         &mut indices,
-        [
-            [p, n, n],
-            [n, n, n],
-            [n, p, n],
-            [p, p, n],
-        ],
+        [[p, n, n], [n, n, n], [n, p, n], [p, p, n]],
         [0.0, 0.0, -1.0],
     );
     // +X — CCW when viewed from +X so (v1−v0)×(v2−v0) points along +X (matches `FrontFace::Ccw` + back cull).
     push_quad(
         &mut verts,
         &mut indices,
-        [
-            [p, n, n],
-            [p, p, n],
-            [p, p, p],
-            [p, n, p],
-        ],
+        [[p, n, n], [p, p, n], [p, p, p], [p, n, p]],
         [1.0, 0.0, 0.0],
     );
     // -X
     push_quad(
         &mut verts,
         &mut indices,
-        [
-            [n, n, p],
-            [n, p, p],
-            [n, p, n],
-            [n, n, n],
-        ],
+        [[n, n, p], [n, p, p], [n, p, n], [n, n, n]],
         [-1.0, 0.0, 0.0],
     );
     // +Y
     push_quad(
         &mut verts,
         &mut indices,
-        [
-            [n, p, n],
-            [n, p, p],
-            [p, p, p],
-            [p, p, n],
-        ],
+        [[n, p, n], [n, p, p], [p, p, p], [p, p, n]],
         [0.0, 1.0, 0.0],
     );
     // -Y
     push_quad(
         &mut verts,
         &mut indices,
-        [
-            [n, n, n],
-            [p, n, n],
-            [p, n, p],
-            [n, n, p],
-        ],
+        [[n, n, n], [p, n, n], [p, n, p], [n, n, p]],
         [0.0, -1.0, 0.0],
     );
     (verts, indices)
@@ -266,20 +236,25 @@ fn grid_from_env() -> (u32, u32, u32) {
         let z = parts[2].clamp(1, 256);
         let total = (x as u64) * (y as u64) * (z as u64);
         if total > 2_000_000 {
-            error!(x, y, z, total, "TRIAD_CUBE_GRID product too large; clamping to 64³");
+            error!(
+                x,
+                y, z, total, "TRIAD_CUBE_GRID product too large; clamping to 64³"
+            );
             return (64, 64, 64);
         }
         (x, y, z)
     } else {
-        error!(raw, "TRIAD_CUBE_GRID must be three comma-separated integers (e.g. 12,10,6); using default");
+        error!(
+            raw,
+            "TRIAD_CUBE_GRID must be three comma-separated integers (e.g. 12,10,6); using default"
+        );
         (14, 14, 5)
     }
 }
 
 fn pulse_from_env() -> bool {
     matches!(
-        std::env::var("TRIAD_CUBE_PULSE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+        std::env::var("TRIAD_CUBE_PULSE").map(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         Ok(true)
     )
 }
@@ -341,7 +316,13 @@ impl CubesManager {
             .usage(BufferUsage::Uniform)
             .build(registry)?;
 
-        let indirect_init = [DrawIndexedIndirectArgs::new(index_count, active_instances, 0, 0, 0)];
+        let indirect_init = [DrawIndexedIndirectArgs::new(
+            index_count,
+            active_instances,
+            0,
+            0,
+            0,
+        )];
         let indirect_buffer = renderer
             .create_gpu_buffer::<DrawIndexedIndirectArgs>()
             .label("cube draw indexed indirect")
@@ -359,14 +340,22 @@ impl CubesManager {
         let (camera_layout, camera_bind_group) = renderer
             .create_bind_group()
             .label("cubes camera")
-            .buffer_stage(0, ShaderStage::Vertex, camera_buffer.handle(), BindingType::Uniform)
+            .buffer_stage(
+                0,
+                ShaderStage::Vertex,
+                camera_buffer.handle(),
+                BindingType::Uniform,
+            )
             .build(registry)?;
 
-        let pipeline_layout = renderer.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cubes pipeline layout"),
-            bind_group_layouts: &[registry.get(camera_layout).expect("bind group layout")],
-            push_constant_ranges: &[],
-        });
+        let pipeline_layout =
+            renderer
+                .device()
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("cubes pipeline layout"),
+                    bind_group_layouts: &[registry.get(camera_layout).expect("bind group layout")],
+                    push_constant_ranges: &[],
+                });
 
         let mesh_stride = std::mem::size_of::<MeshVertex>() as wgpu::BufferAddress;
         let inst_stride = std::mem::size_of::<CubeInstance>() as wgpu::BufferAddress;
@@ -448,7 +437,13 @@ impl RendererManager for CubesManager {
                 .round()
                 .clamp(1.0, self.active_instances as f32) as u32;
         }
-        let args = [DrawIndexedIndirectArgs::new(self.index_count, count, 0, 0, 0)];
+        let args = [DrawIndexedIndirectArgs::new(
+            self.index_count,
+            count,
+            0,
+            0,
+            0,
+        )];
         renderer.write_buffer(self.indirect_buffer, &args, registry)?;
         Ok(())
     }

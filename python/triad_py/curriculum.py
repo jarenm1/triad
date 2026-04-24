@@ -158,9 +158,7 @@ class CurriculumSchedule:
                     break
             phase = self.phase_at_index(selected_phase_index)
             env_seed = rng.getrandbits(32)
-            env_rng = Random(
-                env_seed ^ env_index ^ (selected_phase_index * 0x9E3779B9)
-            )
+            env_rng = Random(env_seed ^ env_index ^ (selected_phase_index * 0x9E3779B9))
             reset_params.append(
                 (
                     env_seed,
@@ -225,8 +223,8 @@ def build_teacher_curriculum_schedule() -> CurriculumSchedule:
                 progress_end=0.2,
                 curriculum_stage=CurriculumStage.INTRO,
                 difficulty_min=0.0,
-                difficulty_max=0.15,
-                grammar_ids=(0, 1),
+                difficulty_max=0.08,
+                grammar_ids=(0,),
             ),
             CurriculumPhase(
                 name="offset",

@@ -254,8 +254,8 @@ class _TriadRewardDone(ctypes.Structure):
         ("done_reason", ctypes.c_uint32),
         ("_pad0", ctypes.c_uint32),
         ("shaping_reward", ctypes.c_float),
-        ("_unused_reward0", ctypes.c_float),
-        ("_unused_reward1", ctypes.c_float),
+        ("proximity_reward", ctypes.c_float),
+        ("out_of_bounds_penalty", ctypes.c_float),
         ("time_penalty", ctypes.c_float),
         ("sparse_objective_reward", ctypes.c_float),
         ("collision_penalty", ctypes.c_float),
@@ -914,6 +914,8 @@ class SimulationCore:
                     and int(value.done_reason) & int(reason)
                 ],
                 "shaping_reward": float(value.shaping_reward),
+                "proximity_reward": float(value.proximity_reward),
+                "out_of_bounds_penalty": float(value.out_of_bounds_penalty),
                 "time_penalty": float(value.time_penalty),
                 "sparse_objective_reward": float(value.sparse_objective_reward),
                 "collision_penalty": float(value.collision_penalty),
@@ -1257,12 +1259,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--curriculum-eval-env-count", type=int, default=64)
     ppo_train.add_argument("--curriculum-mastery-window", type=int, default=3)
     ppo_train.add_argument("--curriculum-min-stage-updates", type=int, default=20)
-    ppo_train.add_argument(
-        "--curriculum-completion-threshold", type=float, default=0.6
-    )
-    ppo_train.add_argument(
-        "--curriculum-progress-threshold", type=float, default=0.9
-    )
+    ppo_train.add_argument("--curriculum-completion-threshold", type=float, default=0.6)
+    ppo_train.add_argument("--curriculum-progress-threshold", type=float, default=0.9)
     ppo_train.add_argument("--curriculum-current-weight", type=float, default=0.7)
     ppo_train.add_argument("--curriculum-previous-weight", type=float, default=0.2)
     ppo_train.add_argument("--curriculum-easy-weight", type=float, default=0.1)
@@ -1536,7 +1534,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             gamma=args.gamma,
             gae_lambda=args.gae_lambda,
             clip_coef=args.clip_coef,
-            value_clip_coef=None if args.value_clip_coef <= 0.0 else args.value_clip_coef,
+            value_clip_coef=None
+            if args.value_clip_coef <= 0.0
+            else args.value_clip_coef,
             value_coef=args.value_coef,
             entropy_coef=args.entropy_coef,
             max_grad_norm=args.max_grad_norm,

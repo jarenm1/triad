@@ -5,11 +5,11 @@ use std::time::Instant;
 
 use tracing::{error, info};
 use triad_gpu::{
-    BindingType, BufferUsage, ComputePassBuilder, CopyPassBuilder, DepthLoadOp, DispatchIndirectArgs,
-    DrawIndirectArgs, ExecutableFrameGraph, FrameBufferHandle, FrameGraph, FrameGraphError,
-    FrameTextureView, Handle, Pass, PassBuilder, PassContext, RenderPassBuilder, Renderer,
-    ResourceRegistry, ShaderStage,
-    SpatialGridConfig, SpatialGridGpu, SpatialGridParams, total_cells, wgpu,
+    BindingType, BufferUsage, ComputePassBuilder, CopyPassBuilder, DepthLoadOp,
+    DispatchIndirectArgs, DrawIndirectArgs, ExecutableFrameGraph, FrameBufferHandle, FrameGraph,
+    FrameGraphError, FrameTextureView, Handle, Pass, PassBuilder, PassContext, RenderPassBuilder,
+    Renderer, ResourceRegistry, ShaderStage, SpatialGridConfig, SpatialGridGpu, SpatialGridParams,
+    total_cells, wgpu,
 };
 use triad_window::{CameraUniforms, RendererManager, WindowConfig, egui, run_with_renderer_config};
 
@@ -915,15 +915,16 @@ impl ParticleRendererManager {
                         .expect("clear grid neighbor layout")],
                     push_constant_ranges: &[],
                 });
-        let grid_neighbor_max_pl = renderer
-            .device()
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("grid neighbor max layout"),
-                bind_group_layouts: &[registry
-                    .get(grid_neighbor_max_layout)
-                    .expect("grid neighbor max layout")],
-                push_constant_ranges: &[],
-            });
+        let grid_neighbor_max_pl =
+            renderer
+                .device()
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("grid neighbor max layout"),
+                    bind_group_layouts: &[registry
+                        .get(grid_neighbor_max_layout)
+                        .expect("grid neighbor max layout")],
+                    push_constant_ranges: &[],
+                });
 
         let clear_grid_neighbor_pipeline = renderer
             .create_compute_pipeline()
@@ -977,15 +978,16 @@ impl ParticleRendererManager {
                 BindingType::StorageRead,
             )
             .build(registry)?;
-        let collision_pl = renderer
-            .device()
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("particle collision layout"),
-                bind_group_layouts: &[registry
-                    .get(collision_layout)
-                    .expect("collision layout")],
-                push_constant_ranges: &[],
-            });
+        let collision_pl =
+            renderer
+                .device()
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("particle collision layout"),
+                    bind_group_layouts: &[registry
+                        .get(collision_layout)
+                        .expect("collision layout")],
+                    push_constant_ranges: &[],
+                });
         let collision_pipeline = renderer
             .create_compute_pipeline()
             .with_label("particle collision")
@@ -1217,7 +1219,10 @@ impl RendererManager for ParticleRendererManager {
             _reserved1: 0.0,
         }];
         renderer.write_buffer(self.sim_params_buffer, &params, registry)?;
-        let sim_view = [sim_view_params_from_viewport(self.viewport_w, self.viewport_h)];
+        let sim_view = [sim_view_params_from_viewport(
+            self.viewport_w,
+            self.viewport_h,
+        )];
         renderer.write_buffer(self.sim_view_buffer, &sim_view, registry)?;
 
         let mut gpu_visible_count = None;
@@ -1411,7 +1416,8 @@ impl RendererManager for ParticleRendererManager {
             grid: Arc::clone(&self.spatial_grid),
         }));
 
-        let mut collision_passes: Vec<PassBuilder> = Vec::with_capacity(COLLISION_ITERATIONS as usize);
+        let mut collision_passes: Vec<PassBuilder> =
+            Vec::with_capacity(COLLISION_ITERATIONS as usize);
         for iter in 0..COLLISION_ITERATIONS {
             let p = ComputePassBuilder::new(format!("ParticleCollision_{iter}"))
                 .read(self.spatial_grid.params)
@@ -1471,11 +1477,8 @@ impl RendererManager for ParticleRendererManager {
                 std::mem::size_of::<DrawIndirectArgs>() as u64,
             );
         if self.grid_neighbor_validate {
-            copy_readback = copy_readback.copy_buffer(
-                self.grid_neighbor_stats,
-                self.grid_neighbor_readback,
-                4,
-            );
+            copy_readback =
+                copy_readback.copy_buffer(self.grid_neighbor_stats, self.grid_neighbor_readback, 4);
         }
         let copy_readback_pass = copy_readback
             .build()

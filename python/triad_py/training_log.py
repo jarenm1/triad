@@ -253,8 +253,12 @@ class PPOTrainingLogger:
         writer.add_scalar(
             "rollout/mean_episode_length", float(stats["mean_episode_length"]), env_step
         )
-        writer.add_scalar("optimization/policy_loss", float(stats["policy_loss"]), env_step)
-        writer.add_scalar("optimization/value_loss", float(stats["value_loss"]), env_step)
+        writer.add_scalar(
+            "optimization/policy_loss", float(stats["policy_loss"]), env_step
+        )
+        writer.add_scalar(
+            "optimization/value_loss", float(stats["value_loss"]), env_step
+        )
         writer.add_scalar("optimization/entropy", float(stats["entropy"]), env_step)
         writer.add_scalar("optimization/approx_kl", float(stats["approx_kl"]), env_step)
         writer.add_scalar(
@@ -277,7 +281,9 @@ class PPOTrainingLogger:
         writer.add_scalar("timing/env_steps_per_second", throughput, env_step)
         writer.add_scalar("curriculum/progress", float(stats["progress"]), env_step)
         writer.add_scalar("curriculum/phase_index", int(stats["phase_index"]), env_step)
-        writer.add_scalar("curriculum/phase_updates", int(stats["phase_updates"]), env_step)
+        writer.add_scalar(
+            "curriculum/phase_updates", int(stats["phase_updates"]), env_step
+        )
         writer.add_scalar(
             "curriculum/phase_advanced",
             1.0 if bool(stats["phase_advanced"]) else 0.0,
@@ -286,7 +292,9 @@ class PPOTrainingLogger:
         writer.add_scalar(
             "eval/completion_rate", float(stats["eval_completion_rate"]), env_step
         )
-        writer.add_scalar("eval/mean_progress", float(stats["eval_mean_progress"]), env_step)
+        writer.add_scalar(
+            "eval/mean_progress", float(stats["eval_mean_progress"]), env_step
+        )
         writer.add_scalar(
             "eval/mean_episode_return",
             float(stats["eval_mean_episode_return"]),
@@ -338,7 +346,9 @@ class PPOTrainingLogger:
         )
 
         eval_text = ""
-        if isinstance(curriculum, Mapping) and isinstance(curriculum.get("eval"), Mapping):
+        if isinstance(curriculum, Mapping) and isinstance(
+            curriculum.get("eval"), Mapping
+        ):
             eval_payload = curriculum["eval"]
             eval_text = (
                 f" | eval prog={float(eval_payload['mean_progress']):.3f}"
@@ -356,5 +366,5 @@ class PPOTrainingLogger:
             f" | kl={float(optimization['approx_kl']):.4f}"
             f" clip={float(optimization['clip_fraction']):.3f}"
             f" lr={float(optimization['learning_rate']):.2e}"
-            f" | {float(timing['env_steps_per_second'])/1000.0:.1f}k/s"
+            f" | {float(timing['env_steps_per_second']) / 1000.0:.1f}k/s"
         )

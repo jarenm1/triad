@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from collections import deque
-from datetime import datetime
 import json
 import math
 import random
 import sys
+from collections import deque
 from dataclasses import asdict, dataclass, fields
+from datetime import datetime
 from pathlib import Path
 from time import perf_counter
 
@@ -47,8 +47,13 @@ def _create_tensorboard_writer(config: "PPOConfig"):
             "TensorBoard logging requires `tensorboard`. Install with `uv sync --extra training`."
         ) from error
 
-    checkpoint_stem = Path(config.checkpoint_path).stem if config.checkpoint_path else "ppo"
-    run_name = config.run_name or f"{checkpoint_stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    checkpoint_stem = (
+        Path(config.checkpoint_path).stem if config.checkpoint_path else "ppo"
+    )
+    run_name = (
+        config.run_name
+        or f"{checkpoint_stem}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
     log_dir = Path(config.tensorboard_dir) / run_name
     log_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir=str(log_dir))
@@ -190,6 +195,8 @@ class CurriculumEvalEnvResult:
     gate_alignment: float
     reward: float
     shaping_reward: float
+    proximity_reward: float
+    out_of_bounds_penalty: float
     time_penalty: float
     sparse_objective_reward: float
     collision_penalty: float
@@ -340,7 +347,9 @@ def _training_sim_config(course: CourseSpec, config: PPOConfig) -> SimulationCon
 
 def _evaluation_sim_config(course: CourseSpec, config: PPOConfig) -> SimulationConfig:
     sim_config = _training_sim_config(course, config)
-    sim_config.env_count = max(1, min(config.curriculum_eval_env_count, config.env_count))
+    sim_config.env_count = max(
+        1, min(config.curriculum_eval_env_count, config.env_count)
+    )
     return sim_config
 
 
@@ -389,17 +398,23 @@ def _randomization_preview(
     curriculum_stages = np.asarray([item[3] for item in reset_params], dtype=np.uint32)
 
     dynamics_strength = (
-        0.04 + np.clip(difficulties, 0.0, 1.0) * 0.18
-    ) * np.asarray(
-        [_curriculum_dynamics_scale(int(stage)) for stage in curriculum_stages],
-        dtype=np.float32,
-    ) * float(config.dynamics_randomization_scale)
-    actuator_strength = dynamics_strength * 0.25 * float(config.actuator_randomization_scale)
+        (0.04 + np.clip(difficulties, 0.0, 1.0) * 0.18)
+        * np.asarray(
+            [_curriculum_dynamics_scale(int(stage)) for stage in curriculum_stages],
+            dtype=np.float32,
+        )
+        * float(config.dynamics_randomization_scale)
+    )
+    actuator_strength = (
+        dynamics_strength * 0.25 * float(config.actuator_randomization_scale)
+    )
 
     def scales(salt: int, multiplier: float = 1.0) -> np.ndarray:
         return np.asarray(
             [
-                _randomized_positive_scale(int(seed), salt, float(strength) * multiplier)
+                _randomized_positive_scale(
+                    int(seed), salt, float(strength) * multiplier
+                )
                 for seed, strength in zip(seeds, dynamics_strength, strict=True)
             ],
             dtype=np.float32,
@@ -427,16 +442,15 @@ def _randomization_preview(
     spawn_scale = float(config.spawn_randomization_scale)
     lateral_spawn_offset = np.asarray(
         [
-            _hash_to_signed(int(seed) ^ 0x611) * (0.08 + float(diff) * 0.18) * spawn_scale
+            _hash_to_signed(int(seed) ^ 0x611)
+            * (0.08 + float(diff) * 0.18)
+            * spawn_scale
             for seed, diff in zip(seeds, difficulties, strict=True)
         ],
         dtype=np.float32,
     )
     yaw_offset = np.asarray(
-        [
-            _hash_to_signed(int(seed) ^ 0x1551) * 0.25 * spawn_scale
-            for seed in seeds
-        ],
+        [_hash_to_signed(int(seed) ^ 0x1551) * 0.25 * spawn_scale for seed in seeds],
         dtype=np.float32,
     )
 
@@ -649,7 +663,9 @@ class MasteryCurriculumController:
             for phase_index, phase in enumerate(self.schedule.phases)
             if phase.name in phase_mix
         ]
-        weights = [phase_mix[self.schedule.phase_at_index(i).name] for i in phase_indices]
+        weights = [
+            phase_mix[self.schedule.phase_at_index(i).name] for i in phase_indices
+        ]
         return self.schedule.sample_reset_params_mixture(
             env_count=env_count,
             phase_indices=phase_indices,
@@ -796,15 +812,25 @@ def _evaluate_curriculum_phase(
                 target_gate_position=list(
                     final_observations[env_index]["target_gate_position"]
                 ),
-                distance_to_gate=float(final_observations[env_index]["distance_to_gate"]),
+                distance_to_gate=float(
+                    final_observations[env_index]["distance_to_gate"]
+                ),
                 gate_alignment=float(final_observations[env_index]["gate_alignment"]),
                 reward=float(final_reward_done[env_index]["reward"]),
                 shaping_reward=float(final_reward_done[env_index]["shaping_reward"]),
+                proximity_reward=float(
+                    final_reward_done[env_index]["proximity_reward"]
+                ),
+                out_of_bounds_penalty=float(
+                    final_reward_done[env_index]["out_of_bounds_penalty"]
+                ),
                 time_penalty=float(final_reward_done[env_index]["time_penalty"]),
                 sparse_objective_reward=float(
                     final_reward_done[env_index]["sparse_objective_reward"]
                 ),
-                collision_penalty=float(final_reward_done[env_index]["collision_penalty"]),
+                collision_penalty=float(
+                    final_reward_done[env_index]["collision_penalty"]
+                ),
             )
             for env_index, (
                 grammar_id,
@@ -1114,9 +1140,7 @@ def serve_ppo_policy(checkpoint_path: str | Path, device: str = "auto") -> int:
 
             observations = np.asarray(request["observations"], dtype=np.float32)
             deterministic = bool(request.get("deterministic", True))
-            actions, values = policy.predict(
-                observations, deterministic=deterministic
-            )
+            actions, values = policy.predict(observations, deterministic=deterministic)
             response = {
                 "actions": actions.tolist(),
                 "values": values.tolist(),
@@ -1244,7 +1268,9 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                 )
             batch_observations = batch["observations"]
             if observation_normalizer is not None:
-                batch_observations = observation_normalizer.normalize(batch_observations)
+                batch_observations = observation_normalizer.normalize(
+                    batch_observations
+                )
 
             obs_batch = torch_module.as_tensor(
                 batch_observations, dtype=torch_module.float32, device=device
@@ -1312,10 +1338,13 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                         clipped_value_loss = (
                             returns_batch[indices] - clipped_values
                         ).pow(2)
-                        value_loss = 0.5 * torch_module.max(
-                            unclipped_value_loss,
-                            clipped_value_loss,
-                        ).mean()
+                        value_loss = (
+                            0.5
+                            * torch_module.max(
+                                unclipped_value_loss,
+                                clipped_value_loss,
+                            ).mean()
+                        )
                     entropy_loss = entropy.mean()
 
                     loss = (
@@ -1384,8 +1413,12 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                 completed_episodes=completed_episodes,
                 mean_episode_return=mean_episode_return,
                 mean_episode_length=mean_episode_length,
-                eval_completion_rate=0.0 if eval_stats is None else eval_stats.completion_rate,
-                eval_mean_progress=0.0 if eval_stats is None else eval_stats.mean_progress,
+                eval_completion_rate=0.0
+                if eval_stats is None
+                else eval_stats.completion_rate,
+                eval_mean_progress=0.0
+                if eval_stats is None
+                else eval_stats.mean_progress,
                 eval_mean_episode_return=0.0
                 if eval_stats is None
                 else eval_stats.mean_episode_return,

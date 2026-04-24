@@ -46,8 +46,8 @@ struct RewardDone {
     done_reason: u32,
     _pad0: u32,
     shaping_reward: f32,
-    _unused_reward0: f32,
-    _unused_reward1: f32,
+    proximity_reward: f32,
+    out_of_bounds_penalty: f32,
     time_penalty: f32,
     sparse_objective_reward: f32,
     collision_penalty: f32,
@@ -477,6 +477,11 @@ fn gate_approach_activation(gate: Gate, distance_to_gate: f32) -> f32 {
     return 1.0 - clamp(distance_to_gate / gate_scale, 0.0, 1.0);
 }
 
+fn gate_proximity_reward(gate: Gate, distance_to_gate: f32) -> f32 {
+    let proximity = gate_approach_activation(gate, distance_to_gate);
+    return proximity * proximity * 0.00075;
+}
+
 fn segment_start_for_target_gate(
     index: u32,
     current_gate: u32,
@@ -661,7 +666,7 @@ fn obstacle_collision(obstacle: Gate, position: vec3<f32>, attitude: vec3<f32>) 
 
 fn family_segment_count(curriculum_stage: u32, grammar_id: u32) -> u32 {
     if (curriculum_stage == 0u) {
-        return 3u;
+        return 1u;
     }
     if (curriculum_stage == 1u) {
         return 4u;
@@ -688,7 +693,7 @@ fn curriculum_family(curriculum_stage: u32, grammar_id: u32) -> u32 {
 
 fn curriculum_length_scale(curriculum_stage: u32) -> f32 {
     if (curriculum_stage == 0u) {
-        return 1.22;
+        return 0.82;
     }
     if (curriculum_stage == 1u) {
         return 1.08;
@@ -701,7 +706,7 @@ fn curriculum_length_scale(curriculum_stage: u32) -> f32 {
 
 fn curriculum_vertical_scale(curriculum_stage: u32) -> f32 {
     if (curriculum_stage == 0u) {
-        return 0.12;
+        return 0.02;
     }
     if (curriculum_stage == 1u) {
         return 0.3;
@@ -714,7 +719,7 @@ fn curriculum_vertical_scale(curriculum_stage: u32) -> f32 {
 
 fn curriculum_hole_scale(curriculum_stage: u32) -> f32 {
     if (curriculum_stage == 0u) {
-        return 1.25;
+        return 1.4;
     }
     if (curriculum_stage == 1u) {
         return 1.12;
@@ -736,14 +741,8 @@ fn family_segment_length(
     var base = 8.0;
     var jitter = 0.9;
     if (curriculum_stage == 0u) {
-        if (segment_index == 0u) {
-            base = 11.5;
-        } else if (segment_index == 1u) {
-            base = 10.4;
-        } else {
-            base = 9.1;
-        }
-        jitter = 0.45;
+        base = 7.2;
+        jitter = 0.2;
     } else if (curriculum_stage == 1u) {
         if (grammar_id == 0u) {
             if (segment_index == 0u) {
@@ -1199,7 +1198,7 @@ fn has_cleared_previous_gate_zone(index: u32, state: EnvState, position: vec3<f3
 
 fn curriculum_gate_count(curriculum_stage: u32, base_gate_count: u32) -> u32 {
     if (curriculum_stage == 0u) {
-        return clamp(base_gate_count / 2u, 5u, 7u);
+        return min(max(base_gate_count, 4u), 4u);
     }
     if (curriculum_stage == 1u) {
         return clamp((base_gate_count * 2u) / 3u, 7u, 9u);
@@ -1522,8 +1521,8 @@ fn reset_env(index: u32) {
     reward_done.values[index].done_reason = DONE_REASON_NONE;
     reward_done.values[index]._pad0 = 0u;
     reward_done.values[index].shaping_reward = 0.0;
-    reward_done.values[index]._unused_reward0 = 0.0;
-    reward_done.values[index]._unused_reward1 = 0.0;
+    reward_done.values[index].proximity_reward = 0.0;
+    reward_done.values[index].out_of_bounds_penalty = 0.0;
     reward_done.values[index].time_penalty = 0.0;
     reward_done.values[index].sparse_objective_reward = 0.0;
     reward_done.values[index].collision_penalty = 0.0;
@@ -1835,7 +1834,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         max(gate_centering_score(prev_target_gate, prev_gate_delta), 0.0) * 0.03 * approach_activation;
     let alignment_reward =
         gate_velocity_alignment(prev_target_gate, state.velocity.xyz) * 0.05 * approach_activation;
-    let shaping_reward = progress_reward + centering_reward + alignment_reward;
+    let proximity_reward = gate_proximity_reward(prev_target_gate, prev_gate_distance);
+    let shaping_reward =
+        progress_reward + centering_reward + alignment_reward + proximity_reward;
     let gate_age_seconds = f32(state.gate_age_steps) * params.dt_seconds;
     let collision_happened = collided_gate || collided_obstacle || collided_world;
     let pass_speed_bonus = min(gate_forward_speed(prev_target_gate, state.velocity.xyz), 12.0) * 0.35;
@@ -1844,17 +1845,19 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         + select(0.0, 12.0, (done_reason & DONE_REASON_COMPLETE) != 0u);
     let time_penalty = 0.001 + min(max(gate_age_seconds - 1.5, 0.0) * 0.012, 0.05);
     let collision_penalty = select(0.0, params.collision_penalty, collision_happened);
+    let out_of_bounds_penalty = select(0.0, 24.0, out_of_bounds);
     reward_done.values[index].reward =
         shaping_reward
         + sparse_objective_reward
         - time_penalty
-        - collision_penalty;
+        - collision_penalty
+        - out_of_bounds_penalty;
     reward_done.values[index].done = state.done;
     reward_done.values[index].done_reason = done_reason;
     reward_done.values[index]._pad0 = 0u;
     reward_done.values[index].shaping_reward = shaping_reward;
-    reward_done.values[index]._unused_reward0 = 0.0;
-    reward_done.values[index]._unused_reward1 = 0.0;
+    reward_done.values[index].proximity_reward = proximity_reward;
+    reward_done.values[index].out_of_bounds_penalty = out_of_bounds_penalty;
     reward_done.values[index].time_penalty = time_penalty;
     reward_done.values[index].sparse_objective_reward = sparse_objective_reward;
     reward_done.values[index].collision_penalty = collision_penalty;
@@ -1927,8 +1930,8 @@ pub struct RewardDone {
     pub done_reason: u32,
     pub _pad: u32,
     pub shaping_reward: f32,
-    pub _unused_reward0: f32,
-    pub _unused_reward1: f32,
+    pub proximity_reward: f32,
+    pub out_of_bounds_penalty: f32,
     pub time_penalty: f32,
     pub sparse_objective_reward: f32,
     pub collision_penalty: f32,

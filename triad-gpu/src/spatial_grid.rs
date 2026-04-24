@@ -23,7 +23,12 @@ pub struct SpatialGridParams {
 
 impl SpatialGridParams {
     #[inline]
-    pub fn new(world_origin: [f32; 3], cell_size: f32, grid_dims: [u32; 3], entity_count: u32) -> Self {
+    pub fn new(
+        world_origin: [f32; 3],
+        cell_size: f32,
+        grid_dims: [u32; 3],
+        entity_count: u32,
+    ) -> Self {
         Self {
             world_origin_cell: [world_origin[0], world_origin[1], world_origin[2], cell_size],
             grid_dims_entities: [grid_dims[0], grid_dims[1], grid_dims[2], entity_count],
@@ -570,51 +575,52 @@ impl SpatialGridGpu {
                 },
             ],
         });
-        let layout_scan_finalize = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("spatial_grid scan finalize layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let layout_scan_finalize =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("spatial_grid scan finalize layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
         let layout_init_heads = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("spatial_grid init_heads layout"),
             entries: &[
@@ -765,7 +771,10 @@ impl SpatialGridGpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: registry.get(positions.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(positions.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -789,7 +798,10 @@ impl SpatialGridGpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: registry.get(counts_linear.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(counts_linear.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
             ],
         });
@@ -805,11 +817,17 @@ impl SpatialGridGpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: registry.get(counts_linear.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(counts_linear.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: registry.get(scan_scratch.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(scan_scratch.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
             ],
         });
@@ -825,11 +843,17 @@ impl SpatialGridGpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: registry.get(scan_scratch.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(scan_scratch.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: registry.get(scan_temp.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(scan_temp.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
             ],
         });
@@ -845,38 +869,54 @@ impl SpatialGridGpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: registry.get(scan_temp.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(scan_temp.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: registry.get(scan_scratch.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(scan_scratch.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
             ],
         });
         let bind_scan_inc_temp_to_scratch = registry.insert(bind_scan_inc_temp_to_scratch);
 
-        let bind_scan_finalize_from_scratch = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("spatial_grid bind scan finalize (inclusive in scratch)"),
-            layout: &layout_scan_finalize,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: registry.get(params_handle).unwrap().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: registry.get(counts_linear.handle()).unwrap().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: registry.get(scan_scratch.handle()).unwrap().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: registry.get(cell_offsets.handle()).unwrap().as_entire_binding(),
-                },
-            ],
-        });
+        let bind_scan_finalize_from_scratch =
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("spatial_grid bind scan finalize (inclusive in scratch)"),
+                layout: &layout_scan_finalize,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: registry.get(params_handle).unwrap().as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: registry
+                            .get(counts_linear.handle())
+                            .unwrap()
+                            .as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: registry
+                            .get(scan_scratch.handle())
+                            .unwrap()
+                            .as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: registry
+                            .get(cell_offsets.handle())
+                            .unwrap()
+                            .as_entire_binding(),
+                    },
+                ],
+            });
         let bind_scan_finalize_from_scratch = registry.insert(bind_scan_finalize_from_scratch);
 
         let bind_scan_finalize_from_temp = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -889,15 +929,24 @@ impl SpatialGridGpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: registry.get(counts_linear.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(counts_linear.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: registry.get(scan_temp.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(scan_temp.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: registry.get(cell_offsets.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(cell_offsets.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
             ],
         });
@@ -915,7 +964,10 @@ impl SpatialGridGpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: registry.get(cell_offsets.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(cell_offsets.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -935,7 +987,10 @@ impl SpatialGridGpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: registry.get(positions.handle()).unwrap().as_entire_binding(),
+                    resource: registry
+                        .get(positions.handle())
+                        .unwrap()
+                        .as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -1068,20 +1123,36 @@ impl SpatialGridGpu {
 
         let p_clear = registry.get(self.pipeline_clear).expect("pipeline_clear");
         let p_count = registry.get(self.pipeline_count).expect("pipeline_count");
-        let p_linearize = registry.get(self.pipeline_linearize).expect("pipeline_linearize");
-        let p_scan_copy = registry.get(self.pipeline_scan_copy).expect("pipeline_scan_copy");
+        let p_linearize = registry
+            .get(self.pipeline_linearize)
+            .expect("pipeline_linearize");
+        let p_scan_copy = registry
+            .get(self.pipeline_scan_copy)
+            .expect("pipeline_scan_copy");
         let p_scan = registry.get(self.pipeline_scan).expect("pipeline_scan");
-        let p_init = registry.get(self.pipeline_init_heads).expect("pipeline_init_heads");
-        let p_scatter = registry.get(self.pipeline_scatter).expect("pipeline_scatter");
+        let p_init = registry
+            .get(self.pipeline_init_heads)
+            .expect("pipeline_init_heads");
+        let p_scatter = registry
+            .get(self.pipeline_scatter)
+            .expect("pipeline_scatter");
 
         let g_clear = registry.get(self.bind_clear).expect("bind_clear");
         let g_count = registry.get(self.bind_count).expect("bind_count");
         let g_linearize = registry.get(self.bind_linearize).expect("bind_linearize");
         let g_scan_copy = registry.get(self.bind_scan_copy).expect("bind_scan_copy");
-        let g_scan_inc_s2t = registry.get(self.bind_scan_inc_scratch_to_temp).expect("bind_scan_inc_s2t");
-        let g_scan_inc_t2s = registry.get(self.bind_scan_inc_temp_to_scratch).expect("bind_scan_inc_t2s");
-        let g_scan_fin_scratch = registry.get(self.bind_scan).expect("bind_scan (finalize scratch)");
-        let g_scan_fin_temp = registry.get(self.bind_scan_finalize_from_temp).expect("bind_scan_fin_temp");
+        let g_scan_inc_s2t = registry
+            .get(self.bind_scan_inc_scratch_to_temp)
+            .expect("bind_scan_inc_s2t");
+        let g_scan_inc_t2s = registry
+            .get(self.bind_scan_inc_temp_to_scratch)
+            .expect("bind_scan_inc_t2s");
+        let g_scan_fin_scratch = registry
+            .get(self.bind_scan)
+            .expect("bind_scan (finalize scratch)");
+        let g_scan_fin_temp = registry
+            .get(self.bind_scan_finalize_from_temp)
+            .expect("bind_scan_fin_temp");
         let g_init = registry.get(self.bind_init_heads).expect("bind_init_heads");
         let g_scatter = registry.get(self.bind_scatter).expect("bind_scatter");
 
@@ -1249,11 +1320,12 @@ mod tests {
             .write_buffer(grid.positions, &positions, &registry)
             .expect("write positions");
 
-        let mut encoder = renderer
-            .device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("spatial_grid test"),
-            });
+        let mut encoder =
+            renderer
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("spatial_grid test"),
+                });
         grid.encode_rebuild(&mut encoder, &registry);
 
         let src_counts = registry.get(grid.counts_linear).expect("counts");
@@ -1269,7 +1341,10 @@ mod tests {
         encoder.copy_buffer_to_buffer(src_sorted, 0, dst_sorted, 0, 16 * 4);
 
         renderer.queue().submit([encoder.finish()]);
-        renderer.device().poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        renderer
+            .device()
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
 
         let counts = renderer
             .read_buffer::<u32>(rb_counts.handle(), &registry)

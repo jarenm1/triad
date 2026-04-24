@@ -359,13 +359,11 @@ impl PpoPolicyClient {
         let mut actions = Vec::with_capacity(action_rows.len());
         for row in action_rows {
             if row.len() != 4 {
-                return Err(
-                    io::Error::other(format!(
-                        "expected 4 action values, got {}",
-                        row.len()
-                    ))
-                    .into(),
-                );
+                return Err(io::Error::other(format!(
+                    "expected 4 action values, got {}",
+                    row.len()
+                ))
+                .into());
             }
             actions.push([row[0], row[1], row[2], row[3]]);
         }
@@ -660,28 +658,31 @@ impl VisualizerManager {
             return Err(io::Error::other("checkpoint policy is not loaded").into());
         };
 
-        let (action_rows, values) = client.predict(&self.cached_observations)?;
-        if action_rows.len() != self.actions.len() {
-            return Err(
-                io::Error::other(format!(
-                    "policy returned {} action rows for {} envs",
-                    action_rows.len(),
-                    self.actions.len()
-                ))
-                .into(),
-            );
+        let selected_env = self
+            .selected_env
+            .min(self.cached_observations.len().saturating_sub(1));
+        let selected_observation = self
+            .cached_observations
+            .get(selected_env)
+            .ok_or_else(|| io::Error::other("selected env observation unavailable"))?;
+        let (action_rows, values) = client.predict(std::slice::from_ref(selected_observation))?;
+        if action_rows.len() != 1 {
+            return Err(io::Error::other(format!(
+                "policy returned {} action rows for selected env replay",
+                action_rows.len(),
+            ))
+            .into());
         }
 
-        for (index, action) in action_rows.into_iter().enumerate() {
-            self.actions[index] = Action::new(action);
-        }
+        self.actions.fill(Action::new([0.0; 4]));
+        self.actions[selected_env] = Action::new(action_rows[0]);
         self.last_value_estimates.fill(0.0);
-        for (index, value) in values.into_iter().enumerate() {
-            if let Some(slot) = self.last_value_estimates.get_mut(index) {
+        if let Some(value) = values.first().copied() {
+            if let Some(slot) = self.last_value_estimates.get_mut(selected_env) {
                 *slot = value;
             }
         }
-        self.set_checkpoint_status("Replay active with PPO checkpoint");
+        self.set_checkpoint_status("Replay active with PPO checkpoint (selected env)");
         Ok(())
     }
 
@@ -965,7 +966,9 @@ impl RendererManager for VisualizerManager {
         let selected_observation = self.cached_observations.get(self.selected_env).copied();
         let selected_reward_done = self.cached_reward_done.get(self.selected_env).copied();
         if snapshot.replay_active
-            && selected_reward_done.map(|value| value.done != 0).unwrap_or(false)
+            && selected_reward_done
+                .map(|value| value.done != 0)
+                .unwrap_or(false)
         {
             {
                 let mut ui = self.ui_state.lock().expect("ui state poisoned");
@@ -1113,10 +1116,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         panel.label(format!("Progress: {:.3}", ui.progress));
                         panel.label(format!("Distance To Gate: {:.3}", ui.distance_to_gate));
                         panel.label(format!("Gate Alignment: {:.3}", ui.gate_alignment));
-                        panel.label(format!(
-                            "Mean Motor Thrust: {:.3}",
-                            ui.mean_motor_thrust
-                        ));
+                        panel.label(format!("Mean Motor Thrust: {:.3}", ui.mean_motor_thrust));
                         panel.label(format!(
                             "Position: {:.2}, {:.2}, {:.2}",
                             ui.position[0], ui.position[1], ui.position[2]
@@ -1395,12 +1395,7 @@ fn trail_instances(points: &VecDeque<[f32; 3]>) -> Vec<RenderInstance> {
     let mut instances = Vec::with_capacity(segment_count.min(TRAIL_INSTANCE_COUNT));
     for (index, (start, end)) in points.iter().zip(points.iter().skip(1)).enumerate() {
         let progress = (index + 1) as f32 / segment_count.max(1) as f32;
-        let color = [
-            0.18 + progress * 0.30,
-            0.72 + progress * 0.18,
-            0.98,
-            1.0,
-        ];
+        let color = [0.18 + progress * 0.30, 0.72 + progress * 0.18, 0.98, 1.0];
         if let Some(instance) = segment_instance(
             vec3_from_array(*start),
             vec3_from_array(*end),
@@ -1436,8 +1431,10 @@ fn direction_arrow_instances(state: EnvState) -> [RenderInstance; ARROW_INSTANCE
         -vec3_from_array(forward),
     );
     let left_side = safe_normalize(vec3_from_array(up).cross(left_dir), vec3_from_array(right));
-    let right_side =
-        safe_normalize(vec3_from_array(up).cross(right_dir), -vec3_from_array(right));
+    let right_side = safe_normalize(
+        vec3_from_array(up).cross(right_dir),
+        -vec3_from_array(right),
+    );
 
     [
         RenderInstance::oriented_box(
