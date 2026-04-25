@@ -29,6 +29,10 @@ except ImportError:  # pragma: no cover - runtime dependency
     nn = None
 
 
+ACTION_SPACE_VERSION = "pilot_acro_rates_v1"
+OBSERVATION_SPACE_VERSION = "teacher_privileged_v1"
+
+
 def _require_torch():
     if torch is None or nn is None:
         raise RuntimeError(
@@ -105,6 +109,7 @@ class PPOConfig:
     tensorboard_dir: str | None = "runs"
     run_name: str | None = None
     checkpoint_path: str | None = None
+    resume_from: str | None = None
     checkpoint_interval: int = 0
     curriculum_eval_interval: int = 10
     curriculum_eval_env_count: int = 64
@@ -212,6 +217,80 @@ class PPOEvalResult:
     max_episode_steps: int
     per_env: bool
     results: list[CurriculumEvalStats]
+
+
+def _curriculum_eval_env_result_from_dict(
+    payload: dict[str, object],
+) -> CurriculumEvalEnvResult:
+    return CurriculumEvalEnvResult(
+        env_index=int(payload["env_index"]),
+        seed=int(payload["seed"]),
+        grammar_id=int(payload["grammar_id"]),
+        difficulty=float(payload["difficulty"]),
+        curriculum_stage=int(payload["curriculum_stage"]),
+        completed=bool(payload["completed"]),
+        done=bool(payload["done"]),
+        done_reason=int(payload["done_reason"]),
+        done_reason_labels=list(payload["done_reason_labels"]),
+        episode_return=float(payload["episode_return"]),
+        episode_length=int(payload["episode_length"]),
+        best_progress=float(payload["best_progress"]),
+        final_progress=float(payload["final_progress"]),
+        current_gate=int(payload["current_gate"]),
+        current_lap=int(payload["current_lap"]),
+        step_count=int(payload["step_count"]),
+        position=list(payload["position"]),
+        velocity=list(payload["velocity"]),
+        attitude=list(payload["attitude"]),
+        target_gate_position=list(payload["target_gate_position"]),
+        distance_to_gate=float(payload["distance_to_gate"]),
+        gate_alignment=float(payload["gate_alignment"]),
+        reward=float(payload["reward"]),
+        shaping_reward=float(payload["shaping_reward"]),
+        proximity_reward=float(payload["proximity_reward"]),
+        out_of_bounds_penalty=float(payload["out_of_bounds_penalty"]),
+        time_penalty=float(payload["time_penalty"]),
+        sparse_objective_reward=float(payload["sparse_objective_reward"]),
+        collision_penalty=float(payload["collision_penalty"]),
+    )
+
+
+def _curriculum_eval_stats_from_dict(
+    payload: dict[str, object],
+) -> CurriculumEvalStats:
+    per_env_payload = payload.get("per_env")
+    per_env = None
+    if per_env_payload is not None:
+        per_env = [
+            _curriculum_eval_env_result_from_dict(item) for item in per_env_payload
+        ]
+    return CurriculumEvalStats(
+        phase_index=int(payload["phase_index"]),
+        phase=str(payload["phase"]),
+        completion_rate=float(payload["completion_rate"]),
+        mean_progress=float(payload["mean_progress"]),
+        mean_episode_return=float(payload["mean_episode_return"]),
+        mean_episode_length=float(payload["mean_episode_length"]),
+        per_env=per_env,
+    )
+
+
+def _safe_checkpoint_stem(name: str) -> str:
+    stem = "".join(
+        character if character.isalnum() or character in ("-", "_", ".") else "_"
+        for character in name.strip()
+    )
+    return stem or "ppo"
+
+
+def _resolve_checkpoint_path(config: PPOConfig) -> Path | None:
+    if config.checkpoint_path:
+        return Path(config.checkpoint_path)
+    if config.resume_from:
+        return Path(config.resume_from)
+    if config.run_name:
+        return Path("checkpoints") / f"{_safe_checkpoint_stem(config.run_name)}.pt"
+    return None
 
 
 @dataclass
@@ -707,6 +786,59 @@ class MasteryCurriculumController:
         self.phase_update_count = 0
         return True
 
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "current_phase_index": int(self.current_phase_index),
+            "phase_update_count": int(self.phase_update_count),
+            "latest_eval_stats": None
+            if self.latest_eval_stats is None
+            else asdict(self.latest_eval_stats),
+            "history": {
+                str(phase_index): [asdict(item) for item in history]
+                for phase_index, history in self._history.items()
+            },
+        }
+
+    def load_state_dict(self, state: dict[str, object] | None) -> None:
+        if not state:
+            return
+
+        self.current_phase_index = int(
+            max(
+                0,
+                min(
+                    int(state.get("current_phase_index", 0)),
+                    len(self.schedule.phases) - 1,
+                ),
+            )
+        )
+        self.phase_update_count = int(max(0, int(state.get("phase_update_count", 0))))
+
+        self.latest_eval_stats = None
+        latest_eval_stats = state.get("latest_eval_stats")
+        if isinstance(latest_eval_stats, dict):
+            self.latest_eval_stats = _curriculum_eval_stats_from_dict(latest_eval_stats)
+
+        self._history = {
+            phase_index: deque(maxlen=self.config.curriculum_mastery_window)
+            for phase_index in range(len(self.schedule.phases))
+        }
+        history_payload = state.get("history")
+        if not isinstance(history_payload, dict):
+            return
+
+        for phase_index_text, values in history_payload.items():
+            try:
+                phase_index = int(phase_index_text)
+            except (TypeError, ValueError):
+                continue
+            history = self._history.get(phase_index)
+            if history is None or not isinstance(values, list):
+                continue
+            for item in values:
+                if isinstance(item, dict):
+                    history.append(_curriculum_eval_stats_from_dict(item))
+
 
 COMPLETE_DONE_REASON = 1 << 0
 PROGRESS_OBSERVATION_INDEX = 18
@@ -754,7 +886,8 @@ def _evaluate_curriculum_phase(
             actions, _ = model.act_deterministic(obs_tensor)
 
         action_values = actions.detach().cpu().numpy()
-        action_values[~active] = 0.0
+        action_values[~active, 0] = 0.0
+        action_values[~active, 1:] = 0.5
         env.numpy_action_view()[:, :] = action_values
 
         step_result = env.step_in_place()
@@ -964,6 +1097,7 @@ def _save_checkpoint(
     optimizer,
     config: PPOConfig,
     observation_normalizer: RunningMeanStd | None,
+    curriculum: MasteryCurriculumController,
     update_index: int,
     total_env_steps: int,
 ) -> None:
@@ -974,9 +1108,12 @@ def _save_checkpoint(
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "config": asdict(config),
+            "action_space_version": ACTION_SPACE_VERSION,
+            "observation_space_version": OBSERVATION_SPACE_VERSION,
             "observation_normalizer": None
             if observation_normalizer is None
             else observation_normalizer.state_dict(),
+            "curriculum": curriculum.state_dict(),
             "update_index": int(update_index),
             "total_env_steps": int(total_env_steps),
         },
@@ -1011,6 +1148,40 @@ def _upgrade_legacy_model_state(
     return upgraded
 
 
+def _require_supported_action_space(
+    checkpoint: dict[str, object], *, context: str
+) -> None:
+    action_space_version = checkpoint.get("action_space_version")
+    if action_space_version == ACTION_SPACE_VERSION:
+        return
+    if action_space_version is None:
+        raise ValueError(
+            f"{context} checkpoint uses the legacy motor-action policy interface and "
+            "cannot be loaded after the pilot-controls action-space change"
+        )
+    raise ValueError(
+        f"{context} checkpoint action space {action_space_version!r} is not supported; "
+        f"expected {ACTION_SPACE_VERSION!r}"
+    )
+
+
+def _require_supported_observation_space(
+    checkpoint: dict[str, object], *, context: str
+) -> None:
+    observation_space_version = checkpoint.get("observation_space_version")
+    if observation_space_version == OBSERVATION_SPACE_VERSION:
+        return
+    if observation_space_version is None:
+        raise ValueError(
+            f"{context} checkpoint uses the legacy teacher observation interface and "
+            "cannot be loaded after the privileged-teacher observation change"
+        )
+    raise ValueError(
+        f"{context} checkpoint observation space {observation_space_version!r} is not "
+        f"supported; expected {OBSERVATION_SPACE_VERSION!r}"
+    )
+
+
 def load_ppo_policy(
     checkpoint_path: str | Path, device: str = "auto"
 ) -> LoadedPPOPolicy:
@@ -1019,6 +1190,8 @@ def load_ppo_policy(
     checkpoint = torch_module.load(
         Path(checkpoint_path), map_location=resolved_device, weights_only=False
     )
+    _require_supported_action_space(checkpoint, context="PPO")
+    _require_supported_observation_space(checkpoint, context="PPO")
     model_state = _upgrade_legacy_model_state(checkpoint["model"])
     observation_key = (
         "actor_body.0.weight"
@@ -1170,7 +1343,12 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
     eval_sim.set_course(eval_course)
     eval_env = TriadFastVecEnv(eval_sim, auto_reset=False)
 
-    checkpoint_path = Path(config.checkpoint_path) if config.checkpoint_path else None
+    checkpoint_path = _resolve_checkpoint_path(config)
+    if checkpoint_path is not None:
+        config.checkpoint_path = str(checkpoint_path)
+    resume_path = Path(config.resume_from) if config.resume_from else None
+    if resume_path is not None:
+        config.resume_from = str(resume_path)
 
     try:
         model = ActorCritic(
@@ -1199,9 +1377,32 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                 None if tensorboard_log_dir is None else str(tensorboard_log_dir)
             ),
         )
+        start_update = 0
+        total_env_steps = 0
+        if resume_path is not None:
+            checkpoint = torch_module.load(
+                resume_path, map_location=device, weights_only=False
+            )
+            _require_supported_action_space(checkpoint, context="resume")
+            _require_supported_observation_space(checkpoint, context="resume")
+            model.load_state_dict(_upgrade_legacy_model_state(checkpoint["model"]))
+            optimizer_state = checkpoint.get("optimizer")
+            if optimizer_state is not None:
+                optimizer.load_state_dict(optimizer_state)
+            observation_normalizer_state = checkpoint.get("observation_normalizer")
+            if (
+                observation_normalizer is not None
+                and observation_normalizer_state is not None
+            ):
+                observation_normalizer = RunningMeanStd.from_state_dict(
+                    observation_normalizer_state
+                )
+            curriculum.load_state_dict(checkpoint.get("curriculum"))
+            start_update = max(0, int(checkpoint.get("update_index", -1)) + 1)
+            total_env_steps = max(0, int(checkpoint.get("total_env_steps", 0)))
         reset_params = curriculum.sample_training_reset_params(
             env_count=sim.env_count,
-            base_seed=config.seed,
+            base_seed=config.seed + start_update,
         )
         sim.set_reset_params(reset_params)
         del reset_params
@@ -1214,24 +1415,25 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
             sim.action_stride,
         )
 
-        total_env_steps = 0
         final_phase = curriculum.current_phase().name
         final_progress = curriculum.progress()
         training_logger.emit_started(initial_phase=final_phase)
+        end_update = start_update + config.total_updates
 
-        for update_index in range(config.total_updates):
+        for update_index in range(start_update, end_update):
             started_at = perf_counter()
             phase_index = curriculum.current_phase_index
             phase = curriculum.current_phase()
             progress = curriculum.progress()
             final_phase = phase.name
             final_progress = progress
+            session_update_index = update_index - start_update
 
             if config.anneal_learning_rate:
                 if config.total_updates <= 1:
                     current_learning_rate = config.learning_rate
                 else:
-                    frac = 1.0 - (update_index / (config.total_updates - 1))
+                    frac = 1.0 - (session_update_index / (config.total_updates - 1))
                     current_learning_rate = config.learning_rate * frac
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = current_learning_rate
@@ -1389,7 +1591,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
             )
             eval_stats = curriculum.latest_eval_stats
             phase_advanced = False
-            if curriculum.should_evaluate(update_index, config.total_updates):
+            if curriculum.should_evaluate(update_index, end_update):
                 eval_stats = _evaluate_curriculum_phase(
                     eval_env,
                     model,
@@ -1440,7 +1642,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
 
             if (
                 update_index % config.log_interval == 0
-                or update_index == config.total_updates - 1
+                or update_index == end_update - 1
             ):
                 training_logger.emit_update(
                     asdict(stats),
@@ -1476,6 +1678,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                     optimizer=optimizer,
                     config=config,
                     observation_normalizer=observation_normalizer,
+                    curriculum=curriculum,
                     update_index=update_index,
                     total_env_steps=total_env_steps,
                 )
@@ -1492,17 +1695,18 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                 optimizer=optimizer,
                 config=config,
                 observation_normalizer=observation_normalizer,
-                update_index=config.total_updates - 1,
+                curriculum=curriculum,
+                update_index=end_update - 1,
                 total_env_steps=total_env_steps,
             )
             training_logger.emit_checkpoint_saved(
                 checkpoint_path=str(checkpoint_path),
-                update_index=config.total_updates - 1,
+                update_index=end_update - 1,
                 total_env_steps=total_env_steps,
             )
 
         result = PPOTrainResult(
-            final_update=config.total_updates - 1,
+            final_update=end_update - 1,
             final_progress=curriculum.progress(),
             final_phase=curriculum.current_phase().name,
             final_phase_index=curriculum.current_phase_index,

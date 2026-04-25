@@ -40,13 +40,13 @@ const TRAIL_MIN_POINT_DISTANCE: f32 = 0.04;
 const TRAIL_RESET_DISTANCE: f32 = 2.5;
 const TRAIL_HALF_WIDTH: f32 = 0.012;
 const TRAIL_HALF_HEIGHT: f32 = 0.006;
-const ARROW_INSTANCE_COUNT: usize = 3;
-const ARROW_FORWARD_OFFSET: f32 = 0.12;
-const ARROW_VERTICAL_OFFSET: f32 = 0.055;
-const ARROW_SHAFT_HALF_LENGTH: f32 = 0.10;
-const ARROW_SHAFT_HALF_WIDTH: f32 = 0.010;
-const ARROW_HEAD_HALF_LENGTH: f32 = 0.055;
-const ARROW_HEAD_HALF_WIDTH: f32 = 0.008;
+const DEBUG_VECTOR_INSTANCE_COUNT: usize = 3;
+const DEBUG_VECTOR_HALF_WIDTH: f32 = 0.014;
+const DEBUG_VECTOR_HALF_HEIGHT: f32 = 0.007;
+const FORWARD_VECTOR_LENGTH: f32 = 0.55;
+const THRUST_VECTOR_LENGTH: f32 = 0.55;
+const VELOCITY_VECTOR_SCALE: f32 = 0.22;
+const VELOCITY_VECTOR_MAX_LENGTH: f32 = 0.9;
 const VISUALIZER_ENV_COUNT: usize = 128;
 const DONE_REASON_COMPLETE: u32 = 1 << 0;
 const DONE_REASON_GATE_COLLISION: u32 = 1 << 1;
@@ -506,7 +506,7 @@ impl VisualizerManager {
             })
             .build(registry)?;
 
-        let zero_actions = vec![Action::new([0.0; 4]); sim.env_count()];
+        let zero_actions = vec![Action::idle(); sim.env_count()];
         let trail_points = (0..sim.env_count())
             .map(|_| VecDeque::with_capacity(TRAIL_MAX_POINTS))
             .collect();
@@ -643,7 +643,7 @@ impl VisualizerManager {
     }
 
     fn apply_heuristic_actions(&mut self) {
-        self.actions.fill(Action::new([0.0; 4]));
+        self.actions.fill(Action::idle());
         self.last_value_estimates.fill(0.0);
         for (env_index, state) in self.cached_states.iter().copied().enumerate() {
             if let Some(target_gate) = self.target_gate_for_env(env_index, &state) {
@@ -674,7 +674,7 @@ impl VisualizerManager {
             .into());
         }
 
-        self.actions.fill(Action::new([0.0; 4]));
+        self.actions.fill(Action::idle());
         self.actions[selected_env] = Action::new(action_rows[0]);
         self.last_value_estimates.fill(0.0);
         if let Some(value) = values.first().copied() {
@@ -742,7 +742,7 @@ impl VisualizerManager {
                     write_index += 1;
                 }
             }
-            for instance in direction_arrow_instances(state) {
+            for instance in debug_vector_instances(state) {
                 if let Some(slot) = self.instances.get_mut(write_index) {
                     *slot = instance;
                     write_index += 1;
@@ -1160,7 +1160,7 @@ fn visible_instance_capacity(max_gates_per_env: usize) -> usize {
         + max_obstacles_per_env(max_gates_per_env)
         + TRAIL_INSTANCE_COUNT
         + DRONE_MODEL_INSTANCE_COUNT
-        + ARROW_INSTANCE_COUNT
+        + DEBUG_VECTOR_INSTANCE_COUNT
         + 1
 }
 
@@ -1196,6 +1196,21 @@ fn flatten_observation(observation: &Observation) -> Vec<f32> {
         observation.distance_to_gate,
         observation.gate_alignment,
         observation.mean_motor_thrust,
+        observation.privileged_velocity_body[0],
+        observation.privileged_velocity_body[1],
+        observation.privileged_velocity_body[2],
+        observation.privileged_target_gate_body[0],
+        observation.privileged_target_gate_body[1],
+        observation.privileged_target_gate_body[2],
+        observation.privileged_target_gate_forward_body[0],
+        observation.privileged_target_gate_forward_body[1],
+        observation.privileged_target_gate_forward_body[2],
+        observation.privileged_next_gate_body[0],
+        observation.privileged_next_gate_body[1],
+        observation.privileged_next_gate_body[2],
+        observation.privileged_next_gate_forward_body[0],
+        observation.privileged_next_gate_forward_body[1],
+        observation.privileged_next_gate_forward_body[2],
     ]
 }
 
@@ -1409,71 +1424,45 @@ fn trail_instances(points: &VecDeque<[f32; 3]>) -> Vec<RenderInstance> {
     instances
 }
 
-fn direction_arrow_instances(state: EnvState) -> [RenderInstance; ARROW_INSTANCE_COUNT] {
-    let (forward, _, _) = drone_basis(state);
-    let forward = normalized_xz(forward).unwrap_or([1.0, 0.0, 0.0]);
-    let right = [forward[2], 0.0, -forward[0]];
-    let up = [0.0, 1.0, 0.0];
+fn debug_vector_instances(state: EnvState) -> Vec<RenderInstance> {
+    let (forward, _, up) = drone_basis(state);
     let center = vec3_from_array(state.position);
-    let arrow_origin = center
-        + vec3_from_array(forward) * ARROW_FORWARD_OFFSET
-        + vec3_from_array(up) * ARROW_VERTICAL_OFFSET;
-    let color = [0.99, 0.92, 0.24, 1.0];
-    let shaft_center = arrow_origin + vec3_from_array(forward) * ARROW_SHAFT_HALF_LENGTH;
-    let tip = arrow_origin + vec3_from_array(forward) * (ARROW_SHAFT_HALF_LENGTH * 2.0 + 0.02);
+    let velocity = vec3_from_array(state.velocity);
+    let mut instances = Vec::with_capacity(DEBUG_VECTOR_INSTANCE_COUNT);
 
-    let left_dir = safe_normalize(
-        -vec3_from_array(forward) - vec3_from_array(right) * 0.72,
-        -vec3_from_array(forward),
-    );
-    let right_dir = safe_normalize(
-        -vec3_from_array(forward) + vec3_from_array(right) * 0.72,
-        -vec3_from_array(forward),
-    );
-    let left_side = safe_normalize(vec3_from_array(up).cross(left_dir), vec3_from_array(right));
-    let right_side = safe_normalize(
-        vec3_from_array(up).cross(right_dir),
-        -vec3_from_array(right),
-    );
-
-    [
-        RenderInstance::oriented_box(
-            vec3_to_array(shaft_center),
-            right,
-            forward,
-            up,
-            [
-                ARROW_SHAFT_HALF_WIDTH,
-                ARROW_SHAFT_HALF_LENGTH,
-                ARROW_SHAFT_HALF_WIDTH,
-            ],
-            color,
-        ),
-        RenderInstance::oriented_box(
-            vec3_to_array(tip + left_dir * ARROW_HEAD_HALF_LENGTH),
-            vec3_to_array(left_side),
-            vec3_to_array(left_dir),
-            up,
-            [
-                ARROW_HEAD_HALF_WIDTH,
-                ARROW_HEAD_HALF_LENGTH,
-                ARROW_HEAD_HALF_WIDTH,
-            ],
-            color,
-        ),
-        RenderInstance::oriented_box(
-            vec3_to_array(tip + right_dir * ARROW_HEAD_HALF_LENGTH),
-            vec3_to_array(right_side),
-            vec3_to_array(right_dir),
-            up,
-            [
-                ARROW_HEAD_HALF_WIDTH,
-                ARROW_HEAD_HALF_LENGTH,
-                ARROW_HEAD_HALF_WIDTH,
-            ],
-            color,
-        ),
-    ]
+    if let Some(instance) = segment_instance(
+        center,
+        center + vec3_from_array(forward) * FORWARD_VECTOR_LENGTH,
+        DEBUG_VECTOR_HALF_WIDTH,
+        DEBUG_VECTOR_HALF_HEIGHT,
+        [0.99, 0.92, 0.24, 1.0],
+    ) {
+        instances.push(instance);
+    }
+    if let Some(instance) = segment_instance(
+        center,
+        center + vec3_from_array(up) * THRUST_VECTOR_LENGTH,
+        DEBUG_VECTOR_HALF_WIDTH,
+        DEBUG_VECTOR_HALF_HEIGHT,
+        [0.34, 0.95, 0.46, 1.0],
+    ) {
+        instances.push(instance);
+    }
+    let velocity_length = velocity.length();
+    if velocity_length > 1e-5 {
+        let scaled_velocity =
+            velocity * (VELOCITY_VECTOR_SCALE.min(VELOCITY_VECTOR_MAX_LENGTH / velocity_length));
+        if let Some(instance) = segment_instance(
+            center,
+            center + scaled_velocity,
+            DEBUG_VECTOR_HALF_WIDTH,
+            DEBUG_VECTOR_HALF_HEIGHT,
+            [0.96, 0.32, 0.28, 1.0],
+        ) {
+            instances.push(instance);
+        }
+    }
+    instances
 }
 
 fn target_instance(gate: Gate) -> RenderInstance {
@@ -1506,15 +1495,15 @@ fn autopilot_action(state: EnvState, target_gate: Gate) -> Action {
         - std::f32::consts::PI;
 
     let collective = (0.58 + delta_y * 0.22 - state.velocity[1] * 0.08).clamp(0.2, 0.9);
-    let roll_cmd = (-lateral_error * 0.07 + lateral_velocity * 0.04).clamp(-0.25, 0.25);
-    let pitch_cmd = (forward_error * 0.07 - forward_velocity * 0.04).clamp(-0.25, 0.25);
-    let yaw_cmd = (yaw_error * 0.18 - state.angular_velocity[2] * 0.05).clamp(-0.16, 0.16);
+    let roll_rate_cmd = (-lateral_error * 0.9 + lateral_velocity * 0.45).clamp(-6.0, 6.0);
+    let pitch_rate_cmd = (forward_error * 0.9 - forward_velocity * 0.45).clamp(-6.0, 6.0);
+    let yaw_rate_cmd = (yaw_error * 2.4 - state.angular_velocity[2] * 0.35).clamp(-4.0, 4.0);
 
     Action::new([
-        (collective - roll_cmd - pitch_cmd + yaw_cmd).clamp(0.0, 1.0),
-        (collective + roll_cmd - pitch_cmd - yaw_cmd).clamp(0.0, 1.0),
-        (collective + roll_cmd + pitch_cmd + yaw_cmd).clamp(0.0, 1.0),
-        (collective - roll_cmd + pitch_cmd - yaw_cmd).clamp(0.0, 1.0),
+        collective.clamp(0.0, 1.0),
+        (0.5 + roll_rate_cmd / 15.0).clamp(0.0, 1.0),
+        (0.5 + pitch_rate_cmd / 15.0).clamp(0.0, 1.0),
+        (0.5 + yaw_rate_cmd / 9.0).clamp(0.0, 1.0),
     ])
 }
 

@@ -27,7 +27,7 @@ struct EnvState {
 };
 
 struct Action {
-    motor_command: vec4<f32>,
+    pilot_command: vec4<f32>,
 };
 
 struct Observation {
@@ -38,6 +38,11 @@ struct Observation {
     target_gate_position: vec4<f32>,
     target_gate_forward_progress: vec4<f32>,
     metrics: vec4<f32>,
+    privileged_velocity_body: vec4<f32>,
+    privileged_target_gate_body: vec4<f32>,
+    privileged_target_gate_forward_body: vec4<f32>,
+    privileged_next_gate_body: vec4<f32>,
+    privileged_next_gate_forward_body: vec4<f32>,
 };
 
 struct RewardDone {
@@ -62,7 +67,6 @@ const DONE_REASON_OBSTACLE_COLLISION: u32 = 1u << 2u;
 const DONE_REASON_FLOOR_COLLISION: u32 = 1u << 3u;
 const DONE_REASON_OUT_OF_BOUNDS: u32 = 1u << 4u;
 const DONE_REASON_STEP_LIMIT: u32 = 1u << 5u;
-const DONE_REASON_EXCESSIVE_TILT: u32 = 1u << 6u;
 
 struct SimParams {
     dt_seconds: f32,
@@ -216,8 +220,51 @@ fn rotate_around_axis(v: vec3<f32>, axis: vec3<f32>, angle: f32) -> vec3<f32> {
     return v * c + cross(a, v) * s + a * dot(a, v) * (1.0 - c);
 }
 
-fn clamp_motor_command(command: vec4<f32>) -> vec4<f32> {
+fn clamp_pilot_command(command: vec4<f32>) -> vec4<f32> {
     return clamp(command, vec4<f32>(0.0), vec4<f32>(1.0));
+}
+
+fn centered_stick(command: f32) -> f32 {
+    return clamp(command, 0.0, 1.0) * 2.0 - 1.0;
+}
+
+fn pilot_collective_thrust(command: vec4<f32>) -> f32 {
+    return clamp(command.x, 0.0, 1.0);
+}
+
+fn pilot_roll_rate_target(command: vec4<f32>) -> f32 {
+    return centered_stick(command.y) * 7.5;
+}
+
+fn pilot_pitch_rate_target(command: vec4<f32>) -> f32 {
+    return centered_stick(command.z) * 7.5;
+}
+
+fn pilot_yaw_rate_target(command: vec4<f32>) -> f32 {
+    return centered_stick(command.w) * 4.5;
+}
+
+fn motor_target_from_pilot_command(
+    command: vec4<f32>,
+    angular_velocity: vec3<f32>,
+) -> vec4<f32> {
+    let collective = pilot_collective_thrust(command);
+    let roll_rate_error = pilot_roll_rate_target(command) - angular_velocity.x;
+    let pitch_rate_error = pilot_pitch_rate_target(command) - angular_velocity.y;
+    let yaw_rate_error = pilot_yaw_rate_target(command) - angular_velocity.z;
+    let roll_mix = clamp(roll_rate_error * 0.09, -0.7, 0.7);
+    let pitch_mix = clamp(pitch_rate_error * 0.09, -0.7, 0.7);
+    let yaw_mix = clamp(yaw_rate_error * 0.08, -0.35, 0.35);
+    return clamp(
+        vec4<f32>(
+            collective - roll_mix - pitch_mix + yaw_mix,
+            collective + roll_mix - pitch_mix - yaw_mix,
+            collective + roll_mix + pitch_mix + yaw_mix,
+            collective - roll_mix + pitch_mix - yaw_mix,
+        ),
+        vec4<f32>(0.0),
+        vec4<f32>(1.0),
+    );
 }
 
 fn body_forward(attitude: vec3<f32>) -> vec3<f32> {
@@ -240,6 +287,17 @@ fn body_up(attitude: vec3<f32>) -> vec3<f32> {
 
 fn body_right(attitude: vec3<f32>) -> vec3<f32> {
     return normalize(cross(body_up(attitude), body_forward(attitude)));
+}
+
+fn project_to_body_frame(attitude: vec3<f32>, world_vector: vec3<f32>) -> vec3<f32> {
+    let right = body_right(attitude);
+    let up = body_up(attitude);
+    let forward = body_forward(attitude);
+    return vec3<f32>(
+        dot(world_vector, right),
+        dot(world_vector, up),
+        dot(world_vector, forward),
+    );
 }
 
 fn wrap_angle(angle: f32) -> f32 {
@@ -1496,25 +1554,7 @@ fn reset_env(index: u32) {
     states.values[index]._pad_state1 = 0u;
     states.values[index]._pad_state2 = 0u;
 
-    observations.values[index].position = vec4<f32>(start_position, 0.0);
-    observations.values[index].velocity = vec4<f32>(
-        start_forward * forward_velocity
-            + start_right * lateral_velocity
-            + vec3<f32>(0.0, vertical_velocity, 0.0),
-        0.0,
-    );
-    observations.values[index].attitude = vec4<f32>(0.0, 0.0, start_yaw, 0.0);
-    observations.values[index].angular_velocity =
-        vec4<f32>(roll_rate, pitch_rate, yaw_rate, 0.0);
-    observations.values[index].target_gate_position = first_gate.center;
-    observations.values[index].target_gate_forward_progress =
-        vec4<f32>(first_gate.forward.xyz, 0.0);
-    observations.values[index].metrics = vec4<f32>(
-        0.0,
-        0.0,
-        1.0,
-        dot(initial_motor_thrust, vec4<f32>(0.25)),
-    );
+    write_observation(index, states.values[index], first_gate, count);
 
     reward_done.values[index].reward = 0.0;
     reward_done.values[index].done = 0u;
@@ -1537,6 +1577,60 @@ fn current_target_gate(index: u32, current_gate: u32) -> Gate {
     return gates.values[env_gate_offset(index) + safe_gate];
 }
 
+fn lookahead_gate(index: u32, current_gate: u32, current_lap: u32, gate_count: u32) -> Gate {
+    if (current_gate + 1u < gate_count) {
+        return current_target_gate(index, current_gate + 1u);
+    }
+    if (course_header.loop_enabled != 0u
+        && current_lap + 1u < max(course_header.laps_required, 1u))
+    {
+        return current_target_gate(index, 0u);
+    }
+    return current_target_gate(index, current_gate);
+}
+
+fn write_observation(index: u32, state: EnvState, target_gate: Gate, gate_count: u32) {
+    let target_position = target_gate.center.xyz;
+    let target_forward = normalize(target_gate.forward.xyz);
+    let target_delta = target_position - state.position.xyz;
+    let distance_to_gate = length(target_delta);
+    let progress = progress_value(state.current_lap, state.current_gate, gate_count);
+    let gate_alignment = gate_alignment_score(target_gate, target_delta, distance_to_gate);
+    let next_gate = lookahead_gate(index, state.current_gate, state.current_lap, gate_count);
+
+    observations.values[index].position = state.position;
+    observations.values[index].velocity = state.velocity;
+    observations.values[index].attitude = state.attitude;
+    observations.values[index].angular_velocity = state.angular_velocity;
+    observations.values[index].target_gate_position = target_gate.center;
+    observations.values[index].target_gate_forward_progress = vec4<f32>(target_forward, progress);
+    observations.values[index].metrics = vec4<f32>(
+        progress,
+        distance_to_gate,
+        gate_alignment,
+        dot(state.motor_thrust, vec4<f32>(0.25)),
+    );
+    observations.values[index].privileged_velocity_body =
+        vec4<f32>(project_to_body_frame(state.attitude.xyz, state.velocity.xyz), 0.0);
+    observations.values[index].privileged_target_gate_body =
+        vec4<f32>(project_to_body_frame(state.attitude.xyz, target_delta), 0.0);
+    observations.values[index].privileged_target_gate_forward_body = vec4<f32>(
+        project_to_body_frame(state.attitude.xyz, target_forward),
+        0.0,
+    );
+    observations.values[index].privileged_next_gate_body = vec4<f32>(
+        project_to_body_frame(
+            state.attitude.xyz,
+            next_gate.center.xyz - state.position.xyz,
+        ),
+        0.0,
+    );
+    observations.values[index].privileged_next_gate_forward_body = vec4<f32>(
+        project_to_body_frame(state.attitude.xyz, normalize(next_gate.forward.xyz)),
+        0.0,
+    );
+}
+
 @compute @workgroup_size(64)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let index = gid.x;
@@ -1556,27 +1650,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if (state.done != 0u) {
         var debug = reward_done.values[index];
-        let position = state.position.xyz;
-        let target_position = target_gate.center.xyz;
-        let to_gate = target_position - position;
-        let distance_to_gate = length(to_gate);
-        let target_forward = normalize(target_gate.forward.xyz);
-        let gate_alignment = gate_alignment_score(target_gate, to_gate, distance_to_gate);
-        observations.values[index].position = state.position;
-        observations.values[index].velocity = state.velocity;
-        observations.values[index].attitude = state.attitude;
-        observations.values[index].angular_velocity = state.angular_velocity;
-        observations.values[index].target_gate_position = target_gate.center;
-        observations.values[index].target_gate_forward_progress = vec4<f32>(
-            target_forward,
-            progress_value(state.current_lap, state.current_gate, gate_count),
-        );
-        observations.values[index].metrics = vec4<f32>(
-            progress_value(state.current_lap, state.current_gate, gate_count),
-            distance_to_gate,
-            gate_alignment,
-            dot(state.motor_thrust, vec4<f32>(0.25)),
-        );
+        write_observation(index, state, target_gate, gate_count);
         debug.reward = 0.0;
         debug.done = 1u;
         reward_done.values[index] = debug;
@@ -1596,7 +1670,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         prev_target_gate.center.xyz,
         prev_position,
     );
-    let action = clamp_motor_command(actions.values[index].motor_command);
+    let command = clamp_pilot_command(actions.values[index].pilot_command);
     let dynamics_strength =
         (0.04 + clamp(reset.difficulty, 0.0, 1.0) * 0.18)
         * curriculum_dynamics_scale(reset.curriculum_stage)
@@ -1645,10 +1719,13 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             dynamics_strength * 0.25 * params.actuator_randomization_scale,
         ),
     );
-    state.motor_thrust = state.motor_thrust
-        + (action - state.motor_thrust) * motor_response * params.dt_seconds;
-
     var attitude = state.attitude.xyz;
+    let motor_target = motor_target_from_pilot_command(
+        command,
+        state.angular_velocity.xyz,
+    );
+    state.motor_thrust = state.motor_thrust
+        + (motor_target - state.motor_thrust) * motor_response * params.dt_seconds;
     let forward = body_forward(attitude);
     let up = body_up(attitude);
     let right = body_right(attitude);
@@ -1701,8 +1778,8 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         0.0,
     );
     attitude = attitude + state.angular_velocity.xyz * params.dt_seconds;
-    attitude.x = clamp(attitude.x, -0.9, 0.9);
-    attitude.y = clamp(attitude.y, -0.9, 0.9);
+    attitude.x = wrap_angle(attitude.x);
+    attitude.y = wrap_angle(attitude.y);
     attitude.z = wrap_angle(attitude.z);
     state.attitude = vec4<f32>(attitude, 0.0);
 
@@ -1791,7 +1868,6 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         || abs(state.position.z) > env_bounds.z - clearance_z
         || state.position.y > env_bounds.y - clearance_y;
     let reached_step_limit = state.step_count >= params.max_steps;
-    let excessive_tilt = abs(attitude.x) > 1.2 || abs(attitude.y) > 1.2;
     if (collided_floor) {
         state.done = 1u;
         done_reason = done_reason | DONE_REASON_FLOOR_COLLISION;
@@ -1804,28 +1880,11 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         state.done = 1u;
         done_reason = done_reason | DONE_REASON_STEP_LIMIT;
     }
-    if (excessive_tilt) {
-        state.done = 1u;
-        done_reason = done_reason | DONE_REASON_EXCESSIVE_TILT;
-    }
     let collided_world = collided_floor || out_of_bounds;
 
     states.values[index] = state;
 
-    observations.values[index].position = state.position;
-    observations.values[index].velocity = state.velocity;
-    observations.values[index].attitude = state.attitude;
-    observations.values[index].angular_velocity = state.angular_velocity;
-    observations.values[index].target_gate_position = target_gate.center;
-    let progress = progress_value(state.current_lap, state.current_gate, gate_count);
-    let gate_alignment = gate_alignment_score(target_gate, delta, distance_to_gate);
-    observations.values[index].target_gate_forward_progress = vec4<f32>(target_forward, progress);
-    observations.values[index].metrics = vec4<f32>(
-        progress,
-        distance_to_gate,
-        gate_alignment,
-        dot(state.motor_thrust, vec4<f32>(0.25)),
-    );
+    write_observation(index, state, target_gate, gate_count);
 
     let progress_delta = current_segment_progress - previous_segment_progress;
     let progress_reward = clamp(progress_delta, -0.25, 0.25) * 1.35;
@@ -1891,13 +1950,18 @@ pub struct EnvState {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Action {
-    pub motor_command: [f32; 4],
+    pub pilot_command: [f32; 4],
 }
 
 impl Action {
     #[must_use]
-    pub fn new(motor_command: [f32; 4]) -> Self {
-        Self { motor_command }
+    pub fn new(pilot_command: [f32; 4]) -> Self {
+        Self { pilot_command }
+    }
+
+    #[must_use]
+    pub fn idle() -> Self {
+        Self::new([0.0, 0.5, 0.5, 0.5])
     }
 }
 
@@ -1919,7 +1983,16 @@ pub struct Observation {
     pub distance_to_gate: f32,
     pub gate_alignment: f32,
     pub mean_motor_thrust: f32,
+    pub privileged_velocity_body: [f32; 3],
     pub _pad5: f32,
+    pub privileged_target_gate_body: [f32; 3],
+    pub _pad6: f32,
+    pub privileged_target_gate_forward_body: [f32; 3],
+    pub _pad7: f32,
+    pub privileged_next_gate_body: [f32; 3],
+    pub _pad8: f32,
+    pub privileged_next_gate_forward_body: [f32; 3],
+    pub _pad9: f32,
 }
 
 #[repr(C)]

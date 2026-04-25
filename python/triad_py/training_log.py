@@ -15,7 +15,6 @@ DONE_REASON_BITS: tuple[tuple[int, str], ...] = (
     (1 << 3, "floor_collision"),
     (1 << 4, "out_of_bounds"),
     (1 << 5, "step_limit"),
-    (1 << 6, "excessive_tilt"),
 )
 _KNOWN_DONE_REASON_MASK = sum(bit for bit, _ in DONE_REASON_BITS)
 _DONE_REASON_SHORT_LABELS = {
@@ -25,7 +24,6 @@ _DONE_REASON_SHORT_LABELS = {
     "floor_collision": "floor",
     "out_of_bounds": "oob",
     "step_limit": "step",
-    "excessive_tilt": "tilt",
     "unknown": "unk",
 }
 

@@ -4,7 +4,6 @@ members = [
 "triad-sim",
 "triad-window",
 "triad-app",
-"triad-cubes",
 "triad-headless",
 "triad-visualizer",
 "triad-py",

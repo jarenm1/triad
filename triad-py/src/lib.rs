@@ -21,7 +21,7 @@ const CURRICULUM_STAGE_ARENA: u32 = 1;
 const CURRICULUM_STAGE_TECHNICAL: u32 = 2;
 const CURRICULUM_STAGE_ELEVATED: u32 = 3;
 const ACTION_STRIDE: usize = 4;
-const OBSERVATION_STRIDE: usize = 22;
+const OBSERVATION_STRIDE: usize = 37;
 
 static LAST_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
 
@@ -101,10 +101,10 @@ pub struct TriadSimConfig {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct TriadAction {
-    pub motor_0: f32,
-    pub motor_1: f32,
-    pub motor_2: f32,
-    pub motor_3: f32,
+    pub collective_thrust: f32,
+    pub roll_rate: f32,
+    pub pitch_rate: f32,
+    pub yaw_rate: f32,
 }
 
 #[repr(C)]
@@ -166,6 +166,21 @@ pub struct TriadObservation {
     pub distance_to_gate: f32,
     pub gate_alignment: f32,
     pub mean_motor_thrust: f32,
+    pub privileged_velocity_body_x: f32,
+    pub privileged_velocity_body_y: f32,
+    pub privileged_velocity_body_z: f32,
+    pub privileged_target_gate_body_x: f32,
+    pub privileged_target_gate_body_y: f32,
+    pub privileged_target_gate_body_z: f32,
+    pub privileged_target_gate_forward_body_x: f32,
+    pub privileged_target_gate_forward_body_y: f32,
+    pub privileged_target_gate_forward_body_z: f32,
+    pub privileged_next_gate_body_x: f32,
+    pub privileged_next_gate_body_y: f32,
+    pub privileged_next_gate_body_z: f32,
+    pub privileged_next_gate_forward_body_x: f32,
+    pub privileged_next_gate_forward_body_y: f32,
+    pub privileged_next_gate_forward_body_z: f32,
 }
 
 #[repr(C)]
@@ -249,7 +264,7 @@ impl TriadSimulation {
         let mut registry = ResourceRegistry::default();
         let simulation = GpuSimulation::new(&renderer, &mut registry, config.into())
             .map_err(|error| format!("simulation init failed: {error}"))?;
-        let zero_actions = vec![Action::new([0.0; 4]); simulation.env_count()];
+        let zero_actions = vec![Action::idle(); simulation.env_count()];
         simulation
             .set_actions(&renderer, &registry, &zero_actions)
             .map_err(|error| format!("failed to zero actions: {error}"))?;
@@ -339,10 +354,10 @@ fn convert_actions(actions: &[TriadAction]) -> Vec<Action> {
         .iter()
         .map(|action| {
             Action::new([
-                action.motor_0,
-                action.motor_1,
-                action.motor_2,
-                action.motor_3,
+                action.collective_thrust,
+                action.roll_rate,
+                action.pitch_rate,
+                action.yaw_rate,
             ])
         })
         .collect()
@@ -437,6 +452,21 @@ fn convert_observation(observation: &Observation) -> TriadObservation {
         distance_to_gate: observation.distance_to_gate,
         gate_alignment: observation.gate_alignment,
         mean_motor_thrust: observation.mean_motor_thrust,
+        privileged_velocity_body_x: observation.privileged_velocity_body[0],
+        privileged_velocity_body_y: observation.privileged_velocity_body[1],
+        privileged_velocity_body_z: observation.privileged_velocity_body[2],
+        privileged_target_gate_body_x: observation.privileged_target_gate_body[0],
+        privileged_target_gate_body_y: observation.privileged_target_gate_body[1],
+        privileged_target_gate_body_z: observation.privileged_target_gate_body[2],
+        privileged_target_gate_forward_body_x: observation.privileged_target_gate_forward_body[0],
+        privileged_target_gate_forward_body_y: observation.privileged_target_gate_forward_body[1],
+        privileged_target_gate_forward_body_z: observation.privileged_target_gate_forward_body[2],
+        privileged_next_gate_body_x: observation.privileged_next_gate_body[0],
+        privileged_next_gate_body_y: observation.privileged_next_gate_body[1],
+        privileged_next_gate_body_z: observation.privileged_next_gate_body[2],
+        privileged_next_gate_forward_body_x: observation.privileged_next_gate_forward_body[0],
+        privileged_next_gate_forward_body_y: observation.privileged_next_gate_forward_body[1],
+        privileged_next_gate_forward_body_z: observation.privileged_next_gate_forward_body[2],
     }
 }
 
@@ -483,6 +513,21 @@ fn flatten_observations(observations: &[Observation]) -> Vec<f32> {
             observation.distance_to_gate,
             observation.gate_alignment,
             observation.mean_motor_thrust,
+            observation.privileged_velocity_body[0],
+            observation.privileged_velocity_body[1],
+            observation.privileged_velocity_body[2],
+            observation.privileged_target_gate_body[0],
+            observation.privileged_target_gate_body[1],
+            observation.privileged_target_gate_body[2],
+            observation.privileged_target_gate_forward_body[0],
+            observation.privileged_target_gate_forward_body[1],
+            observation.privileged_target_gate_forward_body[2],
+            observation.privileged_next_gate_body[0],
+            observation.privileged_next_gate_body[1],
+            observation.privileged_next_gate_body[2],
+            observation.privileged_next_gate_forward_body[0],
+            observation.privileged_next_gate_forward_body[1],
+            observation.privileged_next_gate_forward_body[2],
         ]);
     }
     flat

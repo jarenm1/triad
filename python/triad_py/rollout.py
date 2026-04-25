@@ -52,7 +52,8 @@ PolicyFn = Callable[[object, object, int], None]
 
 def zero_policy(observations: object, actions: object, step_index: int) -> None:
     del observations, step_index
-    actions.fill(0.0)
+    actions[:, 0] = 0.0
+    actions[:, 1:] = 0.5
 
 
 def point_to_gate_policy(
@@ -88,15 +89,14 @@ def point_to_gate_policy(
     vertical_velocity = velocity[:, 1]
 
     collective = 0.48 + altitude_error * 0.22 - vertical_velocity * 0.08
-    roll_cmd = np.clip(-lateral_error * 0.07 + lateral_velocity * 0.04, -0.25, 0.25)
-    pitch_cmd = np.clip(forward_error * 0.07 - forward_velocity * 0.04, -0.25, 0.25)
-    yaw_cmd = np.clip(yaw_error * 0.18 - angular_velocity[:, 2] * 0.05, -0.16, 0.16)
+    roll_rate_cmd = np.clip(-lateral_error * 0.9 + lateral_velocity * 0.45, -6.0, 6.0)
+    pitch_rate_cmd = np.clip(forward_error * 0.9 - forward_velocity * 0.45, -6.0, 6.0)
+    yaw_rate_cmd = np.clip(yaw_error * 2.4 - angular_velocity[:, 2] * 0.35, -4.0, 4.0)
 
-    actions[:, 0] = collective - roll_cmd - pitch_cmd + yaw_cmd
-    actions[:, 1] = collective + roll_cmd - pitch_cmd - yaw_cmd
-    actions[:, 2] = collective + roll_cmd + pitch_cmd + yaw_cmd
-    actions[:, 3] = collective - roll_cmd + pitch_cmd - yaw_cmd
-    np.clip(actions, 0.0, 1.0, out=actions)
+    actions[:, 0] = np.clip(collective, 0.0, 1.0)
+    actions[:, 1] = np.clip(0.5 + roll_rate_cmd / 15.0, 0.0, 1.0)
+    actions[:, 2] = np.clip(0.5 + pitch_rate_cmd / 15.0, 0.0, 1.0)
+    actions[:, 3] = np.clip(0.5 + yaw_rate_cmd / 9.0, 0.0, 1.0)
 
 
 class RolloutCollector:
