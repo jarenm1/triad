@@ -100,7 +100,7 @@ def _pilot_action(action: Sequence[float]) -> _TriadAction:
 
 
 def _idle_action_values(env_count: int) -> list[float]:
-    return [0.0, 0.5, 0.5, 0.5] * env_count
+    return [0.5, 0.5, 0.5, 0.5] * env_count
 
 
 @lru_cache(maxsize=1)
@@ -125,6 +125,7 @@ class TurnDirection(IntEnum):
 
 
 class CurriculumStage(IntEnum):
+    BOOTSTRAP = _lib.triad_curriculum_stage_bootstrap()
     INTRO = _lib.triad_curriculum_stage_intro()
     ARENA = _lib.triad_curriculum_stage_arena()
     TECHNICAL = _lib.triad_curriculum_stage_technical()
@@ -271,7 +272,6 @@ class _TriadRewardDone(ctypes.Structure):
         ("done_reason", ctypes.c_uint32),
         ("_pad0", ctypes.c_uint32),
         ("shaping_reward", ctypes.c_float),
-        ("proximity_reward", ctypes.c_float),
         ("out_of_bounds_penalty", ctypes.c_float),
         ("time_penalty", ctypes.c_float),
         ("sparse_objective_reward", ctypes.c_float),
@@ -305,6 +305,8 @@ _lib.triad_course_get_stats.restype = ctypes.c_bool
 _lib.triad_sim_config_default.restype = _TriadSimConfig
 _lib.triad_action_stride.restype = ctypes.c_size_t
 _lib.triad_observation_stride.restype = ctypes.c_size_t
+_lib.triad_curriculum_stage_bootstrap.argtypes = []
+_lib.triad_curriculum_stage_bootstrap.restype = ctypes.c_uint32
 _lib.triad_curriculum_stage_intro.argtypes = []
 _lib.triad_curriculum_stage_intro.restype = ctypes.c_uint32
 _lib.triad_curriculum_stage_arena.argtypes = []
@@ -956,7 +958,6 @@ class SimulationCore:
                     and int(value.done_reason) & int(reason)
                 ],
                 "shaping_reward": float(value.shaping_reward),
-                "proximity_reward": float(value.proximity_reward),
                 "out_of_bounds_penalty": float(value.out_of_bounds_penalty),
                 "time_penalty": float(value.time_penalty),
                 "sparse_objective_reward": float(value.sparse_objective_reward),
@@ -1309,6 +1310,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--curriculum-previous-weight", type=float, default=0.2)
     ppo_train.add_argument("--curriculum-easy-weight", type=float, default=0.1)
     ppo_train.add_argument("--curriculum-holdout-seed", type=int, default=131071)
+    ppo_train.add_argument("--pretrain-updates", type=int, default=32)
+    ppo_train.add_argument("--pretrain-epochs", type=int, default=4)
+    ppo_train.add_argument("--pretrain-minibatch-size", type=int, default=4096)
+    ppo_train.add_argument("--pretrain-bootstrap-weight", type=float, default=0.75)
+    ppo_train.add_argument("--pretrain-intro-weight", type=float, default=0.25)
     ppo_train.add_argument(
         "--no-lr-anneal", action="store_true", help="Disable learning rate annealing"
     )
@@ -1444,7 +1450,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sim = SimulationCore(_demo_config(course))
         try:
             sim.set_course(course).reset_all().step(1)
-            sim.set_actions([(0.0, 0.5, 0.5, 0.5)] * sim.env_count).step(4)
+            sim.set_actions([(0.5, 0.5, 0.5, 0.5)] * sim.env_count).step(4)
             _print_json(
                 {
                     "env_count": sim.env_count,
@@ -1463,7 +1469,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         env = TriadVecEnv(sim)
         try:
             observations = env.reset()
-            step_result = env.step([(0.0, 0.5, 0.5, 0.5)] * sim.env_count)
+            step_result = env.step([(0.5, 0.5, 0.5, 0.5)] * sim.env_count)
             _print_json(
                 {
                     "reset_head": observations[:2],
@@ -1483,7 +1489,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         env = TriadFastVecEnv(sim)
         try:
             observations = env.reset()
-            result = env.step([(0.0, 0.5, 0.5, 0.5)] * sim.env_count)
+            result = env.step([(0.5, 0.5, 0.5, 0.5)] * sim.env_count)
             _print_json(
                 {
                     "reset_obs_len": len(observations),
@@ -1611,6 +1617,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             curriculum_previous_weight=args.curriculum_previous_weight,
             curriculum_easy_weight=args.curriculum_easy_weight,
             curriculum_holdout_seed=args.curriculum_holdout_seed,
+            pretrain_updates=args.pretrain_updates,
+            pretrain_epochs=args.pretrain_epochs,
+            pretrain_minibatch_size=args.pretrain_minibatch_size,
+            pretrain_bootstrap_weight=args.pretrain_bootstrap_weight,
+            pretrain_intro_weight=args.pretrain_intro_weight,
         )
         train_ppo(config)
         return 0

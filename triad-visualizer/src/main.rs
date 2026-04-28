@@ -48,6 +48,7 @@ const THRUST_VECTOR_LENGTH: f32 = 0.55;
 const VELOCITY_VECTOR_SCALE: f32 = 0.22;
 const VELOCITY_VECTOR_MAX_LENGTH: f32 = 0.9;
 const VISUALIZER_ENV_COUNT: usize = 128;
+const MAX_CURRICULUM_STAGE: u32 = 4;
 const DONE_REASON_COMPLETE: u32 = 1 << 0;
 const DONE_REASON_GATE_COLLISION: u32 = 1 << 1;
 const DONE_REASON_OBSTACLE_COLLISION: u32 = 1 << 2;
@@ -227,7 +228,7 @@ impl Default for UiState {
             use_checkpoint_policy: false,
             selected_env: 0,
             difficulty: 0.35,
-            curriculum_stage: 1,
+            curriculum_stage: 0,
             seed_base: 1,
             checkpoint_path: "checkpoints/ppo.pt".to_string(),
             checkpoint_status: "Heuristic replay ready".to_string(),
@@ -286,6 +287,12 @@ struct PpoPolicyClient {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+struct CurriculumStageProfile {
+    grammar_ids: &'static [u32],
+    difficulty_min: f32,
+    difficulty_max: f32,
 }
 
 impl PpoPolicyClient {
@@ -406,6 +413,36 @@ struct VisualizerManager {
 }
 
 impl VisualizerManager {
+    fn curriculum_stage_profile(curriculum_stage: u32) -> CurriculumStageProfile {
+        match curriculum_stage {
+            0 => CurriculumStageProfile {
+                grammar_ids: &[0],
+                difficulty_min: 0.0,
+                difficulty_max: 0.04,
+            },
+            1 => CurriculumStageProfile {
+                grammar_ids: &[0],
+                difficulty_min: 0.0,
+                difficulty_max: 0.08,
+            },
+            2 => CurriculumStageProfile {
+                grammar_ids: &[0, 1, 2],
+                difficulty_min: 0.1,
+                difficulty_max: 0.35,
+            },
+            3 => CurriculumStageProfile {
+                grammar_ids: &[0, 1, 2, 3],
+                difficulty_min: 0.3,
+                difficulty_max: 0.65,
+            },
+            _ => CurriculumStageProfile {
+                grammar_ids: &[0, 1, 2, 3],
+                difficulty_min: 0.6,
+                difficulty_max: 1.0,
+            },
+        }
+    }
+
     fn new(
         renderer: &Renderer,
         registry: &mut ResourceRegistry,
@@ -512,7 +549,7 @@ impl VisualizerManager {
             .collect();
         sim.set_actions(renderer, registry, &zero_actions)?;
 
-        Ok(Self {
+        let mut manager = Self {
             sim,
             ui_state,
             camera_buffer: camera_buffer.handle(),
@@ -534,8 +571,24 @@ impl VisualizerManager {
             selected_env: 0,
             layouts_dirty: true,
             applied_difficulty: 0.35,
-            applied_curriculum_stage: 1,
-        })
+            applied_curriculum_stage: 0,
+        };
+
+        let (seed_base, difficulty, curriculum_stage) = {
+            let state = manager.ui_state.lock().expect("ui state poisoned");
+            (
+                state.seed_base,
+                state.difficulty,
+                state.curriculum_stage.min(MAX_CURRICULUM_STAGE),
+            )
+        };
+        let params = manager.randomize_reset_params(seed_base, difficulty, curriculum_stage);
+        manager.sim.set_reset_params(renderer, registry, &params)?;
+        manager.sim.reset_all(renderer, registry)?;
+        manager.applied_difficulty = difficulty;
+        manager.applied_curriculum_stage = curriculum_stage;
+
+        Ok(manager)
     }
 
     fn snapshot_ui(&self) -> UiSnapshot {
@@ -547,7 +600,7 @@ impl VisualizerManager {
                 .selected_env
                 .min(self.sim.env_count().saturating_sub(1)),
             difficulty: state.difficulty,
-            curriculum_stage: state.curriculum_stage.min(3),
+            curriculum_stage: state.curriculum_stage.min(MAX_CURRICULUM_STAGE),
             seed_base: state.seed_base,
             checkpoint_path: state.checkpoint_path.clone(),
             load_checkpoint: state.request_load_checkpoint,
@@ -575,12 +628,20 @@ impl VisualizerManager {
         difficulty: f32,
         curriculum_stage: u32,
     ) -> Vec<ResetParams> {
+        let profile = Self::curriculum_stage_profile(curriculum_stage);
+        let difficulty_span = (profile.difficulty_max - profile.difficulty_min).max(0.0);
+        let target_difficulty =
+            profile.difficulty_min + difficulty.clamp(0.0, 1.0) * difficulty_span;
+        let jitter_span = difficulty_span * 0.2;
         (0..self.sim.env_count())
             .map(|env_index| {
                 let env_seed = hash_u32(base_seed ^ (env_index as u32).wrapping_mul(0x9e37_79b9));
-                let grammar_id = env_seed % 4;
-                let difficulty_jitter = hash_to_unit(env_seed ^ 0x85eb_ca6b) * 0.2 - 0.1;
-                let env_difficulty = (difficulty + difficulty_jitter).clamp(0.0, 1.0);
+                let grammar_index = (env_seed as usize) % profile.grammar_ids.len();
+                let grammar_id = profile.grammar_ids[grammar_index];
+                let difficulty_jitter =
+                    (hash_to_unit(env_seed ^ 0x85eb_ca6b) * 2.0 - 1.0) * jitter_span;
+                let env_difficulty = (target_difficulty + difficulty_jitter)
+                    .clamp(profile.difficulty_min, profile.difficulty_max);
                 ResetParams::new(env_seed, grammar_id, env_difficulty, curriculum_stage)
             })
             .collect()
@@ -658,31 +719,28 @@ impl VisualizerManager {
             return Err(io::Error::other("checkpoint policy is not loaded").into());
         };
 
-        let selected_env = self
-            .selected_env
-            .min(self.cached_observations.len().saturating_sub(1));
-        let selected_observation = self
-            .cached_observations
-            .get(selected_env)
-            .ok_or_else(|| io::Error::other("selected env observation unavailable"))?;
-        let (action_rows, values) = client.predict(std::slice::from_ref(selected_observation))?;
-        if action_rows.len() != 1 {
+        let (action_rows, values) = client.predict(&self.cached_observations)?;
+        if action_rows.len() != self.actions.len() {
             return Err(io::Error::other(format!(
-                "policy returned {} action rows for selected env replay",
+                "policy returned {} action rows for {} envs",
                 action_rows.len(),
+                self.actions.len(),
             ))
             .into());
         }
 
-        self.actions.fill(Action::idle());
-        self.actions[selected_env] = Action::new(action_rows[0]);
-        self.last_value_estimates.fill(0.0);
-        if let Some(value) = values.first().copied() {
-            if let Some(slot) = self.last_value_estimates.get_mut(selected_env) {
-                *slot = value;
-            }
+        for (slot, action_row) in self.actions.iter_mut().zip(action_rows.iter().copied()) {
+            *slot = Action::new(action_row);
         }
-        self.set_checkpoint_status("Replay active with PPO checkpoint (selected env)");
+        self.last_value_estimates.fill(0.0);
+        for (slot, value) in self
+            .last_value_estimates
+            .iter_mut()
+            .zip(values.iter().copied())
+        {
+            *slot = value;
+        }
+        self.set_checkpoint_status("Replay active with PPO checkpoint (all envs)");
         Ok(())
     }
 
@@ -966,6 +1024,7 @@ impl RendererManager for VisualizerManager {
         let selected_observation = self.cached_observations.get(self.selected_env).copied();
         let selected_reward_done = self.cached_reward_done.get(self.selected_env).copied();
         if snapshot.replay_active
+            && !snapshot.use_checkpoint_policy
             && selected_reward_done
                 .map(|value| value.done != 0)
                 .unwrap_or(false)
@@ -1100,7 +1159,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                             egui::Slider::new(&mut ui.difficulty, 0.0..=1.0).text("Difficulty"),
                         );
                         panel.add(
-                            egui::Slider::new(&mut ui.curriculum_stage, 0..=3).text("Curriculum"),
+                            egui::Slider::new(&mut ui.curriculum_stage, 0..=MAX_CURRICULUM_STAGE)
+                                .text("Curriculum"),
                         );
 
                         panel.separator();
@@ -1484,26 +1544,53 @@ fn autopilot_action(state: EnvState, target_gate: Gate) -> Action {
     let heading = [yaw.cos(), yaw.sin()];
     let right = [heading[1], -heading[0]];
     let horizontal_delta = [delta_x, delta_z];
-    let horizontal_velocity = [state.velocity[0], state.velocity[2]];
-    let forward_error = horizontal_delta[0] * heading[0] + horizontal_delta[1] * heading[1];
     let lateral_error = horizontal_delta[0] * right[0] + horizontal_delta[1] * right[1];
-    let forward_velocity =
-        horizontal_velocity[0] * heading[0] + horizontal_velocity[1] * heading[1];
-    let lateral_velocity = horizontal_velocity[0] * right[0] + horizontal_velocity[1] * right[1];
-    let desired_yaw = target_gate.forward[2].atan2(target_gate.forward[0]);
+    let horizontal_distance = (horizontal_delta[0] * horizontal_delta[0]
+        + horizontal_delta[1] * horizontal_delta[1])
+        .sqrt();
+    let safe_distance = horizontal_distance.max(1.0e-6);
+    let approach_dir = [
+        horizontal_delta[0] / safe_distance,
+        horizontal_delta[1] / safe_distance,
+    ];
+    let gate_forward_length = (target_gate.forward[0] * target_gate.forward[0]
+        + target_gate.forward[2] * target_gate.forward[2])
+        .sqrt()
+        .max(1.0e-6);
+    let gate_forward = [
+        target_gate.forward[0] / gate_forward_length,
+        target_gate.forward[2] / gate_forward_length,
+    ];
+    let gate_align_weight = (1.0 - horizontal_distance / 6.0).clamp(0.0, 1.0);
+    let desired_dir_raw = [
+        approach_dir[0] * (1.0 - gate_align_weight) + gate_forward[0] * gate_align_weight,
+        approach_dir[1] * (1.0 - gate_align_weight) + gate_forward[1] * gate_align_weight,
+    ];
+    let desired_dir_length = (desired_dir_raw[0] * desired_dir_raw[0]
+        + desired_dir_raw[1] * desired_dir_raw[1])
+        .sqrt()
+        .max(1.0e-6);
+    let desired_dir = [
+        desired_dir_raw[0] / desired_dir_length,
+        desired_dir_raw[1] / desired_dir_length,
+    ];
+    let desired_yaw = desired_dir[1].atan2(desired_dir[0]);
     let yaw_error = ((desired_yaw - yaw) + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
         - std::f32::consts::PI;
+    let yaw_alignment = yaw_error.cos().clamp(0.0, 1.0);
+    let approach_scale = yaw_alignment / (1.0 + 0.22 * lateral_error.abs() + 0.18 * delta_y.abs());
 
-    let collective = (0.58 + delta_y * 0.22 - state.velocity[1] * 0.08).clamp(0.2, 0.9);
-    let roll_rate_cmd = (-lateral_error * 0.9 + lateral_velocity * 0.45).clamp(-6.0, 6.0);
-    let pitch_rate_cmd = (forward_error * 0.9 - forward_velocity * 0.45).clamp(-6.0, 6.0);
-    let yaw_rate_cmd = (yaw_error * 2.4 - state.angular_velocity[2] * 0.35).clamp(-4.0, 4.0);
+    let forward_velocity_target =
+        ((horizontal_distance - 0.6) * 1.2).clamp(0.0, 6.0) * approach_scale;
+    let lateral_velocity_target = (lateral_error * 1.0).clamp(-4.0, 4.0);
+    let vertical_velocity_target = (delta_y * 0.9).clamp(-2.5, 2.5);
+    let yaw_rate_target = (yaw_error * 2.2).clamp(-3.5, 3.5);
 
     Action::new([
-        collective.clamp(0.0, 1.0),
-        (0.5 + roll_rate_cmd / 15.0).clamp(0.0, 1.0),
-        (0.5 + pitch_rate_cmd / 15.0).clamp(0.0, 1.0),
-        (0.5 + yaw_rate_cmd / 9.0).clamp(0.0, 1.0),
+        (0.5 + forward_velocity_target / 12.0).clamp(0.0, 1.0),
+        (0.5 + lateral_velocity_target / 8.0).clamp(0.0, 1.0),
+        (0.5 + vertical_velocity_target / 5.0).clamp(0.0, 1.0),
+        (0.5 + yaw_rate_target / 7.0).clamp(0.0, 1.0),
     ])
 }
 

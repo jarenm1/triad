@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import random
@@ -14,6 +15,7 @@ import numpy as np
 
 from . import (
     CourseSpec,
+    CurriculumStage,
     SimulationConfig,
     SimulationCore,
     TriadFastVecEnv,
@@ -29,7 +31,7 @@ except ImportError:  # pragma: no cover - runtime dependency
     nn = None
 
 
-ACTION_SPACE_VERSION = "pilot_acro_rates_v1"
+ACTION_SPACE_VERSION = "velocity_yaw_setpoint_v1"
 OBSERVATION_SPACE_VERSION = "teacher_privileged_v1"
 
 
@@ -121,6 +123,11 @@ class PPOConfig:
     curriculum_previous_weight: float = 0.2
     curriculum_easy_weight: float = 0.1
     curriculum_holdout_seed: int = 131071
+    pretrain_updates: int = 32
+    pretrain_epochs: int = 4
+    pretrain_minibatch_size: int = 4096
+    pretrain_bootstrap_weight: float = 0.75
+    pretrain_intro_weight: float = 0.25
 
 
 @dataclass
@@ -200,11 +207,21 @@ class CurriculumEvalEnvResult:
     gate_alignment: float
     reward: float
     shaping_reward: float
-    proximity_reward: float
     out_of_bounds_penalty: float
     time_penalty: float
     sparse_objective_reward: float
     collision_penalty: float
+
+
+@dataclass
+class PhaseBestEvalSnapshot:
+    phase_index: int
+    eval_stats: CurriculumEvalStats
+    model_state: dict[str, object]
+    optimizer_state: dict[str, object]
+    observation_normalizer_state: dict[str, object] | None
+    update_index: int
+    total_env_steps: int
 
 
 @dataclass
@@ -247,7 +264,6 @@ def _curriculum_eval_env_result_from_dict(
         gate_alignment=float(payload["gate_alignment"]),
         reward=float(payload["reward"]),
         shaping_reward=float(payload["shaping_reward"]),
-        proximity_reward=float(payload["proximity_reward"]),
         out_of_bounds_penalty=float(payload["out_of_bounds_penalty"]),
         time_penalty=float(payload["time_penalty"]),
         sparse_objective_reward=float(payload["sparse_objective_reward"]),
@@ -291,6 +307,42 @@ def _resolve_checkpoint_path(config: PPOConfig) -> Path | None:
     if config.run_name:
         return Path("checkpoints") / f"{_safe_checkpoint_stem(config.run_name)}.pt"
     return None
+
+
+def _best_checkpoint_path(checkpoint_path: Path) -> Path:
+    return checkpoint_path.with_name(
+        f"{checkpoint_path.stem}.best{checkpoint_path.suffix}"
+    )
+
+
+def _eval_score(eval_stats: CurriculumEvalStats) -> tuple[float, float, float, float]:
+    return (
+        float(eval_stats.completion_rate),
+        float(eval_stats.mean_progress),
+        float(eval_stats.mean_episode_return),
+        -float(eval_stats.mean_episode_length),
+    )
+
+
+def _restore_best_phase_snapshot(
+    snapshot: PhaseBestEvalSnapshot,
+    *,
+    model: "ActorCritic",
+    optimizer,
+    observation_normalizer: "RunningMeanStd | None",
+) -> "RunningMeanStd | None":
+    model.load_state_dict(snapshot.model_state)
+    optimizer.load_state_dict(snapshot.optimizer_state)
+    if snapshot.observation_normalizer_state is None:
+        return None
+    restored = RunningMeanStd.from_state_dict(snapshot.observation_normalizer_state)
+    if observation_normalizer is None:
+        return restored
+    observation_normalizer.mean = restored.mean
+    observation_normalizer.var = restored.var
+    observation_normalizer.count = restored.count
+    observation_normalizer.clip = restored.clip
+    return observation_normalizer
 
 
 @dataclass
@@ -443,17 +495,81 @@ def _hash_to_signed(seed: int) -> float:
 
 
 def _curriculum_dynamics_scale(curriculum_stage: int) -> float:
-    if curriculum_stage == 0:
+    if curriculum_stage == int(CurriculumStage.BOOTSTRAP):
+        return 0.0
+    if curriculum_stage == int(CurriculumStage.INTRO):
         return 0.35
-    if curriculum_stage == 1:
+    if curriculum_stage == int(CurriculumStage.ARENA):
         return 0.55
-    if curriculum_stage == 2:
+    if curriculum_stage == int(CurriculumStage.TECHNICAL):
         return 0.8
     return 1.0
 
 
 def _randomized_positive_scale(seed: int, salt: int, magnitude: float) -> float:
     return max(0.25, 1.0 + _hash_to_signed((seed ^ salt) & 0xFFFFFFFF) * magnitude)
+
+
+def _teacher_point_to_gate_actions(observations: np.ndarray) -> np.ndarray:
+    position = observations[:, 0:3]
+    velocity = observations[:, 3:6]
+    attitude = observations[:, 6:9]
+    target_gate_position = observations[:, 12:15]
+    target_gate_forward = observations[:, 15:18]
+
+    target_delta = target_gate_position - position
+    yaw = attitude[:, 2]
+    heading = np.stack((np.cos(yaw), np.sin(yaw)), axis=1)
+    right = np.stack((heading[:, 1], -heading[:, 0]), axis=1)
+
+    horizontal_delta = target_delta[:, [0, 2]]
+    forward_error = np.sum(horizontal_delta * heading, axis=1)
+    lateral_error = np.sum(horizontal_delta * right, axis=1)
+    altitude_error = target_delta[:, 1]
+    horizontal_distance = np.linalg.norm(horizontal_delta, axis=1)
+    safe_distance = np.maximum(horizontal_distance, 1.0e-6)
+    approach_dir = horizontal_delta / safe_distance[:, None]
+    gate_forward_xz = target_gate_forward[:, [0, 2]]
+    gate_forward_norm = np.maximum(
+        np.linalg.norm(gate_forward_xz, axis=1, keepdims=True),
+        1.0e-6,
+    )
+    gate_forward_unit = gate_forward_xz / gate_forward_norm
+    gate_align_weight = np.clip(1.0 - horizontal_distance / 6.0, 0.0, 1.0)
+    desired_dir = (
+        approach_dir * (1.0 - gate_align_weight)[:, None]
+        + gate_forward_unit * gate_align_weight[:, None]
+    )
+    desired_dir_norm = np.maximum(
+        np.linalg.norm(desired_dir, axis=1, keepdims=True),
+        1.0e-6,
+    )
+    desired_dir = desired_dir / desired_dir_norm
+    desired_yaw = np.arctan2(desired_dir[:, 1], desired_dir[:, 0])
+    yaw_error = (desired_yaw - yaw + np.pi) % (2.0 * np.pi) - np.pi
+
+    yaw_alignment = np.clip(np.cos(yaw_error), 0.0, 1.0)
+    approach_scale = yaw_alignment / (
+        1.0 + 0.22 * np.abs(lateral_error) + 0.18 * np.abs(altitude_error)
+    )
+    forward_velocity_target = (
+        np.clip(
+            (horizontal_distance - 0.6) * 1.2,
+            0.0,
+            6.0,
+        )
+        * approach_scale
+    )
+    lateral_velocity_target = np.clip(lateral_error * 1.0, -4.0, 4.0)
+    vertical_velocity_target = np.clip(altitude_error * 0.9, -2.5, 2.5)
+    yaw_rate_target = np.clip(yaw_error * 2.2, -3.5, 3.5)
+
+    actions = np.empty((observations.shape[0], 4), dtype=np.float32)
+    actions[:, 0] = np.clip(0.5 + forward_velocity_target / 12.0, 0.0, 1.0)
+    actions[:, 1] = np.clip(0.5 + lateral_velocity_target / 8.0, 0.0, 1.0)
+    actions[:, 2] = np.clip(0.5 + vertical_velocity_target / 5.0, 0.0, 1.0)
+    actions[:, 3] = np.clip(0.5 + yaw_rate_target / 7.0, 0.0, 1.0)
+    return actions
 
 
 def _summarize_array(values: np.ndarray) -> dict[str, float]:
@@ -706,6 +822,12 @@ class MasteryCurriculumController:
         if self.current_phase_index <= 0:
             return {self.current_phase().name: 1.0}
 
+        if self.current_phase_index == 1:
+            return {
+                self.schedule.phase_at_index(0).name: 0.45,
+                self.schedule.phase_at_index(1).name: 0.55,
+            }
+
         raw_mix: dict[int, float] = {}
 
         def add_weight(phase_index: int, weight: float) -> None:
@@ -951,9 +1073,6 @@ def _evaluate_curriculum_phase(
                 gate_alignment=float(final_observations[env_index]["gate_alignment"]),
                 reward=float(final_reward_done[env_index]["reward"]),
                 shaping_reward=float(final_reward_done[env_index]["shaping_reward"]),
-                proximity_reward=float(
-                    final_reward_done[env_index]["proximity_reward"]
-                ),
                 out_of_bounds_penalty=float(
                     final_reward_done[env_index]["out_of_bounds_penalty"]
                 ),
@@ -1088,6 +1207,110 @@ def _explained_variance(y_pred: np.ndarray, y_true: np.ndarray) -> float:
     if var_y <= 1.0e-8:
         return 0.0
     return float(1.0 - np.var(y_true - y_pred) / var_y)
+
+
+def _collect_pretrain_batch(
+    env: TriadFastVecEnv,
+    schedule,
+    config: PPOConfig,
+    *,
+    base_seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if len(schedule.phases) > 1 and config.pretrain_intro_weight > 0.0:
+        reset_params = schedule.sample_reset_params_mixture(
+            env_count=env.sim.env_count,
+            phase_indices=[0, 1],
+            weights=[
+                max(config.pretrain_bootstrap_weight, 0.0),
+                max(config.pretrain_intro_weight, 0.0),
+            ],
+            base_seed=base_seed,
+        )
+    else:
+        reset_params = schedule.sample_reset_params_for_phase(
+            env_count=env.sim.env_count,
+            phase_index=0,
+            base_seed=base_seed,
+        )
+
+    env.sim.set_reset_params(reset_params)
+    observations = env.reset_numpy().copy()
+    obs_batch = np.empty(
+        (config.horizon, env.sim.env_count, env.sim.observation_stride),
+        dtype=np.float32,
+    )
+    action_batch = np.empty(
+        (config.horizon, env.sim.env_count, env.sim.action_stride),
+        dtype=np.float32,
+    )
+
+    for step_index in range(config.horizon):
+        obs_batch[step_index] = observations
+        teacher_actions = _teacher_point_to_gate_actions(observations)
+        action_batch[step_index] = teacher_actions
+        env.numpy_action_view()[:, :] = teacher_actions
+        next_observations, _, _ = env.step_in_place().numpy_views()
+        observations = next_observations.copy()
+
+    return (
+        obs_batch.reshape((-1, env.sim.observation_stride)),
+        action_batch.reshape((-1, env.sim.action_stride)),
+    )
+
+
+def _behavior_clone_pretrain(
+    env: TriadFastVecEnv,
+    model: "ActorCritic",
+    optimizer,
+    config: PPOConfig,
+    *,
+    device: str,
+    observation_normalizer: RunningMeanStd | None,
+    schedule,
+) -> RunningMeanStd | None:
+    torch_module, _ = _require_torch()
+    if config.pretrain_updates <= 0:
+        return observation_normalizer
+
+    minibatch_size = max(1, int(config.pretrain_minibatch_size))
+    for pretrain_update in range(config.pretrain_updates):
+        flat_observations, flat_actions = _collect_pretrain_batch(
+            env,
+            schedule,
+            config,
+            base_seed=config.seed ^ (pretrain_update * 0x9E37_79B9),
+        )
+        if observation_normalizer is not None:
+            observation_normalizer.update(flat_observations)
+            flat_observations = observation_normalizer.normalize(flat_observations)
+
+        obs_batch = torch_module.as_tensor(
+            flat_observations, dtype=torch_module.float32, device=device
+        )
+        actions_batch = torch_module.as_tensor(
+            flat_actions, dtype=torch_module.float32, device=device
+        )
+        batch_size = obs_batch.shape[0]
+
+        for _ in range(config.pretrain_epochs):
+            permutation = torch_module.randperm(batch_size, device=device)
+            for start in range(0, batch_size, minibatch_size):
+                indices = permutation[start : start + minibatch_size]
+                predicted_mean, _ = model.forward(obs_batch[indices])
+                predicted_actions = torch.sigmoid(predicted_mean)
+                loss = torch_module.nn.functional.mse_loss(
+                    predicted_actions,
+                    actions_batch[indices],
+                )
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch_module.nn.utils.clip_grad_norm_(
+                    model.parameters(), config.max_grad_norm
+                )
+                optimizer.step()
+
+    return observation_normalizer
 
 
 def _save_checkpoint(
@@ -1346,6 +1569,9 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
     checkpoint_path = _resolve_checkpoint_path(config)
     if checkpoint_path is not None:
         config.checkpoint_path = str(checkpoint_path)
+    best_checkpoint_path = (
+        None if checkpoint_path is None else _best_checkpoint_path(checkpoint_path)
+    )
     resume_path = Path(config.resume_from) if config.resume_from else None
     if resume_path is not None:
         config.resume_from = str(resume_path)
@@ -1400,6 +1626,16 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
             curriculum.load_state_dict(checkpoint.get("curriculum"))
             start_update = max(0, int(checkpoint.get("update_index", -1)) + 1)
             total_env_steps = max(0, int(checkpoint.get("total_env_steps", 0)))
+        elif config.pretrain_updates > 0:
+            observation_normalizer = _behavior_clone_pretrain(
+                env,
+                model,
+                optimizer,
+                config,
+                device=device,
+                observation_normalizer=observation_normalizer,
+                schedule=schedule,
+            )
         reset_params = curriculum.sample_training_reset_params(
             env_count=sim.env_count,
             base_seed=config.seed + start_update,
@@ -1417,6 +1653,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
 
         final_phase = curriculum.current_phase().name
         final_progress = curriculum.progress()
+        best_phase_snapshot: PhaseBestEvalSnapshot | None = None
         training_logger.emit_started(initial_phase=final_phase)
         end_update = start_update + config.total_updates
 
@@ -1424,6 +1661,11 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
             started_at = perf_counter()
             phase_index = curriculum.current_phase_index
             phase = curriculum.current_phase()
+            if (
+                best_phase_snapshot is not None
+                and best_phase_snapshot.phase_index != phase_index
+            ):
+                best_phase_snapshot = None
             progress = curriculum.progress()
             final_phase = phase.name
             final_progress = progress
@@ -1602,7 +1844,68 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                     base_seed=config.curriculum_holdout_seed + phase_index * 104729,
                     max_episode_steps=config.max_episode_steps,
                 )
+                if (
+                    best_phase_snapshot is None
+                    or best_phase_snapshot.phase_index != phase_index
+                    or _eval_score(eval_stats)
+                    > _eval_score(best_phase_snapshot.eval_stats)
+                ):
+                    best_phase_snapshot = PhaseBestEvalSnapshot(
+                        phase_index=phase_index,
+                        eval_stats=copy.deepcopy(eval_stats),
+                        model_state=copy.deepcopy(model.state_dict()),
+                        optimizer_state=copy.deepcopy(optimizer.state_dict()),
+                        observation_normalizer_state=None
+                        if observation_normalizer is None
+                        else copy.deepcopy(observation_normalizer.state_dict()),
+                        update_index=update_index,
+                        total_env_steps=total_env_steps,
+                    )
+                    if best_checkpoint_path is not None:
+                        _save_checkpoint(
+                            best_checkpoint_path,
+                            model=model,
+                            optimizer=optimizer,
+                            config=config,
+                            observation_normalizer=observation_normalizer,
+                            curriculum=curriculum,
+                            update_index=update_index,
+                            total_env_steps=total_env_steps,
+                        )
+                        training_logger.emit_checkpoint_saved(
+                            checkpoint_path=str(best_checkpoint_path),
+                            update_index=update_index,
+                            total_env_steps=total_env_steps,
+                        )
                 phase_advanced = curriculum.record_eval(eval_stats, update_index)
+                if (
+                    phase_advanced
+                    and best_phase_snapshot is not None
+                    and best_phase_snapshot.phase_index == phase_index
+                ):
+                    observation_normalizer = _restore_best_phase_snapshot(
+                        best_phase_snapshot,
+                        model=model,
+                        optimizer=optimizer,
+                        observation_normalizer=observation_normalizer,
+                    )
+                    if best_checkpoint_path is not None:
+                        _save_checkpoint(
+                            best_checkpoint_path,
+                            model=model,
+                            optimizer=optimizer,
+                            config=config,
+                            observation_normalizer=observation_normalizer,
+                            curriculum=curriculum,
+                            update_index=best_phase_snapshot.update_index,
+                            total_env_steps=best_phase_snapshot.total_env_steps,
+                        )
+                        training_logger.emit_checkpoint_saved(
+                            checkpoint_path=str(best_checkpoint_path),
+                            update_index=best_phase_snapshot.update_index,
+                            total_env_steps=best_phase_snapshot.total_env_steps,
+                        )
+                    best_phase_snapshot = None
 
             stats = PPOUpdateStats(
                 update_index=update_index,

@@ -52,8 +52,7 @@ PolicyFn = Callable[[object, object, int], None]
 
 def zero_policy(observations: object, actions: object, step_index: int) -> None:
     del observations, step_index
-    actions[:, 0] = 0.0
-    actions[:, 1:] = 0.5
+    actions[:, :] = 0.5
 
 
 def point_to_gate_policy(
@@ -65,7 +64,6 @@ def point_to_gate_policy(
     position = observations[:, 0:3]
     velocity = observations[:, 3:6]
     attitude = observations[:, 6:9]
-    angular_velocity = observations[:, 9:12]
     target_gate_position = observations[:, 12:15]
     target_gate_forward = observations[:, 15:18]
 
@@ -75,28 +73,51 @@ def point_to_gate_policy(
     right = np.stack((heading[:, 1], -heading[:, 0]), axis=1)
 
     horizontal_delta = target_delta[:, [0, 2]]
-    horizontal_velocity = velocity[:, [0, 2]]
     forward_error = np.sum(horizontal_delta * heading, axis=1)
     lateral_error = np.sum(horizontal_delta * right, axis=1)
-    forward_velocity = np.sum(horizontal_velocity * heading, axis=1)
-    lateral_velocity = np.sum(horizontal_velocity * right, axis=1)
-
-    desired_yaw = np.arctan2(target_gate_forward[:, 2], target_gate_forward[:, 0])
-    yaw_error = desired_yaw - yaw
-    yaw_error = (yaw_error + np.pi) % (2.0 * np.pi) - np.pi
-
     altitude_error = target_delta[:, 1]
-    vertical_velocity = velocity[:, 1]
+    horizontal_distance = np.linalg.norm(horizontal_delta, axis=1)
+    safe_distance = np.maximum(horizontal_distance, 1.0e-6)
+    approach_dir = horizontal_delta / safe_distance[:, None]
+    gate_forward_xz = target_gate_forward[:, [0, 2]]
+    gate_forward_norm = np.maximum(
+        np.linalg.norm(gate_forward_xz, axis=1, keepdims=True),
+        1.0e-6,
+    )
+    gate_forward_unit = gate_forward_xz / gate_forward_norm
+    gate_align_weight = np.clip(1.0 - horizontal_distance / 6.0, 0.0, 1.0)
+    desired_dir = (
+        approach_dir * (1.0 - gate_align_weight)[:, None]
+        + gate_forward_unit * gate_align_weight[:, None]
+    )
+    desired_dir_norm = np.maximum(
+        np.linalg.norm(desired_dir, axis=1, keepdims=True),
+        1.0e-6,
+    )
+    desired_dir = desired_dir / desired_dir_norm
+    desired_yaw = np.arctan2(desired_dir[:, 1], desired_dir[:, 0])
+    yaw_error = (desired_yaw - yaw + np.pi) % (2.0 * np.pi) - np.pi
 
-    collective = 0.48 + altitude_error * 0.22 - vertical_velocity * 0.08
-    roll_rate_cmd = np.clip(-lateral_error * 0.9 + lateral_velocity * 0.45, -6.0, 6.0)
-    pitch_rate_cmd = np.clip(forward_error * 0.9 - forward_velocity * 0.45, -6.0, 6.0)
-    yaw_rate_cmd = np.clip(yaw_error * 2.4 - angular_velocity[:, 2] * 0.35, -4.0, 4.0)
+    yaw_alignment = np.clip(np.cos(yaw_error), 0.0, 1.0)
+    approach_scale = yaw_alignment / (
+        1.0 + 0.22 * np.abs(lateral_error) + 0.18 * np.abs(altitude_error)
+    )
+    forward_velocity_target = (
+        np.clip(
+            (horizontal_distance - 0.6) * 1.2,
+            0.0,
+            6.0,
+        )
+        * approach_scale
+    )
+    lateral_velocity_target = np.clip(lateral_error * 1.0, -4.0, 4.0)
+    vertical_velocity_target = np.clip(altitude_error * 0.9, -2.5, 2.5)
+    yaw_rate_target = np.clip(yaw_error * 2.2, -3.5, 3.5)
 
-    actions[:, 0] = np.clip(collective, 0.0, 1.0)
-    actions[:, 1] = np.clip(0.5 + roll_rate_cmd / 15.0, 0.0, 1.0)
-    actions[:, 2] = np.clip(0.5 + pitch_rate_cmd / 15.0, 0.0, 1.0)
-    actions[:, 3] = np.clip(0.5 + yaw_rate_cmd / 9.0, 0.0, 1.0)
+    actions[:, 0] = np.clip(0.5 + forward_velocity_target / 12.0, 0.0, 1.0)
+    actions[:, 1] = np.clip(0.5 + lateral_velocity_target / 8.0, 0.0, 1.0)
+    actions[:, 2] = np.clip(0.5 + vertical_velocity_target / 5.0, 0.0, 1.0)
+    actions[:, 3] = np.clip(0.5 + yaw_rate_target / 7.0, 0.0, 1.0)
 
 
 class RolloutCollector:

@@ -51,7 +51,6 @@ struct RewardDone {
     done_reason: u32,
     _pad0: u32,
     shaping_reward: f32,
-    proximity_reward: f32,
     out_of_bounds_penalty: f32,
     time_penalty: f32,
     sparse_objective_reward: f32,
@@ -190,14 +189,21 @@ fn hash_to_signed(seed: u32) -> f32 {
     return hash_to_unit(seed) * 2.0 - 1.0;
 }
 
+fn is_bootstrap_stage(curriculum_stage: u32) -> bool {
+    return curriculum_stage == 0u;
+}
+
 fn curriculum_dynamics_scale(curriculum_stage: u32) -> f32 {
-    if (curriculum_stage == 0u) {
-        return 0.35;
+    if (is_bootstrap_stage(curriculum_stage)) {
+        return 0.0;
     }
     if (curriculum_stage == 1u) {
-        return 0.55;
+        return 0.35;
     }
     if (curriculum_stage == 2u) {
+        return 0.55;
+    }
+    if (curriculum_stage == 3u) {
         return 0.8;
     }
     return 1.0;
@@ -226,6 +232,22 @@ fn clamp_pilot_command(command: vec4<f32>) -> vec4<f32> {
 
 fn centered_stick(command: f32) -> f32 {
     return clamp(command, 0.0, 1.0) * 2.0 - 1.0;
+}
+
+fn forward_velocity_target(command: vec4<f32>) -> f32 {
+    return centered_stick(command.x) * 6.0;
+}
+
+fn lateral_velocity_target(command: vec4<f32>) -> f32 {
+    return centered_stick(command.y) * 4.0;
+}
+
+fn vertical_velocity_target(command: vec4<f32>) -> f32 {
+    return centered_stick(command.z) * 2.5;
+}
+
+fn assisted_yaw_rate_target(command: vec4<f32>) -> f32 {
+    return centered_stick(command.w) * 3.5;
 }
 
 fn pilot_collective_thrust(command: vec4<f32>) -> f32 {
@@ -297,6 +319,50 @@ fn project_to_body_frame(attitude: vec3<f32>, world_vector: vec3<f32>) -> vec3<f
         dot(world_vector, right),
         dot(world_vector, up),
         dot(world_vector, forward),
+    );
+}
+
+fn low_level_command_from_velocity_setpoint(
+    command: vec4<f32>,
+    attitude: vec3<f32>,
+    velocity: vec3<f32>,
+    angular_velocity: vec3<f32>,
+    hover_collective: f32,
+) -> vec4<f32> {
+    let body_velocity = project_to_body_frame(attitude, velocity);
+    let desired_roll = clamp(
+        -(lateral_velocity_target(command) - body_velocity.x) * 0.16,
+        -0.45,
+        0.45,
+    );
+    let desired_pitch = clamp(
+        (forward_velocity_target(command) - body_velocity.z) * 0.14,
+        -0.4,
+        0.4,
+    );
+    let roll_rate_target = clamp(
+        (desired_roll - attitude.x) * 6.0 - angular_velocity.x * 0.35,
+        -6.0,
+        6.0,
+    );
+    let pitch_rate_target = clamp(
+        (desired_pitch - attitude.y) * 6.0 - angular_velocity.y * 0.35,
+        -6.0,
+        6.0,
+    );
+    let yaw_rate_target = assisted_yaw_rate_target(command);
+    let vertical_error = vertical_velocity_target(command) - velocity.y;
+    let vertical_comp = hover_collective / max(body_up(attitude).y, 0.55);
+    let collective = clamp(vertical_comp + vertical_error * 0.08, 0.15, 0.92);
+    return clamp(
+        vec4<f32>(
+            collective,
+            0.5 + roll_rate_target / 15.0,
+            0.5 + pitch_rate_target / 15.0,
+            0.5 + yaw_rate_target / 9.0,
+        ),
+        vec4<f32>(0.0),
+        vec4<f32>(1.0),
     );
 }
 
@@ -535,11 +601,6 @@ fn gate_approach_activation(gate: Gate, distance_to_gate: f32) -> f32 {
     return 1.0 - clamp(distance_to_gate / gate_scale, 0.0, 1.0);
 }
 
-fn gate_proximity_reward(gate: Gate, distance_to_gate: f32) -> f32 {
-    let proximity = gate_approach_activation(gate, distance_to_gate);
-    return proximity * proximity * 0.00075;
-}
-
 fn segment_start_for_target_gate(
     index: u32,
     current_gate: u32,
@@ -723,13 +784,13 @@ fn obstacle_collision(obstacle: Gate, position: vec3<f32>, attitude: vec3<f32>) 
 }
 
 fn family_segment_count(curriculum_stage: u32, grammar_id: u32) -> u32 {
-    if (curriculum_stage == 0u) {
+    if (curriculum_stage == 1u) {
         return 1u;
     }
-    if (curriculum_stage == 1u) {
+    if (curriculum_stage == 2u) {
         return 4u;
     }
-    if (curriculum_stage == 2u) {
+    if (curriculum_stage == 3u) {
         if (grammar_id == 3u) {
             return 5u;
         }
@@ -740,49 +801,49 @@ fn family_segment_count(curriculum_stage: u32, grammar_id: u32) -> u32 {
 
 fn curriculum_family(curriculum_stage: u32, grammar_id: u32) -> u32 {
     let family = grammar_id % 4u;
-    if (curriculum_stage == 0u) {
+    if (curriculum_stage == 1u) {
         return family % 2u;
     }
-    if (curriculum_stage == 1u) {
+    if (curriculum_stage == 2u) {
         return family % 3u;
     }
     return family;
 }
 
 fn curriculum_length_scale(curriculum_stage: u32) -> f32 {
-    if (curriculum_stage == 0u) {
+    if (curriculum_stage == 1u) {
         return 0.82;
     }
-    if (curriculum_stage == 1u) {
+    if (curriculum_stage == 2u) {
         return 1.08;
     }
-    if (curriculum_stage == 2u) {
+    if (curriculum_stage == 3u) {
         return 1.0;
     }
     return 1.14;
 }
 
 fn curriculum_vertical_scale(curriculum_stage: u32) -> f32 {
-    if (curriculum_stage == 0u) {
+    if (curriculum_stage == 1u) {
         return 0.02;
     }
-    if (curriculum_stage == 1u) {
+    if (curriculum_stage == 2u) {
         return 0.3;
     }
-    if (curriculum_stage == 2u) {
+    if (curriculum_stage == 3u) {
         return 0.85;
     }
     return 1.35;
 }
 
 fn curriculum_hole_scale(curriculum_stage: u32) -> f32 {
-    if (curriculum_stage == 0u) {
+    if (curriculum_stage == 1u) {
         return 1.4;
     }
-    if (curriculum_stage == 1u) {
+    if (curriculum_stage == 2u) {
         return 1.12;
     }
-    if (curriculum_stage == 3u) {
+    if (curriculum_stage == 4u) {
         return 0.92;
     }
     return 1.0;
@@ -798,10 +859,10 @@ fn family_segment_length(
 ) -> f32 {
     var base = 8.0;
     var jitter = 0.9;
-    if (curriculum_stage == 0u) {
+    if (curriculum_stage == 1u) {
         base = 7.2;
         jitter = 0.2;
-    } else if (curriculum_stage == 1u) {
+    } else if (curriculum_stage == 2u) {
         if (grammar_id == 0u) {
             if (segment_index == 0u) {
                 base = 10.8;
@@ -834,7 +895,7 @@ fn family_segment_length(
             }
         }
         jitter = 0.7;
-    } else if (curriculum_stage == 2u) {
+    } else if (curriculum_stage == 3u) {
         if (grammar_id == 0u) {
             if (segment_index == 0u) {
                 base = 10.5;
@@ -942,7 +1003,7 @@ fn family_segment_length(
 
 fn family_turn_radians(curriculum_stage: u32, grammar_id: u32, segment_index: u32) -> f32 {
     let quarter_turn = 1.5707963267948966;
-    if (curriculum_stage == 0u) {
+    if (curriculum_stage == 1u) {
         if (grammar_id == 0u) {
             if (segment_index == 0u) {
                 return 0.18;
@@ -960,7 +1021,7 @@ fn family_turn_radians(curriculum_stage: u32, grammar_id: u32, segment_index: u3
         }
         return 0.0;
     }
-    if (curriculum_stage == 1u) {
+    if (curriculum_stage == 2u) {
         if (grammar_id == 0u) {
             if (segment_index == 0u) {
                 return 0.34;
@@ -996,7 +1057,7 @@ fn family_turn_radians(curriculum_stage: u32, grammar_id: u32, segment_index: u3
         }
         return 0.0;
     }
-    if (curriculum_stage == 2u) {
+    if (curriculum_stage == 3u) {
         if (grammar_id == 0u) {
             if (segment_index == 0u) {
                 return quarter_turn;
@@ -1234,6 +1295,32 @@ fn minimum_previous_gate_exit_distance(previous_gate: Gate) -> f32 {
     return max(previous_gate.half_extents.x, previous_gate.half_extents.y) + 1.4;
 }
 
+fn bootstrap_target_gate(seed: u32, difficulty: f32) -> Gate {
+    let course_angle = hash_to_unit(seed ^ 0x12345u) * 6.283185307179586;
+    let gate_forward = vec3<f32>(cos(course_angle), 0.0, sin(course_angle));
+    let gate_right = gate_right_axis(gate_forward);
+    let approach_distance = 2.35 + hash_to_unit(seed ^ 0x5101u) * 0.18 + difficulty * 0.05;
+    let lateral_offset = hash_to_signed(seed ^ 0x5103u) * (0.08 + difficulty * 0.04);
+    let hole_half_width = 1.18 - difficulty * 0.02;
+    let hole_half_height = 1.18 - difficulty * 0.02;
+    let min_gate_center_y =
+        params.min_altitude + hole_half_height + params.gate_frame_thickness + 0.12;
+    let center =
+        gate_forward * approach_distance
+        + gate_right * lateral_offset
+        + vec3<f32>(0.0, min_gate_center_y + hash_to_unit(seed ^ 0x5105u) * 0.02, 0.0);
+    var gate: Gate;
+    gate.center = vec4<f32>(center, 0.0);
+    gate.forward = vec4<f32>(gate_forward, 0.0);
+    gate.half_extents = vec4<f32>(
+        hole_half_width,
+        hole_half_height,
+        params.gate_depth_half,
+        0.0,
+    );
+    return gate;
+}
+
 fn previous_target_gate(index: u32, current_gate: u32, current_lap: u32) -> Gate {
     let gate_count = max(configured_gate_count(index), 1u);
     if (current_gate > 0u) {
@@ -1255,14 +1342,17 @@ fn has_cleared_previous_gate_zone(index: u32, state: EnvState, position: vec3<f3
 }
 
 fn curriculum_gate_count(curriculum_stage: u32, base_gate_count: u32) -> u32 {
-    if (curriculum_stage == 0u) {
-        return min(max(base_gate_count, 4u), 4u);
+    if (is_bootstrap_stage(curriculum_stage)) {
+        return 1u;
     }
     if (curriculum_stage == 1u) {
-        return clamp((base_gate_count * 2u) / 3u, 7u, 9u);
+        return min(max(base_gate_count, 2u), 2u);
     }
     if (curriculum_stage == 2u) {
-        return max(select(0u, base_gate_count - 2u, base_gate_count >= 2u), 8u);
+        return clamp((base_gate_count + 1u) / 2u, 4u, 6u);
+    }
+    if (curriculum_stage == 3u) {
+        return clamp(max(select(0u, base_gate_count - 2u, base_gate_count >= 2u), 1u), 6u, 8u);
     }
     return base_gate_count;
 }
@@ -1274,111 +1364,115 @@ fn reset_env(index: u32) {
         min(course_header.total_gate_count, params.max_gates_per_env),
     );
     let base_slot = env_gate_offset(index);
-    let family_id = curriculum_family(reset.curriculum_stage, reset.grammar_id);
     layout_headers.values[index].gate_count = count;
     layout_headers.values[index].obstacle_count = 0u;
-
-    let course_angle =
-        hash_to_unit(reset.seed ^ 0x12345u) * 6.283185307179586
-        + f32(family_id) * 0.37;
-    let base_total_path_length = path_total_length(
-        family_id,
-        reset.seed,
-        reset.difficulty,
-        reset.curriculum_stage,
-        1.0,
-    );
-    let path_scale = family_path_scale(count, reset.difficulty, base_total_path_length);
-    let total_path_length = path_total_length(
-        family_id,
-        reset.seed,
-        reset.difficulty,
-        reset.curriculum_stage,
-        path_scale,
-    );
-    let entry_margin = min(1.8, total_path_length * 0.12);
-    let exit_margin = min(1.2, total_path_length * 0.08);
-    let usable_length = max(total_path_length - entry_margin - exit_margin, 0.5);
     var gate_index = 0u;
-
-    loop {
-        if (gate_index >= count) {
-            break;
-        }
-
-        let gate_t = select(
-            0.5,
-            f32(gate_index) / max(f32(count - 1u), 1.0),
-            count > 1u,
-        );
-        var distance_along_path = entry_margin + gate_t * usable_length;
-        if (gate_index > 0u) {
-            let previous_gate_t = f32(gate_index - 1u) / max(f32(count - 1u), 1.0);
-            let previous_distance = entry_margin + previous_gate_t * usable_length;
-            distance_along_path = max(
-                distance_along_path,
-                previous_distance + minimum_gate_path_spacing(reset.difficulty),
-            );
-            distance_along_path = min(entry_margin + usable_length, distance_along_path);
-        }
-        var gate = sample_family_path(
+    if (is_bootstrap_stage(reset.curriculum_stage)) {
+        gates.values[base_slot] = bootstrap_target_gate(reset.seed, reset.difficulty);
+        gate_index = 1u;
+    } else {
+        let family_id = curriculum_family(reset.curriculum_stage, reset.grammar_id);
+        let course_angle =
+            hash_to_unit(reset.seed ^ 0x12345u) * 6.283185307179586
+            + f32(family_id) * 0.37;
+        let base_total_path_length = path_total_length(
             family_id,
             reset.seed,
             reset.difficulty,
             reset.curriculum_stage,
-            course_angle,
-            distance_along_path,
+            1.0,
+        );
+        let path_scale = family_path_scale(count, reset.difficulty, base_total_path_length);
+        let total_path_length = path_total_length(
+            family_id,
+            reset.seed,
+            reset.difficulty,
+            reset.curriculum_stage,
             path_scale,
         );
-        if (gate_index > 0u) {
-            let previous_gate = gates.values[gate_slot(index, gate_index - 1u)];
-            var adjustment = 0u;
-            loop {
-                let gate_spacing = distance(gate.center.xyz, previous_gate.center.xyz);
-                if (gate_spacing >= minimum_gate_separation(reset.difficulty) || adjustment >= 6u) {
-                    break;
-                }
-                let pull_forward = 1.2 + f32(adjustment) * 0.7;
-                distance_along_path = min(entry_margin + usable_length, distance_along_path + pull_forward);
-                gate = sample_family_path(
-                    family_id,
-                    reset.seed,
-                    reset.difficulty,
-                    reset.curriculum_stage,
-                    course_angle,
-                    distance_along_path,
-                    path_scale,
-                );
-                adjustment = adjustment + 1u;
-            }
-        }
-        gates.values[gate_slot(index, gate_index)] = gate;
-        gate_index = gate_index + 1u;
-    }
+        let entry_margin = min(1.8, total_path_length * 0.12);
+        let exit_margin = min(1.2, total_path_length * 0.08);
+        let usable_length = max(total_path_length - entry_margin - exit_margin, 0.5);
 
-    if (count > 1u) {
-        let first_gate = gates.values[base_slot];
-        let last_slot = gate_slot(index, count - 1u);
-        var last_gate = gates.values[last_slot];
-        var adjustment = 0u;
         loop {
-            let closure_distance = distance(last_gate.center.xyz, first_gate.center.xyz);
-            if (closure_distance >= 4.2 || adjustment >= 5u) {
+            if (gate_index >= count) {
                 break;
             }
-            let pullback = (f32(adjustment) + 1.0) * 1.9;
-            let adjusted_distance = entry_margin + max(usable_length - pullback, 0.5);
-            last_gate = sample_family_path(
+
+            let gate_t = select(
+                0.5,
+                f32(gate_index) / max(f32(count - 1u), 1.0),
+                count > 1u,
+            );
+            var distance_along_path = entry_margin + gate_t * usable_length;
+            if (gate_index > 0u) {
+                let previous_gate_t = f32(gate_index - 1u) / max(f32(count - 1u), 1.0);
+                let previous_distance = entry_margin + previous_gate_t * usable_length;
+                distance_along_path = max(
+                    distance_along_path,
+                    previous_distance + minimum_gate_path_spacing(reset.difficulty),
+                );
+                distance_along_path = min(entry_margin + usable_length, distance_along_path);
+            }
+            var gate = sample_family_path(
                 family_id,
                 reset.seed,
                 reset.difficulty,
                 reset.curriculum_stage,
                 course_angle,
-                adjusted_distance,
+                distance_along_path,
                 path_scale,
             );
-            gates.values[last_slot] = last_gate;
-            adjustment = adjustment + 1u;
+            if (gate_index > 0u) {
+                let previous_gate = gates.values[gate_slot(index, gate_index - 1u)];
+                var adjustment = 0u;
+                loop {
+                    let gate_spacing = distance(gate.center.xyz, previous_gate.center.xyz);
+                    if (gate_spacing >= minimum_gate_separation(reset.difficulty) || adjustment >= 6u) {
+                        break;
+                    }
+                    let pull_forward = 1.2 + f32(adjustment) * 0.7;
+                    distance_along_path = min(entry_margin + usable_length, distance_along_path + pull_forward);
+                    gate = sample_family_path(
+                        family_id,
+                        reset.seed,
+                        reset.difficulty,
+                        reset.curriculum_stage,
+                        course_angle,
+                        distance_along_path,
+                        path_scale,
+                    );
+                    adjustment = adjustment + 1u;
+                }
+            }
+            gates.values[gate_slot(index, gate_index)] = gate;
+            gate_index = gate_index + 1u;
+        }
+
+        if (count > 1u) {
+            let first_gate = gates.values[base_slot];
+            let last_slot = gate_slot(index, count - 1u);
+            var last_gate = gates.values[last_slot];
+            var adjustment = 0u;
+            loop {
+                let closure_distance = distance(last_gate.center.xyz, first_gate.center.xyz);
+                if (closure_distance >= 4.2 || adjustment >= 5u) {
+                    break;
+                }
+                let pullback = (f32(adjustment) + 1.0) * 1.9;
+                let adjusted_distance = entry_margin + max(usable_length - pullback, 0.5);
+                last_gate = sample_family_path(
+                    family_id,
+                    reset.seed,
+                    reset.difficulty,
+                    reset.curriculum_stage,
+                    course_angle,
+                    adjusted_distance,
+                    path_scale,
+                );
+                gates.values[last_slot] = last_gate;
+                adjustment = adjustment + 1u;
+            }
         }
     }
 
@@ -1454,20 +1548,29 @@ fn reset_env(index: u32) {
     let first_gate = gates.values[base_slot];
     let gate_forward = normalize(first_gate.forward.xyz);
     let gate_right = gate_right_axis(gate_forward);
+    let bootstrap_stage = is_bootstrap_stage(reset.curriculum_stage);
     let spawn_offset_scale =
-        (0.08 + reset.difficulty * 0.18) * params.spawn_randomization_scale;
+        select(
+            (0.08 + reset.difficulty * 0.18) * params.spawn_randomization_scale,
+            (0.003 + reset.difficulty * 0.007) * params.spawn_randomization_scale,
+            bootstrap_stage,
+        );
     let lateral_spawn_offset =
         (hash_to_unit(reset.seed ^ 0x611u) - 0.5) * 2.0 * spawn_offset_scale;
     let vertical_spawn_offset =
-        (hash_to_unit(reset.seed ^ 0x977u) - 0.5) * 0.12 * params.spawn_randomization_scale;
+        (hash_to_unit(reset.seed ^ 0x977u) - 0.5)
+        * select(0.12, 0.01, bootstrap_stage)
+        * params.spawn_randomization_scale;
     let yaw_offset =
-        (hash_to_unit(reset.seed ^ 0x1551u) - 0.5) * 0.5 * params.spawn_randomization_scale;
+        (hash_to_unit(reset.seed ^ 0x1551u) - 0.5)
+        * select(0.5, 0.015, bootstrap_stage)
+        * params.spawn_randomization_scale;
     let start_yaw = atan2(first_gate.forward.z, first_gate.forward.x) + yaw_offset;
     var start_position =
         first_gate.center.xyz
-        - gate_forward * 1.2
+        - gate_forward * select(1.2, 1.45 + reset.difficulty * 0.04, bootstrap_stage)
         + gate_right * lateral_spawn_offset
-        + vec3<f32>(0.0, 0.2 + vertical_spawn_offset, 0.0);
+        + vec3<f32>(0.0, 0.14 + vertical_spawn_offset, 0.0);
     let spawn_floor_clearance =
         params.min_altitude
         + drone_support_extent(gate_up_axis(), vec3<f32>(0.0, 0.0, start_yaw))
@@ -1476,17 +1579,29 @@ fn reset_env(index: u32) {
     let start_forward = vec3<f32>(cos(start_yaw), 0.0, sin(start_yaw));
     let start_right = vec3<f32>(start_forward.z, 0.0, -start_forward.x);
     let forward_velocity =
-        (hash_to_unit(reset.seed ^ 0x2001u) - 0.5) * 0.5 * params.spawn_randomization_scale;
+        (hash_to_unit(reset.seed ^ 0x2001u) - 0.5)
+        * select(0.5, 0.01, bootstrap_stage)
+        * params.spawn_randomization_scale;
     let lateral_velocity =
-        (hash_to_unit(reset.seed ^ 0x2003u) - 0.5) * 0.35 * params.spawn_randomization_scale;
+        (hash_to_unit(reset.seed ^ 0x2003u) - 0.5)
+        * select(0.35, 0.006, bootstrap_stage)
+        * params.spawn_randomization_scale;
     let vertical_velocity =
-        (hash_to_unit(reset.seed ^ 0x2005u) - 0.5) * 0.2 * params.spawn_randomization_scale;
+        (hash_to_unit(reset.seed ^ 0x2005u) - 0.5)
+        * select(0.2, 0.004, bootstrap_stage)
+        * params.spawn_randomization_scale;
     let roll_rate =
-        (hash_to_unit(reset.seed ^ 0x3001u) - 0.5) * 0.3 * params.spawn_randomization_scale;
+        (hash_to_unit(reset.seed ^ 0x3001u) - 0.5)
+        * select(0.3, 0.004, bootstrap_stage)
+        * params.spawn_randomization_scale;
     let pitch_rate =
-        (hash_to_unit(reset.seed ^ 0x3003u) - 0.5) * 0.3 * params.spawn_randomization_scale;
+        (hash_to_unit(reset.seed ^ 0x3003u) - 0.5)
+        * select(0.3, 0.004, bootstrap_stage)
+        * params.spawn_randomization_scale;
     let yaw_rate =
-        (hash_to_unit(reset.seed ^ 0x3005u) - 0.5) * 0.35 * params.spawn_randomization_scale;
+        (hash_to_unit(reset.seed ^ 0x3005u) - 0.5)
+        * select(0.35, 0.006, bootstrap_stage)
+        * params.spawn_randomization_scale;
     let reset_dynamics_strength =
         (0.04 + clamp(reset.difficulty, 0.0, 1.0) * 0.18)
         * curriculum_dynamics_scale(reset.curriculum_stage)
@@ -1561,7 +1676,6 @@ fn reset_env(index: u32) {
     reward_done.values[index].done_reason = DONE_REASON_NONE;
     reward_done.values[index]._pad0 = 0u;
     reward_done.values[index].shaping_reward = 0.0;
-    reward_done.values[index].proximity_reward = 0.0;
     reward_done.values[index].out_of_bounds_penalty = 0.0;
     reward_done.values[index].time_penalty = 0.0;
     reward_done.values[index].sparse_objective_reward = 0.0;
@@ -1720,8 +1834,21 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         ),
     );
     var attitude = state.attitude.xyz;
-    let motor_target = motor_target_from_pilot_command(
+    let mean_motor_gain = max(dot(motor_gain, vec4<f32>(0.25)), 0.25);
+    let hover_collective = clamp(
+        (mass * gravity) / (4.0 * thrust_scale * mean_motor_gain),
+        0.15,
+        0.85,
+    );
+    let low_level_command = low_level_command_from_velocity_setpoint(
         command,
+        attitude,
+        state.velocity.xyz,
+        state.angular_velocity.xyz,
+        hover_collective,
+    );
+    let motor_target = motor_target_from_pilot_command(
+        low_level_command,
         state.angular_velocity.xyz,
     );
     state.motor_thrust = state.motor_thrust
@@ -1842,6 +1969,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             delta = target_gate.center.xyz - state.position.xyz;
             distance_to_gate = length(delta);
         } else {
+            // Mark terminal progress as fully complete so eval promotion can
+            // distinguish successful course completion from near-misses.
+            state.current_gate = gate_count;
             state.done = 1u;
             done_reason = done_reason | DONE_REASON_COMPLETE;
         }
@@ -1887,21 +2017,16 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     write_observation(index, state, target_gate, gate_count);
 
     let progress_delta = current_segment_progress - previous_segment_progress;
-    let progress_reward = clamp(progress_delta, -0.25, 0.25) * 1.35;
-    let approach_activation = gate_approach_activation(prev_target_gate, prev_gate_distance);
-    let centering_reward =
-        max(gate_centering_score(prev_target_gate, prev_gate_delta), 0.0) * 0.03 * approach_activation;
-    let alignment_reward =
-        gate_velocity_alignment(prev_target_gate, state.velocity.xyz) * 0.05 * approach_activation;
-    let proximity_reward = gate_proximity_reward(prev_target_gate, prev_gate_distance);
-    let shaping_reward =
-        progress_reward + centering_reward + alignment_reward + proximity_reward;
+    let forward_progress = clamp(progress_delta, 0.0, 0.25);
+    let backward_progress = clamp(-progress_delta, 0.0, 0.25);
+    let progress_reward = forward_progress * 0.35 - backward_progress * 0.6;
+    let shaping_reward = progress_reward;
     let gate_age_seconds = f32(state.gate_age_steps) * params.dt_seconds;
     let collision_happened = collided_gate || collided_obstacle || collided_world;
     let pass_speed_bonus = min(gate_forward_speed(prev_target_gate, state.velocity.xyz), 12.0) * 0.35;
     let sparse_objective_reward =
         select(0.0, 8.0 + pass_speed_bonus, passed_gate)
-        + select(0.0, 12.0, (done_reason & DONE_REASON_COMPLETE) != 0u);
+        + select(0.0, 32.0, (done_reason & DONE_REASON_COMPLETE) != 0u);
     let time_penalty = 0.001 + min(max(gate_age_seconds - 1.5, 0.0) * 0.012, 0.05);
     let collision_penalty = select(0.0, params.collision_penalty, collision_happened);
     let out_of_bounds_penalty = select(0.0, 24.0, out_of_bounds);
@@ -1915,7 +2040,6 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     reward_done.values[index].done_reason = done_reason;
     reward_done.values[index]._pad0 = 0u;
     reward_done.values[index].shaping_reward = shaping_reward;
-    reward_done.values[index].proximity_reward = proximity_reward;
     reward_done.values[index].out_of_bounds_penalty = out_of_bounds_penalty;
     reward_done.values[index].time_penalty = time_penalty;
     reward_done.values[index].sparse_objective_reward = sparse_objective_reward;
@@ -1961,7 +2085,7 @@ impl Action {
 
     #[must_use]
     pub fn idle() -> Self {
-        Self::new([0.0, 0.5, 0.5, 0.5])
+        Self::new([0.5, 0.5, 0.5, 0.5])
     }
 }
 
@@ -2003,7 +2127,6 @@ pub struct RewardDone {
     pub done_reason: u32,
     pub _pad: u32,
     pub shaping_reward: f32,
-    pub proximity_reward: f32,
     pub out_of_bounds_penalty: f32,
     pub time_penalty: f32,
     pub sparse_objective_reward: f32,
@@ -2195,7 +2318,7 @@ impl GpuSimulation {
             drone_half_extents: [0.10, 0.045, 0.10, 0.0],
             gate_frame_thickness: 0.08,
             gate_depth_half: 0.04,
-            collision_penalty: 8.0,
+            collision_penalty: 14.0,
             dynamics_randomization_scale: config.dynamics_randomization_scale,
             actuator_randomization_scale: config.actuator_randomization_scale,
             spawn_randomization_scale: config.spawn_randomization_scale,

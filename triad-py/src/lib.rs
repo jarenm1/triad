@@ -16,10 +16,11 @@ const STAGE_KIND_INTRO: u32 = 0;
 const STAGE_KIND_STRAIGHT: u32 = 1;
 const STAGE_KIND_OFFSET: u32 = 2;
 const STAGE_KIND_TURN90: u32 = 3;
-const CURRICULUM_STAGE_INTRO: u32 = 0;
-const CURRICULUM_STAGE_ARENA: u32 = 1;
-const CURRICULUM_STAGE_TECHNICAL: u32 = 2;
-const CURRICULUM_STAGE_ELEVATED: u32 = 3;
+const CURRICULUM_STAGE_BOOTSTRAP: u32 = 0;
+const CURRICULUM_STAGE_INTRO: u32 = 1;
+const CURRICULUM_STAGE_ARENA: u32 = 2;
+const CURRICULUM_STAGE_TECHNICAL: u32 = 3;
+const CURRICULUM_STAGE_ELEVATED: u32 = 4;
 const ACTION_STRIDE: usize = 4;
 const OBSERVATION_STRIDE: usize = 37;
 
@@ -191,7 +192,6 @@ pub struct TriadRewardDone {
     pub done_reason: u32,
     pub _pad0: u32,
     pub shaping_reward: f32,
-    pub proximity_reward: f32,
     pub out_of_bounds_penalty: f32,
     pub time_penalty: f32,
     pub sparse_objective_reward: f32,
@@ -477,7 +477,6 @@ fn convert_reward_done(reward_done: &RewardDone) -> TriadRewardDone {
         done_reason: reward_done.done_reason,
         _pad0: reward_done._pad,
         shaping_reward: reward_done.shaping_reward,
-        proximity_reward: reward_done.proximity_reward,
         out_of_bounds_penalty: reward_done.out_of_bounds_penalty,
         time_penalty: reward_done.time_penalty,
         sparse_objective_reward: reward_done.sparse_objective_reward,
@@ -1263,6 +1262,12 @@ pub extern "C" fn triad_turn_direction_left() -> u32 {
 pub extern "C" fn triad_turn_direction_right() -> u32 {
     clear_last_error();
     TURN_DIRECTION_RIGHT
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn triad_curriculum_stage_bootstrap() -> u32 {
+    clear_last_error();
+    CURRICULUM_STAGE_BOOTSTRAP
 }
 
 #[unsafe(no_mangle)]
