@@ -86,21 +86,17 @@ def _require(success: bool) -> None:
         raise RuntimeError(_last_error_message())
 
 
-def _pilot_action(action: Sequence[float]) -> _TriadAction:
+def _motor_action(action: Sequence[float]) -> _TriadAction:
     if len(action) != ACTION_STRIDE:
         raise ValueError(
-            f"expected {ACTION_STRIDE} pilot control values per action, got {len(action)}"
+            f"expected {ACTION_STRIDE} motor commands per action, got {len(action)}"
         )
     return _TriadAction(
-        collective_thrust=float(action[0]),
-        roll_rate=float(action[1]),
-        pitch_rate=float(action[2]),
-        yaw_rate=float(action[3]),
+        motor_0=float(action[0]),
+        motor_1=float(action[1]),
+        motor_2=float(action[2]),
+        motor_3=float(action[3]),
     )
-
-
-def _idle_action_values(env_count: int) -> list[float]:
-    return [0.5, 0.5, 0.5, 0.5] * env_count
 
 
 @lru_cache(maxsize=1)
@@ -140,6 +136,7 @@ class DoneReason(IntFlag):
     FLOOR_COLLISION = 1 << 3
     OUT_OF_BOUNDS = 1 << 4
     STEP_LIMIT = 1 << 5
+    EXCESSIVE_TILT = 1 << 6
 
 
 class _TriadStageDesc(ctypes.Structure):
@@ -182,10 +179,10 @@ class _TriadSimConfig(ctypes.Structure):
 
 class _TriadAction(ctypes.Structure):
     _fields_ = [
-        ("collective_thrust", ctypes.c_float),
-        ("roll_rate", ctypes.c_float),
-        ("pitch_rate", ctypes.c_float),
-        ("yaw_rate", ctypes.c_float),
+        ("motor_0", ctypes.c_float),
+        ("motor_1", ctypes.c_float),
+        ("motor_2", ctypes.c_float),
+        ("motor_3", ctypes.c_float),
     ]
 
 
@@ -247,21 +244,7 @@ class _TriadObservation(ctypes.Structure):
         ("distance_to_gate", ctypes.c_float),
         ("gate_alignment", ctypes.c_float),
         ("mean_motor_thrust", ctypes.c_float),
-        ("privileged_velocity_body_x", ctypes.c_float),
-        ("privileged_velocity_body_y", ctypes.c_float),
-        ("privileged_velocity_body_z", ctypes.c_float),
-        ("privileged_target_gate_body_x", ctypes.c_float),
-        ("privileged_target_gate_body_y", ctypes.c_float),
-        ("privileged_target_gate_body_z", ctypes.c_float),
-        ("privileged_target_gate_forward_body_x", ctypes.c_float),
-        ("privileged_target_gate_forward_body_y", ctypes.c_float),
-        ("privileged_target_gate_forward_body_z", ctypes.c_float),
-        ("privileged_next_gate_body_x", ctypes.c_float),
-        ("privileged_next_gate_body_y", ctypes.c_float),
-        ("privileged_next_gate_body_z", ctypes.c_float),
-        ("privileged_next_gate_forward_body_x", ctypes.c_float),
-        ("privileged_next_gate_forward_body_y", ctypes.c_float),
-        ("privileged_next_gate_forward_body_z", ctypes.c_float),
+        ("_pad5", ctypes.c_float),
     ]
 
 
@@ -272,7 +255,8 @@ class _TriadRewardDone(ctypes.Structure):
         ("done_reason", ctypes.c_uint32),
         ("_pad0", ctypes.c_uint32),
         ("shaping_reward", ctypes.c_float),
-        ("out_of_bounds_penalty", ctypes.c_float),
+        ("_unused_reward0", ctypes.c_float),
+        ("_unused_reward1", ctypes.c_float),
         ("time_penalty", ctypes.c_float),
         ("sparse_objective_reward", ctypes.c_float),
         ("collision_penalty", ctypes.c_float),
@@ -695,7 +679,7 @@ class SimulationCore:
 
     def set_actions(self, actions: Sequence[Sequence[float]]) -> "SimulationCore":
         ffi_actions = (_TriadAction * len(actions))(
-            *(_pilot_action(action) for action in actions)
+            *(_motor_action(action) for action in actions)
         )
         _require(
             _lib.triad_simulation_set_actions(self._handle, ffi_actions, len(actions))
@@ -780,7 +764,7 @@ class SimulationCore:
         self, actions: Sequence[Sequence[float]], steps: int = 1
     ) -> PackedStepResult:
         ffi_actions = (_TriadAction * len(actions))(
-            *(_pilot_action(action) for action in actions)
+            *(_motor_action(action) for action in actions)
         )
         observations = self._allocate_flat_observation_buffer()
         rewards = self._allocate_reward_buffer()
@@ -910,31 +894,6 @@ class SimulationCore:
                 "distance_to_gate": float(value.distance_to_gate),
                 "gate_alignment": float(value.gate_alignment),
                 "mean_motor_thrust": float(value.mean_motor_thrust),
-                "privileged_velocity_body": [
-                    float(value.privileged_velocity_body_x),
-                    float(value.privileged_velocity_body_y),
-                    float(value.privileged_velocity_body_z),
-                ],
-                "privileged_target_gate_body": [
-                    float(value.privileged_target_gate_body_x),
-                    float(value.privileged_target_gate_body_y),
-                    float(value.privileged_target_gate_body_z),
-                ],
-                "privileged_target_gate_forward_body": [
-                    float(value.privileged_target_gate_forward_body_x),
-                    float(value.privileged_target_gate_forward_body_y),
-                    float(value.privileged_target_gate_forward_body_z),
-                ],
-                "privileged_next_gate_body": [
-                    float(value.privileged_next_gate_body_x),
-                    float(value.privileged_next_gate_body_y),
-                    float(value.privileged_next_gate_body_z),
-                ],
-                "privileged_next_gate_forward_body": [
-                    float(value.privileged_next_gate_forward_body_x),
-                    float(value.privileged_next_gate_forward_body_y),
-                    float(value.privileged_next_gate_forward_body_z),
-                ],
             }
             for value in values
         ]
@@ -958,7 +917,6 @@ class SimulationCore:
                     and int(value.done_reason) & int(reason)
                 ],
                 "shaping_reward": float(value.shaping_reward),
-                "out_of_bounds_penalty": float(value.out_of_bounds_penalty),
                 "time_penalty": float(value.time_penalty),
                 "sparse_objective_reward": float(value.sparse_objective_reward),
                 "collision_penalty": float(value.collision_penalty),
@@ -1038,7 +996,6 @@ class TriadFastVecEnv:
         self.sim = sim
         self.auto_reset = auto_reset
         self._action_values = self.sim.create_action_buffer()
-        self._action_values[:] = _idle_action_values(self.sim.env_count)
         self._result = PackedStepResult(
             observations=self.sim._allocate_flat_observation_buffer(),
             rewards=self.sim._allocate_reward_buffer(),
@@ -1089,15 +1046,15 @@ class TriadFastVecEnv:
         else:
             if len(actions) != self.sim.env_count:
                 raise ValueError(
-                    f"expected {self.sim.env_count} pilot command rows or {len(self._action_values)} flat values, got {len(actions)}"
+                    f"expected {self.sim.env_count} motor command rows or {len(self._action_values)} flat values, got {len(actions)}"
                 )
             write_index = 0
             for action in actions:
-                pilot_action = _pilot_action(action)
-                self._action_values[write_index] = pilot_action.collective_thrust
-                self._action_values[write_index + 1] = pilot_action.roll_rate
-                self._action_values[write_index + 2] = pilot_action.pitch_rate
-                self._action_values[write_index + 3] = pilot_action.yaw_rate
+                motor_action = _motor_action(action)
+                self._action_values[write_index] = motor_action.motor_0
+                self._action_values[write_index + 1] = motor_action.motor_1
+                self._action_values[write_index + 2] = motor_action.motor_2
+                self._action_values[write_index + 3] = motor_action.motor_3
                 write_index += ACTION_STRIDE
         return self.step_in_place(1)
 
@@ -1298,7 +1255,6 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--run-name", default=None)
     ppo_train.add_argument("--tensorboard-dir", default="runs")
     ppo_train.add_argument("--checkpoint", default=None)
-    ppo_train.add_argument("--resume", default=None)
     ppo_train.add_argument("--checkpoint-interval", type=int, default=0)
     ppo_train.add_argument("--curriculum-eval-interval", type=int, default=10)
     ppo_train.add_argument("--curriculum-eval-env-count", type=int, default=64)
@@ -1310,11 +1266,6 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--curriculum-previous-weight", type=float, default=0.2)
     ppo_train.add_argument("--curriculum-easy-weight", type=float, default=0.1)
     ppo_train.add_argument("--curriculum-holdout-seed", type=int, default=131071)
-    ppo_train.add_argument("--pretrain-updates", type=int, default=32)
-    ppo_train.add_argument("--pretrain-epochs", type=int, default=4)
-    ppo_train.add_argument("--pretrain-minibatch-size", type=int, default=4096)
-    ppo_train.add_argument("--pretrain-bootstrap-weight", type=float, default=0.75)
-    ppo_train.add_argument("--pretrain-intro-weight", type=float, default=0.25)
     ppo_train.add_argument(
         "--no-lr-anneal", action="store_true", help="Disable learning rate annealing"
     )
@@ -1450,7 +1401,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sim = SimulationCore(_demo_config(course))
         try:
             sim.set_course(course).reset_all().step(1)
-            sim.set_actions([(0.5, 0.5, 0.5, 0.5)] * sim.env_count).step(4)
+            sim.set_actions([(0.0, 0.0, 0.0, 0.0)] * sim.env_count).step(4)
             _print_json(
                 {
                     "env_count": sim.env_count,
@@ -1469,7 +1420,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         env = TriadVecEnv(sim)
         try:
             observations = env.reset()
-            step_result = env.step([(0.5, 0.5, 0.5, 0.5)] * sim.env_count)
+            step_result = env.step([(0.0, 0.0, 0.0, 0.0)] * sim.env_count)
             _print_json(
                 {
                     "reset_head": observations[:2],
@@ -1489,7 +1440,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         env = TriadFastVecEnv(sim)
         try:
             observations = env.reset()
-            result = env.step([(0.5, 0.5, 0.5, 0.5)] * sim.env_count)
+            result = env.step([(0.0, 0.0, 0.0, 0.0)] * sim.env_count)
             _print_json(
                 {
                     "reset_obs_len": len(observations),
@@ -1605,7 +1556,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             tensorboard_dir=None if args.no_tensorboard else args.tensorboard_dir,
             run_name=args.run_name,
             checkpoint_path=args.checkpoint,
-            resume_from=args.resume,
             checkpoint_interval=args.checkpoint_interval,
             curriculum_eval_interval=args.curriculum_eval_interval,
             curriculum_eval_env_count=args.curriculum_eval_env_count,
@@ -1617,11 +1567,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             curriculum_previous_weight=args.curriculum_previous_weight,
             curriculum_easy_weight=args.curriculum_easy_weight,
             curriculum_holdout_seed=args.curriculum_holdout_seed,
-            pretrain_updates=args.pretrain_updates,
-            pretrain_epochs=args.pretrain_epochs,
-            pretrain_minibatch_size=args.pretrain_minibatch_size,
-            pretrain_bootstrap_weight=args.pretrain_bootstrap_weight,
-            pretrain_intro_weight=args.pretrain_intro_weight,
         )
         train_ppo(config)
         return 0

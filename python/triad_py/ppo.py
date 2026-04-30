@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - runtime dependency
     nn = None
 
 
-ACTION_SPACE_VERSION = "velocity_yaw_setpoint_v1"
+ACTION_SPACE_VERSION = "velocity_yaw_setpoint_v2"
 OBSERVATION_SPACE_VERSION = "teacher_privileged_v1"
 
 
@@ -523,7 +523,6 @@ def _teacher_point_to_gate_actions(observations: np.ndarray) -> np.ndarray:
     right = np.stack((heading[:, 1], -heading[:, 0]), axis=1)
 
     horizontal_delta = target_delta[:, [0, 2]]
-    forward_error = np.sum(horizontal_delta * heading, axis=1)
     lateral_error = np.sum(horizontal_delta * right, axis=1)
     altitude_error = target_delta[:, 1]
     horizontal_distance = np.linalg.norm(horizontal_delta, axis=1)
@@ -547,21 +546,24 @@ def _teacher_point_to_gate_actions(observations: np.ndarray) -> np.ndarray:
     desired_dir = desired_dir / desired_dir_norm
     desired_yaw = np.arctan2(desired_dir[:, 1], desired_dir[:, 0])
     yaw_error = (desired_yaw - yaw + np.pi) % (2.0 * np.pi) - np.pi
+    gate_right = np.stack((gate_forward_unit[:, 1], -gate_forward_unit[:, 0]), axis=1)
+    cross_track_error = np.abs(np.sum(horizontal_delta * gate_right, axis=1))
 
-    yaw_alignment = np.clip(np.cos(yaw_error), 0.0, 1.0)
-    approach_scale = yaw_alignment / (
-        1.0 + 0.22 * np.abs(lateral_error) + 0.18 * np.abs(altitude_error)
+    yaw_scale = 1.0 - np.clip((np.abs(yaw_error) - 0.16) / 0.32, 0.0, 1.0)
+    cross_track_scale = 1.0 - np.clip((cross_track_error - 0.08) / 0.32, 0.0, 1.0)
+    approach_scale = (yaw_scale * yaw_scale * cross_track_scale) / (
+        1.0 + 0.12 * np.abs(lateral_error) + 0.1 * np.abs(altitude_error)
     )
     forward_velocity_target = (
         np.clip(
             (horizontal_distance - 0.6) * 1.2,
             0.0,
-            6.0,
+            2.6,
         )
         * approach_scale
     )
-    lateral_velocity_target = np.clip(lateral_error * 1.0, -4.0, 4.0)
-    vertical_velocity_target = np.clip(altitude_error * 0.9, -2.5, 2.5)
+    lateral_velocity_target = np.clip(lateral_error * 1.2, -3.0, 3.0)
+    vertical_velocity_target = np.clip(altitude_error * 1.15, -2.0, 2.0)
     yaw_rate_target = np.clip(yaw_error * 2.2, -3.5, 3.5)
 
     actions = np.empty((observations.shape[0], 4), dtype=np.float32)

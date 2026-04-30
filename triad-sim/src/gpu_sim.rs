@@ -324,21 +324,76 @@ fn project_to_body_frame(attitude: vec3<f32>, world_vector: vec3<f32>) -> vec3<f
 
 fn low_level_command_from_velocity_setpoint(
     command: vec4<f32>,
+    curriculum_stage: u32,
+    position: vec3<f32>,
+    target_gate: Gate,
     attitude: vec3<f32>,
     velocity: vec3<f32>,
     angular_velocity: vec3<f32>,
     hover_collective: f32,
 ) -> vec4<f32> {
+    let target_delta = target_gate.center.xyz - position;
+    let horizontal_delta = vec2<f32>(target_delta.x, target_delta.z);
+    let horizontal_distance = length(horizontal_delta);
+    let target_forward = normalize(target_gate.forward.xyz);
+    let gate_right = gate_right_axis(target_forward);
+    let cross_track_error = abs(dot(target_delta, gate_right));
+    let approach_dir = normalize(select(
+        vec2<f32>(target_forward.x, target_forward.z),
+        horizontal_delta,
+        horizontal_distance > 1e-5,
+    ));
+    let gate_align_weight = clamp(1.0 - horizontal_distance / 4.0, 0.0, 1.0);
+    let desired_dir = normalize(
+        approach_dir * (1.0 - gate_align_weight)
+        + vec2<f32>(target_forward.x, target_forward.z) * gate_align_weight,
+    );
+    let desired_yaw = atan2(desired_dir.y, desired_dir.x);
+    let yaw_error_abs = abs(wrap_angle(desired_yaw - attitude.z));
     let body_velocity = project_to_body_frame(attitude, velocity);
+    let bootstrap_stage = is_bootstrap_stage(curriculum_stage);
+    let intro_stage = curriculum_stage == 1u;
+    let forward_speed_limit = select(6.0, select(2.6, 1.8, bootstrap_stage), intro_stage);
+    let lateral_speed_limit = select(4.0, select(3.0, 2.2, bootstrap_stage), intro_stage);
+    let vertical_speed_limit = select(2.5, select(2.0, 1.6, bootstrap_stage), intro_stage);
+    let yaw_full_speed = select(0.3, select(0.16, 0.1, bootstrap_stage), intro_stage);
+    let yaw_zero_speed = select(0.8, select(0.48, 0.28, bootstrap_stage), intro_stage);
+    let cross_track_full_speed = select(0.2, select(0.12, 0.06, bootstrap_stage), intro_stage);
+    let cross_track_zero_speed = select(0.8, select(0.45, 0.22, bootstrap_stage), intro_stage);
+    let yaw_scale =
+        1.0
+        - clamp(
+            (yaw_error_abs - yaw_full_speed) / max(yaw_zero_speed - yaw_full_speed, 1e-5),
+            0.0,
+            1.0,
+        );
+    let cross_track_scale =
+        1.0
+        - clamp(
+            (cross_track_error - cross_track_full_speed)
+                / max(cross_track_zero_speed - cross_track_full_speed, 1e-5),
+            0.0,
+            1.0,
+        );
+    let forward_gate_scale = yaw_scale * yaw_scale * cross_track_scale;
+    let gated_forward_target =
+        min(forward_velocity_target(command), forward_speed_limit) * forward_gate_scale;
+    let gated_lateral_target =
+        clamp(lateral_velocity_target(command), -lateral_speed_limit, lateral_speed_limit);
+    let gated_vertical_target =
+        clamp(vertical_velocity_target(command), -vertical_speed_limit, vertical_speed_limit);
+    let roll_gain = select(0.18, select(0.24, 0.28, bootstrap_stage), intro_stage);
+    let pitch_gain = select(0.14, select(0.12, 0.1, bootstrap_stage), intro_stage);
+    let vertical_gain = select(0.08, select(0.12, 0.16, bootstrap_stage), intro_stage);
     let desired_roll = clamp(
-        -(lateral_velocity_target(command) - body_velocity.x) * 0.16,
-        -0.45,
-        0.45,
+        -(gated_lateral_target - body_velocity.x) * roll_gain,
+        -0.5,
+        0.5,
     );
     let desired_pitch = clamp(
-        (forward_velocity_target(command) - body_velocity.z) * 0.14,
-        -0.4,
-        0.4,
+        (gated_forward_target - body_velocity.z) * pitch_gain,
+        -0.35,
+        0.35,
     );
     let roll_rate_target = clamp(
         (desired_roll - attitude.x) * 6.0 - angular_velocity.x * 0.35,
@@ -351,9 +406,9 @@ fn low_level_command_from_velocity_setpoint(
         6.0,
     );
     let yaw_rate_target = assisted_yaw_rate_target(command);
-    let vertical_error = vertical_velocity_target(command) - velocity.y;
+    let vertical_error = gated_vertical_target - velocity.y;
     let vertical_comp = hover_collective / max(body_up(attitude).y, 0.55);
-    let collective = clamp(vertical_comp + vertical_error * 0.08, 0.15, 0.92);
+    let collective = clamp(vertical_comp + vertical_error * vertical_gain, 0.15, 0.92);
     return clamp(
         vec4<f32>(
             collective,
@@ -1842,6 +1897,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     );
     let low_level_command = low_level_command_from_velocity_setpoint(
         command,
+        reset.curriculum_stage,
+        state.position.xyz,
+        target_gate,
         attitude,
         state.velocity.xyz,
         state.angular_velocity.xyz,

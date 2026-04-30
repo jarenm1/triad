@@ -1577,13 +1577,18 @@ fn autopilot_action(state: EnvState, target_gate: Gate) -> Action {
     let desired_yaw = desired_dir[1].atan2(desired_dir[0]);
     let yaw_error = ((desired_yaw - yaw) + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
         - std::f32::consts::PI;
-    let yaw_alignment = yaw_error.cos().clamp(0.0, 1.0);
-    let approach_scale = yaw_alignment / (1.0 + 0.22 * lateral_error.abs() + 0.18 * delta_y.abs());
+    let gate_right = [gate_forward[1], -gate_forward[0]];
+    let cross_track_error =
+        (horizontal_delta[0] * gate_right[0] + horizontal_delta[1] * gate_right[1]).abs();
+    let yaw_scale = 1.0 - ((yaw_error.abs() - 0.16) / 0.32).clamp(0.0, 1.0);
+    let cross_track_scale = 1.0 - ((cross_track_error - 0.08) / 0.32).clamp(0.0, 1.0);
+    let approach_scale = (yaw_scale * yaw_scale * cross_track_scale)
+        / (1.0 + 0.12 * lateral_error.abs() + 0.1 * delta_y.abs());
 
     let forward_velocity_target =
-        ((horizontal_distance - 0.6) * 1.2).clamp(0.0, 6.0) * approach_scale;
-    let lateral_velocity_target = (lateral_error * 1.0).clamp(-4.0, 4.0);
-    let vertical_velocity_target = (delta_y * 0.9).clamp(-2.5, 2.5);
+        ((horizontal_distance - 0.6) * 1.2).clamp(0.0, 2.6) * approach_scale;
+    let lateral_velocity_target = (lateral_error * 1.2).clamp(-3.0, 3.0);
+    let vertical_velocity_target = (delta_y * 1.15).clamp(-2.0, 2.0);
     let yaw_rate_target = (yaw_error * 2.2).clamp(-3.5, 3.5);
 
     Action::new([
