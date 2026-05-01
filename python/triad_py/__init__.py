@@ -4,7 +4,8 @@ import argparse
 import ctypes
 import json
 import os
-from dataclasses import asdict, dataclass
+import sys
+from dataclasses import asdict, dataclass, fields
 from enum import IntEnum, IntFlag
 from functools import lru_cache
 from pathlib import Path
@@ -186,6 +187,14 @@ class _TriadSimConfig(ctypes.Structure):
         ("time_penalty_cap", ctypes.c_float),
         ("collision_penalty", ctypes.c_float),
         ("out_of_bounds_penalty", ctypes.c_float),
+        ("bootstrap_distance_reward_scale", ctypes.c_float),
+        ("bootstrap_alignment_reward_scale", ctypes.c_float),
+        ("bootstrap_centering_reward_scale", ctypes.c_float),
+        ("bootstrap_velocity_alignment_reward_scale", ctypes.c_float),
+        ("bootstrap_gate_pass_speed_reward_scale", ctypes.c_float),
+        ("bootstrap_time_penalty_scale", ctypes.c_float),
+        ("bootstrap_collision_penalty_scale", ctypes.c_float),
+        ("bootstrap_out_of_bounds_penalty_scale", ctypes.c_float),
     ]
 
 
@@ -497,6 +506,14 @@ class SimulationConfig:
     time_penalty_cap: float
     collision_penalty: float
     out_of_bounds_penalty: float
+    bootstrap_distance_reward_scale: float
+    bootstrap_alignment_reward_scale: float
+    bootstrap_centering_reward_scale: float
+    bootstrap_velocity_alignment_reward_scale: float
+    bootstrap_gate_pass_speed_reward_scale: float
+    bootstrap_time_penalty_scale: float
+    bootstrap_collision_penalty_scale: float
+    bootstrap_out_of_bounds_penalty_scale: float
 
     @classmethod
     def default(cls) -> "SimulationConfig":
@@ -523,6 +540,14 @@ class SimulationConfig:
             time_penalty_cap=config.time_penalty_cap,
             collision_penalty=config.collision_penalty,
             out_of_bounds_penalty=config.out_of_bounds_penalty,
+            bootstrap_distance_reward_scale=config.bootstrap_distance_reward_scale,
+            bootstrap_alignment_reward_scale=config.bootstrap_alignment_reward_scale,
+            bootstrap_centering_reward_scale=config.bootstrap_centering_reward_scale,
+            bootstrap_velocity_alignment_reward_scale=config.bootstrap_velocity_alignment_reward_scale,
+            bootstrap_gate_pass_speed_reward_scale=config.bootstrap_gate_pass_speed_reward_scale,
+            bootstrap_time_penalty_scale=config.bootstrap_time_penalty_scale,
+            bootstrap_collision_penalty_scale=config.bootstrap_collision_penalty_scale,
+            bootstrap_out_of_bounds_penalty_scale=config.bootstrap_out_of_bounds_penalty_scale,
         )
 
     def as_ffi(self) -> _TriadSimConfig:
@@ -548,6 +573,14 @@ class SimulationConfig:
             time_penalty_cap=self.time_penalty_cap,
             collision_penalty=self.collision_penalty,
             out_of_bounds_penalty=self.out_of_bounds_penalty,
+            bootstrap_distance_reward_scale=self.bootstrap_distance_reward_scale,
+            bootstrap_alignment_reward_scale=self.bootstrap_alignment_reward_scale,
+            bootstrap_centering_reward_scale=self.bootstrap_centering_reward_scale,
+            bootstrap_velocity_alignment_reward_scale=self.bootstrap_velocity_alignment_reward_scale,
+            bootstrap_gate_pass_speed_reward_scale=self.bootstrap_gate_pass_speed_reward_scale,
+            bootstrap_time_penalty_scale=self.bootstrap_time_penalty_scale,
+            bootstrap_collision_penalty_scale=self.bootstrap_collision_penalty_scale,
+            bootstrap_out_of_bounds_penalty_scale=self.bootstrap_out_of_bounds_penalty_scale,
         )
 
 
@@ -1277,6 +1310,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train = subparsers.add_parser(
         "ppo-train", help="Train a PPO teacher on the Triad sim"
     )
+    ppo_train.add_argument(
+        "--config",
+        default=None,
+        help="Path to a JSON PPO config. If omitted, configs/ppo/default.json is used when present.",
+    )
     ppo_train.add_argument("--task-name", default="drone-racing-basic-lap")
     ppo_train.add_argument("--task-version", default="v1")
     ppo_train.add_argument("--env-count", type=int, default=256)
@@ -1299,6 +1337,26 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--time-penalty-cap", type=float, default=0.05)
     ppo_train.add_argument("--collision-penalty", type=float, default=14.0)
     ppo_train.add_argument("--out-of-bounds-penalty", type=float, default=24.0)
+    ppo_train.add_argument("--bootstrap-distance-reward-scale", type=float, default=1.6)
+    ppo_train.add_argument(
+        "--bootstrap-alignment-reward-scale", type=float, default=0.3
+    )
+    ppo_train.add_argument(
+        "--bootstrap-centering-reward-scale", type=float, default=0.35
+    )
+    ppo_train.add_argument(
+        "--bootstrap-velocity-alignment-reward-scale", type=float, default=0.2
+    )
+    ppo_train.add_argument(
+        "--bootstrap-gate-pass-speed-reward-scale", type=float, default=0.0
+    )
+    ppo_train.add_argument("--bootstrap-time-penalty-scale", type=float, default=0.2)
+    ppo_train.add_argument(
+        "--bootstrap-collision-penalty-scale", type=float, default=0.35
+    )
+    ppo_train.add_argument(
+        "--bootstrap-out-of-bounds-penalty-scale", type=float, default=0.4
+    )
     ppo_train.add_argument("--learning-rate", type=float, default=3.0e-4)
     ppo_train.add_argument("--gamma", type=float, default=0.99)
     ppo_train.add_argument("--gae-lambda", type=float, default=0.95)
@@ -1317,6 +1375,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--run-name", default=None)
     ppo_train.add_argument("--tensorboard-dir", default="runs")
     ppo_train.add_argument("--checkpoint", default=None)
+    ppo_train.add_argument("--resume-from", default=None)
     ppo_train.add_argument("--checkpoint-interval", type=int, default=0)
     ppo_train.add_argument("--curriculum-eval-interval", type=int, default=10)
     ppo_train.add_argument("--curriculum-eval-env-count", type=int, default=64)
@@ -1328,6 +1387,12 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--curriculum-previous-weight", type=float, default=0.2)
     ppo_train.add_argument("--curriculum-easy-weight", type=float, default=0.1)
     ppo_train.add_argument("--curriculum-holdout-seed", type=int, default=131071)
+    ppo_train.add_argument("--pretrain-updates", type=int, default=16)
+    ppo_train.add_argument("--pretrain-epochs", type=int, default=4)
+    ppo_train.add_argument("--pretrain-minibatch-size", type=int, default=4096)
+    ppo_train.add_argument("--pretrain-bootstrap-weight", type=float, default=1.0)
+    ppo_train.add_argument("--pretrain-intro-weight", type=float, default=0.0)
+    ppo_train.add_argument("--pretrain-max-gate-distance", type=float, default=1.25)
     ppo_train.add_argument(
         "--no-lr-anneal", action="store_true", help="Disable learning rate annealing"
     )
@@ -1434,9 +1499,219 @@ def _demo_config(course: CourseSpec) -> SimulationConfig:
     return config
 
 
+def _json_object_from_path(path: str | Path) -> dict[str, object]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"expected JSON object in config file: {path}")
+    return payload
+
+
+def _ppo_config_from_mapping(config_data: dict[str, object]) -> PPOConfig:
+    valid_fields = {field.name for field in fields(PPOConfig)}
+    overrides = {
+        key: value for key, value in config_data.items() if key in valid_fields
+    }
+    return PPOConfig(**overrides)
+
+
+def _cli_option_present(argv: Sequence[str], option: str) -> bool:
+    return any(token == option or token.startswith(f"{option}=") for token in argv)
+
+
+def _resolve_ppo_train_config_path(args) -> Path | None:
+    if args.config is not None:
+        return Path(args.config)
+    default_path = Path("configs/ppo/default.json")
+    if args.command == "ppo-train" and default_path.exists():
+        return default_path
+    return None
+
+
+def _ppo_train_cli_overrides(args, argv: Sequence[str]) -> dict[str, object]:
+    option_to_field = {
+        "--task-name": "task_name",
+        "--task-version": "task_version",
+        "--env-count": "env_count",
+        "--horizon": "horizon",
+        "--total-updates": "total_updates",
+        "--warmup-updates": "warmup_updates",
+        "--max-episode-steps": "max_episode_steps",
+        "--dynamics-randomization-scale": "dynamics_randomization_scale",
+        "--actuator-randomization-scale": "actuator_randomization_scale",
+        "--spawn-randomization-scale": "spawn_randomization_scale",
+        "--forward-progress-reward-scale": "forward_progress_reward_scale",
+        "--backward-progress-reward-scale": "backward_progress_reward_scale",
+        "--gate-pass-reward": "gate_pass_reward",
+        "--gate-pass-speed-reward-scale": "gate_pass_speed_reward_scale",
+        "--gate-pass-speed-reward-cap": "gate_pass_speed_reward_cap",
+        "--course-completion-reward": "course_completion_reward",
+        "--time-penalty-base": "time_penalty_base",
+        "--time-penalty-delay": "time_penalty_delay",
+        "--time-penalty-scale": "time_penalty_scale",
+        "--time-penalty-cap": "time_penalty_cap",
+        "--collision-penalty": "collision_penalty",
+        "--out-of-bounds-penalty": "out_of_bounds_penalty",
+        "--bootstrap-distance-reward-scale": "bootstrap_distance_reward_scale",
+        "--bootstrap-alignment-reward-scale": "bootstrap_alignment_reward_scale",
+        "--bootstrap-centering-reward-scale": "bootstrap_centering_reward_scale",
+        "--bootstrap-velocity-alignment-reward-scale": "bootstrap_velocity_alignment_reward_scale",
+        "--bootstrap-gate-pass-speed-reward-scale": "bootstrap_gate_pass_speed_reward_scale",
+        "--bootstrap-time-penalty-scale": "bootstrap_time_penalty_scale",
+        "--bootstrap-collision-penalty-scale": "bootstrap_collision_penalty_scale",
+        "--bootstrap-out-of-bounds-penalty-scale": "bootstrap_out_of_bounds_penalty_scale",
+        "--learning-rate": "learning_rate",
+        "--gamma": "gamma",
+        "--gae-lambda": "gae_lambda",
+        "--clip-coef": "clip_coef",
+        "--value-clip-coef": "value_clip_coef",
+        "--value-coef": "value_coef",
+        "--entropy-coef": "entropy_coef",
+        "--max-grad-norm": "max_grad_norm",
+        "--ppo-epochs": "ppo_epochs",
+        "--minibatch-size": "minibatch_size",
+        "--target-kl": "target_kl",
+        "--hidden-size": "hidden_size",
+        "--device": "device",
+        "--seed": "seed",
+        "--log-interval": "log_interval",
+        "--run-name": "run_name",
+        "--tensorboard-dir": "tensorboard_dir",
+        "--checkpoint": "checkpoint_path",
+        "--resume-from": "resume_from",
+        "--checkpoint-interval": "checkpoint_interval",
+        "--curriculum-eval-interval": "curriculum_eval_interval",
+        "--curriculum-eval-env-count": "curriculum_eval_env_count",
+        "--curriculum-mastery-window": "curriculum_mastery_window",
+        "--curriculum-min-stage-updates": "curriculum_min_stage_updates",
+        "--curriculum-completion-threshold": "curriculum_completion_threshold",
+        "--curriculum-progress-threshold": "curriculum_progress_threshold",
+        "--curriculum-current-weight": "curriculum_current_weight",
+        "--curriculum-previous-weight": "curriculum_previous_weight",
+        "--curriculum-easy-weight": "curriculum_easy_weight",
+        "--curriculum-holdout-seed": "curriculum_holdout_seed",
+        "--pretrain-updates": "pretrain_updates",
+        "--pretrain-epochs": "pretrain_epochs",
+        "--pretrain-minibatch-size": "pretrain_minibatch_size",
+        "--pretrain-bootstrap-weight": "pretrain_bootstrap_weight",
+        "--pretrain-intro-weight": "pretrain_intro_weight",
+        "--pretrain-max-gate-distance": "pretrain_max_gate_distance",
+        "--observation-clip": "observation_clip",
+    }
+    overrides: dict[str, object] = {}
+    for option, field_name in option_to_field.items():
+        if _cli_option_present(argv, option):
+            overrides[field_name] = getattr(args, field_name)
+
+    if _cli_option_present(argv, "--no-lr-anneal"):
+        overrides["anneal_learning_rate"] = False
+    if _cli_option_present(argv, "--no-advantage-norm"):
+        overrides["normalize_advantages"] = False
+    if _cli_option_present(argv, "--no-observation-norm"):
+        overrides["normalize_observations"] = False
+    if _cli_option_present(argv, "--no-pretty-log"):
+        overrides["pretty_log"] = False
+    if _cli_option_present(argv, "--no-json-log"):
+        overrides["json_log"] = False
+    if _cli_option_present(argv, "--no-tensorboard"):
+        overrides["tensorboard_dir"] = None
+    return overrides
+
+
+def _ppo_train_config_from_args(args, argv: Sequence[str]) -> PPOConfig:
+    config_path = _resolve_ppo_train_config_path(args)
+    config_data: dict[str, object] = {}
+    if config_path is not None:
+        config_data.update(_json_object_from_path(config_path))
+        config_data.update(_ppo_train_cli_overrides(args, argv))
+        if (
+            "value_clip_coef" in config_data
+            and float(config_data["value_clip_coef"]) <= 0.0
+        ):
+            config_data["value_clip_coef"] = None
+        if "target_kl" in config_data and float(config_data["target_kl"]) <= 0.0:
+            config_data["target_kl"] = None
+        return _ppo_config_from_mapping(config_data)
+
+    return PPOConfig(
+        task_name=args.task_name,
+        task_version=args.task_version,
+        env_count=args.env_count,
+        horizon=args.horizon,
+        total_updates=args.total_updates,
+        warmup_updates=args.warmup_updates,
+        max_episode_steps=args.max_episode_steps,
+        dynamics_randomization_scale=args.dynamics_randomization_scale,
+        actuator_randomization_scale=args.actuator_randomization_scale,
+        spawn_randomization_scale=args.spawn_randomization_scale,
+        forward_progress_reward_scale=args.forward_progress_reward_scale,
+        backward_progress_reward_scale=args.backward_progress_reward_scale,
+        gate_pass_reward=args.gate_pass_reward,
+        gate_pass_speed_reward_scale=args.gate_pass_speed_reward_scale,
+        gate_pass_speed_reward_cap=args.gate_pass_speed_reward_cap,
+        course_completion_reward=args.course_completion_reward,
+        time_penalty_base=args.time_penalty_base,
+        time_penalty_delay=args.time_penalty_delay,
+        time_penalty_scale=args.time_penalty_scale,
+        time_penalty_cap=args.time_penalty_cap,
+        collision_penalty=args.collision_penalty,
+        out_of_bounds_penalty=args.out_of_bounds_penalty,
+        bootstrap_distance_reward_scale=args.bootstrap_distance_reward_scale,
+        bootstrap_alignment_reward_scale=args.bootstrap_alignment_reward_scale,
+        bootstrap_centering_reward_scale=args.bootstrap_centering_reward_scale,
+        bootstrap_velocity_alignment_reward_scale=args.bootstrap_velocity_alignment_reward_scale,
+        bootstrap_gate_pass_speed_reward_scale=args.bootstrap_gate_pass_speed_reward_scale,
+        bootstrap_time_penalty_scale=args.bootstrap_time_penalty_scale,
+        bootstrap_collision_penalty_scale=args.bootstrap_collision_penalty_scale,
+        bootstrap_out_of_bounds_penalty_scale=args.bootstrap_out_of_bounds_penalty_scale,
+        learning_rate=args.learning_rate,
+        anneal_learning_rate=not args.no_lr_anneal,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_coef=args.clip_coef,
+        value_clip_coef=None if args.value_clip_coef <= 0.0 else args.value_clip_coef,
+        value_coef=args.value_coef,
+        entropy_coef=args.entropy_coef,
+        max_grad_norm=args.max_grad_norm,
+        ppo_epochs=args.ppo_epochs,
+        minibatch_size=args.minibatch_size,
+        normalize_advantages=not args.no_advantage_norm,
+        target_kl=None if args.target_kl <= 0.0 else args.target_kl,
+        normalize_observations=not args.no_observation_norm,
+        observation_clip=args.observation_clip,
+        hidden_size=args.hidden_size,
+        device=args.device,
+        seed=args.seed,
+        log_interval=args.log_interval,
+        pretty_log=not args.no_pretty_log,
+        json_log=not args.no_json_log,
+        tensorboard_dir=None if args.no_tensorboard else args.tensorboard_dir,
+        run_name=args.run_name,
+        checkpoint_path=args.checkpoint,
+        resume_from=args.resume_from,
+        checkpoint_interval=args.checkpoint_interval,
+        curriculum_eval_interval=args.curriculum_eval_interval,
+        curriculum_eval_env_count=args.curriculum_eval_env_count,
+        curriculum_mastery_window=args.curriculum_mastery_window,
+        curriculum_min_stage_updates=args.curriculum_min_stage_updates,
+        curriculum_completion_threshold=args.curriculum_completion_threshold,
+        curriculum_progress_threshold=args.curriculum_progress_threshold,
+        curriculum_current_weight=args.curriculum_current_weight,
+        curriculum_previous_weight=args.curriculum_previous_weight,
+        curriculum_easy_weight=args.curriculum_easy_weight,
+        curriculum_holdout_seed=args.curriculum_holdout_seed,
+        pretrain_updates=args.pretrain_updates,
+        pretrain_epochs=args.pretrain_epochs,
+        pretrain_minibatch_size=args.pretrain_minibatch_size,
+        pretrain_bootstrap_weight=args.pretrain_bootstrap_weight,
+        pretrain_intro_weight=args.pretrain_intro_weight,
+        pretrain_max_gate_distance=args.pretrain_max_gate_distance,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    arg_list = list(argv) if argv is not None else sys.argv[1:]
     parser = _build_cli_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arg_list)
 
     if args.command == "sim-config":
         _print_json(SimulationConfig.default().__dict__)
@@ -1583,67 +1858,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.command == "ppo-train":
-        config = PPOConfig(
-            task_name=args.task_name,
-            task_version=args.task_version,
-            env_count=args.env_count,
-            horizon=args.horizon,
-            total_updates=args.total_updates,
-            warmup_updates=args.warmup_updates,
-            max_episode_steps=args.max_episode_steps,
-            dynamics_randomization_scale=args.dynamics_randomization_scale,
-            actuator_randomization_scale=args.actuator_randomization_scale,
-            spawn_randomization_scale=args.spawn_randomization_scale,
-            forward_progress_reward_scale=args.forward_progress_reward_scale,
-            backward_progress_reward_scale=args.backward_progress_reward_scale,
-            gate_pass_reward=args.gate_pass_reward,
-            gate_pass_speed_reward_scale=args.gate_pass_speed_reward_scale,
-            gate_pass_speed_reward_cap=args.gate_pass_speed_reward_cap,
-            course_completion_reward=args.course_completion_reward,
-            time_penalty_base=args.time_penalty_base,
-            time_penalty_delay=args.time_penalty_delay,
-            time_penalty_scale=args.time_penalty_scale,
-            time_penalty_cap=args.time_penalty_cap,
-            collision_penalty=args.collision_penalty,
-            out_of_bounds_penalty=args.out_of_bounds_penalty,
-            learning_rate=args.learning_rate,
-            anneal_learning_rate=not args.no_lr_anneal,
-            gamma=args.gamma,
-            gae_lambda=args.gae_lambda,
-            clip_coef=args.clip_coef,
-            value_clip_coef=None
-            if args.value_clip_coef <= 0.0
-            else args.value_clip_coef,
-            value_coef=args.value_coef,
-            entropy_coef=args.entropy_coef,
-            max_grad_norm=args.max_grad_norm,
-            ppo_epochs=args.ppo_epochs,
-            minibatch_size=args.minibatch_size,
-            normalize_advantages=not args.no_advantage_norm,
-            target_kl=None if args.target_kl <= 0.0 else args.target_kl,
-            normalize_observations=not args.no_observation_norm,
-            observation_clip=args.observation_clip,
-            hidden_size=args.hidden_size,
-            device=args.device,
-            seed=args.seed,
-            log_interval=args.log_interval,
-            pretty_log=not args.no_pretty_log,
-            json_log=not args.no_json_log,
-            tensorboard_dir=None if args.no_tensorboard else args.tensorboard_dir,
-            run_name=args.run_name,
-            checkpoint_path=args.checkpoint,
-            checkpoint_interval=args.checkpoint_interval,
-            curriculum_eval_interval=args.curriculum_eval_interval,
-            curriculum_eval_env_count=args.curriculum_eval_env_count,
-            curriculum_mastery_window=args.curriculum_mastery_window,
-            curriculum_min_stage_updates=args.curriculum_min_stage_updates,
-            curriculum_completion_threshold=args.curriculum_completion_threshold,
-            curriculum_progress_threshold=args.curriculum_progress_threshold,
-            curriculum_current_weight=args.curriculum_current_weight,
-            curriculum_previous_weight=args.curriculum_previous_weight,
-            curriculum_easy_weight=args.curriculum_easy_weight,
-            curriculum_holdout_seed=args.curriculum_holdout_seed,
-        )
+        config = _ppo_train_config_from_args(args, arg_list)
         train_ppo(config)
         return 0
 

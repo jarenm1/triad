@@ -222,6 +222,14 @@ class PPOConfig:
     time_penalty_cap: float = 0.05
     collision_penalty: float = 14.0
     out_of_bounds_penalty: float = 24.0
+    bootstrap_distance_reward_scale: float = 1.6
+    bootstrap_alignment_reward_scale: float = 0.3
+    bootstrap_centering_reward_scale: float = 0.35
+    bootstrap_velocity_alignment_reward_scale: float = 0.2
+    bootstrap_gate_pass_speed_reward_scale: float = 0.0
+    bootstrap_time_penalty_scale: float = 0.2
+    bootstrap_collision_penalty_scale: float = 0.35
+    bootstrap_out_of_bounds_penalty_scale: float = 0.4
     learning_rate: float = 3.0e-4
     anneal_learning_rate: bool = True
     gamma: float = 0.99
@@ -258,11 +266,12 @@ class PPOConfig:
     curriculum_previous_weight: float = 0.2
     curriculum_easy_weight: float = 0.1
     curriculum_holdout_seed: int = 131071
-    pretrain_updates: int = 32
+    pretrain_updates: int = 16
     pretrain_epochs: int = 4
     pretrain_minibatch_size: int = 4096
-    pretrain_bootstrap_weight: float = 0.75
-    pretrain_intro_weight: float = 0.25
+    pretrain_bootstrap_weight: float = 1.0
+    pretrain_intro_weight: float = 0.0
+    pretrain_max_gate_distance: float = 1.25
 
 
 @dataclass
@@ -653,6 +662,26 @@ def _training_sim_config(course: CourseSpec, config: PPOConfig) -> SimulationCon
     sim_config.time_penalty_cap = config.time_penalty_cap
     sim_config.collision_penalty = config.collision_penalty
     sim_config.out_of_bounds_penalty = config.out_of_bounds_penalty
+    sim_config.bootstrap_distance_reward_scale = config.bootstrap_distance_reward_scale
+    sim_config.bootstrap_alignment_reward_scale = (
+        config.bootstrap_alignment_reward_scale
+    )
+    sim_config.bootstrap_centering_reward_scale = (
+        config.bootstrap_centering_reward_scale
+    )
+    sim_config.bootstrap_velocity_alignment_reward_scale = (
+        config.bootstrap_velocity_alignment_reward_scale
+    )
+    sim_config.bootstrap_gate_pass_speed_reward_scale = (
+        config.bootstrap_gate_pass_speed_reward_scale
+    )
+    sim_config.bootstrap_time_penalty_scale = config.bootstrap_time_penalty_scale
+    sim_config.bootstrap_collision_penalty_scale = (
+        config.bootstrap_collision_penalty_scale
+    )
+    sim_config.bootstrap_out_of_bounds_penalty_scale = (
+        config.bootstrap_out_of_bounds_penalty_scale
+    )
     return sim_config
 
 
@@ -678,6 +707,14 @@ def _task_reward_config(config: PPOConfig) -> dict[str, object]:
         "time_penalty_cap": config.time_penalty_cap,
         "collision_penalty": config.collision_penalty,
         "out_of_bounds_penalty": config.out_of_bounds_penalty,
+        "bootstrap_distance_reward_scale": config.bootstrap_distance_reward_scale,
+        "bootstrap_alignment_reward_scale": config.bootstrap_alignment_reward_scale,
+        "bootstrap_centering_reward_scale": config.bootstrap_centering_reward_scale,
+        "bootstrap_velocity_alignment_reward_scale": config.bootstrap_velocity_alignment_reward_scale,
+        "bootstrap_gate_pass_speed_reward_scale": config.bootstrap_gate_pass_speed_reward_scale,
+        "bootstrap_time_penalty_scale": config.bootstrap_time_penalty_scale,
+        "bootstrap_collision_penalty_scale": config.bootstrap_collision_penalty_scale,
+        "bootstrap_out_of_bounds_penalty_scale": config.bootstrap_out_of_bounds_penalty_scale,
     }
 
 
@@ -1260,6 +1297,29 @@ class MasteryCurriculumController:
 
 COMPLETE_DONE_REASON = 1 << 0
 PROGRESS_OBSERVATION_INDEX = 18
+POSITION_OBSERVATION_SLICE = slice(0, 3)
+TARGET_GATE_POSITION_OBSERVATION_SLICE = slice(12, 15)
+
+
+def _select_pretrain_rollouts(
+    obs_batch: np.ndarray,
+    completed: np.ndarray,
+    config: PPOConfig,
+) -> np.ndarray:
+    position = obs_batch[:, :, POSITION_OBSERVATION_SLICE]
+    target_gate_position = obs_batch[:, :, TARGET_GATE_POSITION_OBSERVATION_SLICE]
+    min_gate_distance = np.linalg.norm(target_gate_position - position, axis=2).min(
+        axis=0
+    )
+    selected = completed | (min_gate_distance <= config.pretrain_max_gate_distance)
+    if np.any(selected):
+        return selected
+
+    keep_count = max(1, obs_batch.shape[1] // 4)
+    best_indices = np.argsort(min_gate_distance)[:keep_count]
+    selected = np.zeros(obs_batch.shape[1], dtype=bool)
+    selected[best_indices] = True
+    return selected
 
 
 def _done_reason_labels(done_reason: int) -> list[str]:
@@ -1539,18 +1599,26 @@ def _collect_pretrain_batch(
         (config.horizon, env.sim.env_count, env.sim.action_stride),
         dtype=np.float32,
     )
+    completed = np.zeros(env.sim.env_count, dtype=bool)
 
     for step_index in range(config.horizon):
         obs_batch[step_index] = observations
         teacher_actions = _teacher_point_to_gate_actions(observations)
         action_batch[step_index] = teacher_actions
         env.numpy_action_view()[:, :] = teacher_actions
-        next_observations, _, _ = env.step_in_place().numpy_views()
+        step_result = env.step_in_place()
+        next_observations, _, dones = step_result.numpy_views()
+        done_reasons = step_result.numpy_done_reasons()
+        done_flags = dones.astype(bool, copy=False)
+        completed |= done_flags & (
+            (done_reasons & np.uint32(COMPLETE_DONE_REASON)) != 0
+        )
         observations = next_observations.copy()
 
+    selected = _select_pretrain_rollouts(obs_batch, completed, config)
     return (
-        obs_batch.reshape((-1, env.sim.observation_stride)),
-        action_batch.reshape((-1, env.sim.action_stride)),
+        obs_batch[:, selected, :].reshape((-1, env.sim.observation_stride)),
+        action_batch[:, selected, :].reshape((-1, env.sim.action_stride)),
     )
 
 

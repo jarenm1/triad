@@ -109,6 +109,14 @@ pub struct TriadSimConfig {
     pub time_penalty_cap: f32,
     pub collision_penalty: f32,
     pub out_of_bounds_penalty: f32,
+    pub bootstrap_distance_reward_scale: f32,
+    pub bootstrap_alignment_reward_scale: f32,
+    pub bootstrap_centering_reward_scale: f32,
+    pub bootstrap_velocity_alignment_reward_scale: f32,
+    pub bootstrap_gate_pass_speed_reward_scale: f32,
+    pub bootstrap_time_penalty_scale: f32,
+    pub bootstrap_collision_penalty_scale: f32,
+    pub bootstrap_out_of_bounds_penalty_scale: f32,
 }
 
 #[repr(C)]
@@ -253,6 +261,15 @@ impl From<GpuSimulationConfig> for TriadSimConfig {
             time_penalty_cap: config.time_penalty_cap,
             collision_penalty: config.collision_penalty,
             out_of_bounds_penalty: config.out_of_bounds_penalty,
+            bootstrap_distance_reward_scale: config.bootstrap_distance_reward_scale,
+            bootstrap_alignment_reward_scale: config.bootstrap_alignment_reward_scale,
+            bootstrap_centering_reward_scale: config.bootstrap_centering_reward_scale,
+            bootstrap_velocity_alignment_reward_scale: config
+                .bootstrap_velocity_alignment_reward_scale,
+            bootstrap_gate_pass_speed_reward_scale: config.bootstrap_gate_pass_speed_reward_scale,
+            bootstrap_time_penalty_scale: config.bootstrap_time_penalty_scale,
+            bootstrap_collision_penalty_scale: config.bootstrap_collision_penalty_scale,
+            bootstrap_out_of_bounds_penalty_scale: config.bootstrap_out_of_bounds_penalty_scale,
         }
     }
 }
@@ -281,6 +298,15 @@ impl From<TriadSimConfig> for GpuSimulationConfig {
             time_penalty_cap: config.time_penalty_cap,
             collision_penalty: config.collision_penalty,
             out_of_bounds_penalty: config.out_of_bounds_penalty,
+            bootstrap_distance_reward_scale: config.bootstrap_distance_reward_scale,
+            bootstrap_alignment_reward_scale: config.bootstrap_alignment_reward_scale,
+            bootstrap_centering_reward_scale: config.bootstrap_centering_reward_scale,
+            bootstrap_velocity_alignment_reward_scale: config
+                .bootstrap_velocity_alignment_reward_scale,
+            bootstrap_gate_pass_speed_reward_scale: config.bootstrap_gate_pass_speed_reward_scale,
+            bootstrap_time_penalty_scale: config.bootstrap_time_penalty_scale,
+            bootstrap_collision_penalty_scale: config.bootstrap_collision_penalty_scale,
+            bootstrap_out_of_bounds_penalty_scale: config.bootstrap_out_of_bounds_penalty_scale,
         }
     }
 }

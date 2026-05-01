@@ -95,6 +95,14 @@ struct SimParams {
     time_penalty_cap: f32,
     collision_penalty: f32,
     out_of_bounds_penalty: f32,
+    bootstrap_distance_reward_scale: f32,
+    bootstrap_alignment_reward_scale: f32,
+    bootstrap_centering_reward_scale: f32,
+    bootstrap_velocity_alignment_reward_scale: f32,
+    bootstrap_gate_pass_speed_reward_scale: f32,
+    bootstrap_time_penalty_scale: f32,
+    bootstrap_collision_penalty_scale: f32,
+    bootstrap_out_of_bounds_penalty_scale: f32,
     dynamics_randomization_scale: f32,
     actuator_randomization_scale: f32,
     spawn_randomization_scale: f32,
@@ -218,6 +226,26 @@ fn curriculum_dynamics_scale(curriculum_stage: u32) -> f32 {
         return 0.8;
     }
     return 1.0;
+}
+
+fn early_stage_assist_strength(curriculum_stage: u32) -> f32 {
+    if (is_bootstrap_stage(curriculum_stage)) {
+        return 1.0;
+    }
+    if (curriculum_stage == 1u) {
+        return 0.45;
+    }
+    return 0.0;
+}
+
+fn early_stage_penalty_relief_strength(curriculum_stage: u32) -> f32 {
+    if (is_bootstrap_stage(curriculum_stage)) {
+        return 1.0;
+    }
+    if (curriculum_stage == 1u) {
+        return 0.6;
+    }
+    return 0.0;
 }
 
 fn randomized_positive_scale(seed: u32, salt: u32, magnitude: f32) -> f32 {
@@ -364,13 +392,14 @@ fn low_level_command_from_velocity_setpoint(
     let body_velocity = project_to_body_frame(attitude, velocity);
     let bootstrap_stage = is_bootstrap_stage(curriculum_stage);
     let intro_stage = curriculum_stage == 1u;
-    let forward_speed_limit = select(6.0, select(2.6, 1.8, bootstrap_stage), intro_stage);
-    let lateral_speed_limit = select(4.0, select(3.0, 2.2, bootstrap_stage), intro_stage);
-    let vertical_speed_limit = select(2.5, select(2.0, 1.6, bootstrap_stage), intro_stage);
-    let yaw_full_speed = select(0.3, select(0.16, 0.1, bootstrap_stage), intro_stage);
-    let yaw_zero_speed = select(0.8, select(0.48, 0.28, bootstrap_stage), intro_stage);
-    let cross_track_full_speed = select(0.2, select(0.12, 0.06, bootstrap_stage), intro_stage);
-    let cross_track_zero_speed = select(0.8, select(0.45, 0.22, bootstrap_stage), intro_stage);
+    let early_stage = bootstrap_stage || intro_stage;
+    let forward_speed_limit = select(6.0, select(2.6, 2.4, bootstrap_stage), early_stage);
+    let lateral_speed_limit = select(4.0, select(3.0, 2.8, bootstrap_stage), early_stage);
+    let vertical_speed_limit = select(2.5, select(2.0, 1.9, bootstrap_stage), early_stage);
+    let yaw_full_speed = select(0.3, select(0.16, 0.14, bootstrap_stage), early_stage);
+    let yaw_zero_speed = select(0.8, select(0.48, 0.4, bootstrap_stage), early_stage);
+    let cross_track_full_speed = select(0.2, select(0.12, 0.1, bootstrap_stage), early_stage);
+    let cross_track_zero_speed = select(0.8, select(0.45, 0.35, bootstrap_stage), early_stage);
     let yaw_scale =
         1.0
         - clamp(
@@ -393,9 +422,9 @@ fn low_level_command_from_velocity_setpoint(
         clamp(lateral_velocity_target(command), -lateral_speed_limit, lateral_speed_limit);
     let gated_vertical_target =
         clamp(vertical_velocity_target(command), -vertical_speed_limit, vertical_speed_limit);
-    let roll_gain = select(0.18, select(0.24, 0.28, bootstrap_stage), intro_stage);
-    let pitch_gain = select(0.14, select(0.12, 0.1, bootstrap_stage), intro_stage);
-    let vertical_gain = select(0.08, select(0.12, 0.16, bootstrap_stage), intro_stage);
+    let roll_gain = select(0.18, select(0.24, 0.26, bootstrap_stage), early_stage);
+    let pitch_gain = select(0.14, select(0.12, 0.11, bootstrap_stage), early_stage);
+    let vertical_gain = select(0.08, select(0.12, 0.14, bootstrap_stage), early_stage);
     let desired_roll = clamp(
         -(gated_lateral_target - body_velocity.x) * roll_gain,
         -0.5,
@@ -1839,6 +1868,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let prev_position = state.position.xyz;
     let prev_target_gate = target_gate;
+    let previous_gate_distance = distance(prev_position, prev_target_gate.center.xyz);
     let prev_segment_start = segment_start_for_target_gate(
         index,
         state.current_gate,
@@ -2088,28 +2118,70 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let progress_delta = current_segment_progress - previous_segment_progress;
     let forward_progress = clamp(progress_delta, 0.0, 0.25);
     let backward_progress = clamp(-progress_delta, 0.0, 0.25);
+    let assist_strength = early_stage_assist_strength(reset.curriculum_stage);
+    let penalty_relief_strength =
+        early_stage_penalty_relief_strength(reset.curriculum_stage);
     let progress_reward =
         forward_progress * params.forward_progress_reward_scale
         - backward_progress * params.backward_progress_reward_scale;
-    let shaping_reward = progress_reward;
+    let current_gate_alignment =
+        gate_alignment_score(prev_target_gate, prev_gate_delta, prev_gate_distance);
+    let current_centering = max(gate_centering_score(prev_target_gate, prev_gate_delta), 0.0);
+    let approach_activation =
+        gate_approach_activation(prev_target_gate, prev_gate_distance);
+    let distance_delta =
+        clamp(previous_gate_distance - prev_gate_distance, -0.25, 0.25);
+    let bootstrap_dense_reward =
+        distance_delta * params.bootstrap_distance_reward_scale
+        + approach_activation
+            * max(current_gate_alignment, 0.0)
+            * params.bootstrap_alignment_reward_scale
+        + approach_activation
+            * current_centering
+            * params.bootstrap_centering_reward_scale
+        + approach_activation
+            * gate_velocity_alignment(prev_target_gate, state.velocity.xyz)
+            * params.bootstrap_velocity_alignment_reward_scale;
+    let shaping_reward =
+        progress_reward + bootstrap_dense_reward * assist_strength;
     let gate_age_seconds = f32(state.gate_age_steps) * params.dt_seconds;
     let collision_happened = collided_gate || collided_obstacle || collided_world;
     let pass_speed_bonus =
         min(
             gate_forward_speed(prev_target_gate, state.velocity.xyz),
             params.gate_pass_speed_reward_cap,
-        ) * params.gate_pass_speed_reward_scale;
+        ) * params.gate_pass_speed_reward_scale
+        * (1.0
+            - penalty_relief_strength
+                * (1.0 - params.bootstrap_gate_pass_speed_reward_scale));
     let sparse_objective_reward =
         select(0.0, params.gate_pass_reward + pass_speed_bonus, passed_gate)
         + select(0.0, params.course_completion_reward, (done_reason & DONE_REASON_COMPLETE) != 0u);
     let time_penalty =
-        params.time_penalty_base
+        (params.time_penalty_base
         + min(
             max(gate_age_seconds - params.time_penalty_delay, 0.0) * params.time_penalty_scale,
             params.time_penalty_cap,
-        );
-    let collision_penalty = select(0.0, params.collision_penalty, collision_happened);
-    let out_of_bounds_penalty = select(0.0, params.out_of_bounds_penalty, out_of_bounds);
+        ))
+        * (1.0
+            - penalty_relief_strength
+                * (1.0 - params.bootstrap_time_penalty_scale));
+    let collision_penalty = select(
+        0.0,
+        params.collision_penalty
+            * (1.0
+                - penalty_relief_strength
+                    * (1.0 - params.bootstrap_collision_penalty_scale)),
+        collision_happened,
+    );
+    let out_of_bounds_penalty = select(
+        0.0,
+        params.out_of_bounds_penalty
+            * (1.0
+                - penalty_relief_strength
+                    * (1.0 - params.bootstrap_out_of_bounds_penalty_scale)),
+        out_of_bounds,
+    );
     reward_done.values[index].reward =
         shaping_reward
         + sparse_objective_reward
@@ -2285,6 +2357,14 @@ struct SimParams {
     time_penalty_cap: f32,
     collision_penalty: f32,
     out_of_bounds_penalty: f32,
+    bootstrap_distance_reward_scale: f32,
+    bootstrap_alignment_reward_scale: f32,
+    bootstrap_centering_reward_scale: f32,
+    bootstrap_velocity_alignment_reward_scale: f32,
+    bootstrap_gate_pass_speed_reward_scale: f32,
+    bootstrap_time_penalty_scale: f32,
+    bootstrap_collision_penalty_scale: f32,
+    bootstrap_out_of_bounds_penalty_scale: f32,
     dynamics_randomization_scale: f32,
     actuator_randomization_scale: f32,
     spawn_randomization_scale: f32,
@@ -2297,7 +2377,7 @@ struct SimParams {
     _pad_uniform_tail2: u32,
 }
 
-const _: [(); 160] = [(); std::mem::size_of::<SimParams>()];
+const _: [(); 192] = [(); std::mem::size_of::<SimParams>()];
 
 #[derive(Debug, Clone, Copy)]
 pub struct GpuSimulationConfig {
@@ -2322,6 +2402,14 @@ pub struct GpuSimulationConfig {
     pub time_penalty_cap: f32,
     pub collision_penalty: f32,
     pub out_of_bounds_penalty: f32,
+    pub bootstrap_distance_reward_scale: f32,
+    pub bootstrap_alignment_reward_scale: f32,
+    pub bootstrap_centering_reward_scale: f32,
+    pub bootstrap_velocity_alignment_reward_scale: f32,
+    pub bootstrap_gate_pass_speed_reward_scale: f32,
+    pub bootstrap_time_penalty_scale: f32,
+    pub bootstrap_collision_penalty_scale: f32,
+    pub bootstrap_out_of_bounds_penalty_scale: f32,
 }
 
 impl Default for GpuSimulationConfig {
@@ -2348,6 +2436,14 @@ impl Default for GpuSimulationConfig {
             time_penalty_cap: 0.05,
             collision_penalty: 14.0,
             out_of_bounds_penalty: 24.0,
+            bootstrap_distance_reward_scale: 1.6,
+            bootstrap_alignment_reward_scale: 0.3,
+            bootstrap_centering_reward_scale: 0.35,
+            bootstrap_velocity_alignment_reward_scale: 0.2,
+            bootstrap_gate_pass_speed_reward_scale: 0.0,
+            bootstrap_time_penalty_scale: 0.2,
+            bootstrap_collision_penalty_scale: 0.35,
+            bootstrap_out_of_bounds_penalty_scale: 0.4,
         }
     }
 }
@@ -2448,6 +2544,15 @@ impl GpuSimulation {
             time_penalty_cap: config.time_penalty_cap,
             collision_penalty: config.collision_penalty,
             out_of_bounds_penalty: config.out_of_bounds_penalty,
+            bootstrap_distance_reward_scale: config.bootstrap_distance_reward_scale,
+            bootstrap_alignment_reward_scale: config.bootstrap_alignment_reward_scale,
+            bootstrap_centering_reward_scale: config.bootstrap_centering_reward_scale,
+            bootstrap_velocity_alignment_reward_scale: config
+                .bootstrap_velocity_alignment_reward_scale,
+            bootstrap_gate_pass_speed_reward_scale: config.bootstrap_gate_pass_speed_reward_scale,
+            bootstrap_time_penalty_scale: config.bootstrap_time_penalty_scale,
+            bootstrap_collision_penalty_scale: config.bootstrap_collision_penalty_scale,
+            bootstrap_out_of_bounds_penalty_scale: config.bootstrap_out_of_bounds_penalty_scale,
             dynamics_randomization_scale: config.dynamics_randomization_scale,
             actuator_randomization_scale: config.actuator_randomization_scale,
             spawn_randomization_scale: config.spawn_randomization_scale,
