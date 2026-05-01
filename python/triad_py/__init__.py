@@ -174,6 +174,18 @@ class _TriadSimConfig(ctypes.Structure):
         ("dynamics_randomization_scale", ctypes.c_float),
         ("actuator_randomization_scale", ctypes.c_float),
         ("spawn_randomization_scale", ctypes.c_float),
+        ("forward_progress_reward_scale", ctypes.c_float),
+        ("backward_progress_reward_scale", ctypes.c_float),
+        ("gate_pass_reward", ctypes.c_float),
+        ("gate_pass_speed_reward_scale", ctypes.c_float),
+        ("gate_pass_speed_reward_cap", ctypes.c_float),
+        ("course_completion_reward", ctypes.c_float),
+        ("time_penalty_base", ctypes.c_float),
+        ("time_penalty_delay", ctypes.c_float),
+        ("time_penalty_scale", ctypes.c_float),
+        ("time_penalty_cap", ctypes.c_float),
+        ("collision_penalty", ctypes.c_float),
+        ("out_of_bounds_penalty", ctypes.c_float),
     ]
 
 
@@ -473,6 +485,18 @@ class SimulationConfig:
     dynamics_randomization_scale: float
     actuator_randomization_scale: float
     spawn_randomization_scale: float
+    forward_progress_reward_scale: float
+    backward_progress_reward_scale: float
+    gate_pass_reward: float
+    gate_pass_speed_reward_scale: float
+    gate_pass_speed_reward_cap: float
+    course_completion_reward: float
+    time_penalty_base: float
+    time_penalty_delay: float
+    time_penalty_scale: float
+    time_penalty_cap: float
+    collision_penalty: float
+    out_of_bounds_penalty: float
 
     @classmethod
     def default(cls) -> "SimulationConfig":
@@ -487,6 +511,18 @@ class SimulationConfig:
             dynamics_randomization_scale=config.dynamics_randomization_scale,
             actuator_randomization_scale=config.actuator_randomization_scale,
             spawn_randomization_scale=config.spawn_randomization_scale,
+            forward_progress_reward_scale=config.forward_progress_reward_scale,
+            backward_progress_reward_scale=config.backward_progress_reward_scale,
+            gate_pass_reward=config.gate_pass_reward,
+            gate_pass_speed_reward_scale=config.gate_pass_speed_reward_scale,
+            gate_pass_speed_reward_cap=config.gate_pass_speed_reward_cap,
+            course_completion_reward=config.course_completion_reward,
+            time_penalty_base=config.time_penalty_base,
+            time_penalty_delay=config.time_penalty_delay,
+            time_penalty_scale=config.time_penalty_scale,
+            time_penalty_cap=config.time_penalty_cap,
+            collision_penalty=config.collision_penalty,
+            out_of_bounds_penalty=config.out_of_bounds_penalty,
         )
 
     def as_ffi(self) -> _TriadSimConfig:
@@ -500,6 +536,18 @@ class SimulationConfig:
             dynamics_randomization_scale=self.dynamics_randomization_scale,
             actuator_randomization_scale=self.actuator_randomization_scale,
             spawn_randomization_scale=self.spawn_randomization_scale,
+            forward_progress_reward_scale=self.forward_progress_reward_scale,
+            backward_progress_reward_scale=self.backward_progress_reward_scale,
+            gate_pass_reward=self.gate_pass_reward,
+            gate_pass_speed_reward_scale=self.gate_pass_speed_reward_scale,
+            gate_pass_speed_reward_cap=self.gate_pass_speed_reward_cap,
+            course_completion_reward=self.course_completion_reward,
+            time_penalty_base=self.time_penalty_base,
+            time_penalty_delay=self.time_penalty_delay,
+            time_penalty_scale=self.time_penalty_scale,
+            time_penalty_cap=self.time_penalty_cap,
+            collision_penalty=self.collision_penalty,
+            out_of_bounds_penalty=self.out_of_bounds_penalty,
         )
 
 
@@ -1237,6 +1285,18 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--dynamics-randomization-scale", type=float, default=1.0)
     ppo_train.add_argument("--actuator-randomization-scale", type=float, default=1.0)
     ppo_train.add_argument("--spawn-randomization-scale", type=float, default=1.0)
+    ppo_train.add_argument("--forward-progress-reward-scale", type=float, default=0.35)
+    ppo_train.add_argument("--backward-progress-reward-scale", type=float, default=0.6)
+    ppo_train.add_argument("--gate-pass-reward", type=float, default=8.0)
+    ppo_train.add_argument("--gate-pass-speed-reward-scale", type=float, default=0.35)
+    ppo_train.add_argument("--gate-pass-speed-reward-cap", type=float, default=12.0)
+    ppo_train.add_argument("--course-completion-reward", type=float, default=32.0)
+    ppo_train.add_argument("--time-penalty-base", type=float, default=0.001)
+    ppo_train.add_argument("--time-penalty-delay", type=float, default=1.5)
+    ppo_train.add_argument("--time-penalty-scale", type=float, default=0.012)
+    ppo_train.add_argument("--time-penalty-cap", type=float, default=0.05)
+    ppo_train.add_argument("--collision-penalty", type=float, default=14.0)
+    ppo_train.add_argument("--out-of-bounds-penalty", type=float, default=24.0)
     ppo_train.add_argument("--learning-rate", type=float, default=3.0e-4)
     ppo_train.add_argument("--gamma", type=float, default=0.99)
     ppo_train.add_argument("--gae-lambda", type=float, default=0.95)
@@ -1530,6 +1590,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             dynamics_randomization_scale=args.dynamics_randomization_scale,
             actuator_randomization_scale=args.actuator_randomization_scale,
             spawn_randomization_scale=args.spawn_randomization_scale,
+            forward_progress_reward_scale=args.forward_progress_reward_scale,
+            backward_progress_reward_scale=args.backward_progress_reward_scale,
+            gate_pass_reward=args.gate_pass_reward,
+            gate_pass_speed_reward_scale=args.gate_pass_speed_reward_scale,
+            gate_pass_speed_reward_cap=args.gate_pass_speed_reward_cap,
+            course_completion_reward=args.course_completion_reward,
+            time_penalty_base=args.time_penalty_base,
+            time_penalty_delay=args.time_penalty_delay,
+            time_penalty_scale=args.time_penalty_scale,
+            time_penalty_cap=args.time_penalty_cap,
+            collision_penalty=args.collision_penalty,
+            out_of_bounds_penalty=args.out_of_bounds_penalty,
             learning_rate=args.learning_rate,
             anneal_learning_rate=not args.no_lr_anneal,
             gamma=args.gamma,

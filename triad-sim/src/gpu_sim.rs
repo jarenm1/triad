@@ -83,7 +83,18 @@ struct SimParams {
     drone_half_extents: vec4<f32>,
     gate_frame_thickness: f32,
     gate_depth_half: f32,
+    forward_progress_reward_scale: f32,
+    backward_progress_reward_scale: f32,
+    gate_pass_reward: f32,
+    gate_pass_speed_reward_scale: f32,
+    gate_pass_speed_reward_cap: f32,
+    course_completion_reward: f32,
+    time_penalty_base: f32,
+    time_penalty_delay: f32,
+    time_penalty_scale: f32,
+    time_penalty_cap: f32,
     collision_penalty: f32,
+    out_of_bounds_penalty: f32,
     dynamics_randomization_scale: f32,
     actuator_randomization_scale: f32,
     spawn_randomization_scale: f32,
@@ -2077,17 +2088,28 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let progress_delta = current_segment_progress - previous_segment_progress;
     let forward_progress = clamp(progress_delta, 0.0, 0.25);
     let backward_progress = clamp(-progress_delta, 0.0, 0.25);
-    let progress_reward = forward_progress * 0.35 - backward_progress * 0.6;
+    let progress_reward =
+        forward_progress * params.forward_progress_reward_scale
+        - backward_progress * params.backward_progress_reward_scale;
     let shaping_reward = progress_reward;
     let gate_age_seconds = f32(state.gate_age_steps) * params.dt_seconds;
     let collision_happened = collided_gate || collided_obstacle || collided_world;
-    let pass_speed_bonus = min(gate_forward_speed(prev_target_gate, state.velocity.xyz), 12.0) * 0.35;
+    let pass_speed_bonus =
+        min(
+            gate_forward_speed(prev_target_gate, state.velocity.xyz),
+            params.gate_pass_speed_reward_cap,
+        ) * params.gate_pass_speed_reward_scale;
     let sparse_objective_reward =
-        select(0.0, 8.0 + pass_speed_bonus, passed_gate)
-        + select(0.0, 32.0, (done_reason & DONE_REASON_COMPLETE) != 0u);
-    let time_penalty = 0.001 + min(max(gate_age_seconds - 1.5, 0.0) * 0.012, 0.05);
+        select(0.0, params.gate_pass_reward + pass_speed_bonus, passed_gate)
+        + select(0.0, params.course_completion_reward, (done_reason & DONE_REASON_COMPLETE) != 0u);
+    let time_penalty =
+        params.time_penalty_base
+        + min(
+            max(gate_age_seconds - params.time_penalty_delay, 0.0) * params.time_penalty_scale,
+            params.time_penalty_cap,
+        );
     let collision_penalty = select(0.0, params.collision_penalty, collision_happened);
-    let out_of_bounds_penalty = select(0.0, 24.0, out_of_bounds);
+    let out_of_bounds_penalty = select(0.0, params.out_of_bounds_penalty, out_of_bounds);
     reward_done.values[index].reward =
         shaping_reward
         + sparse_objective_reward
@@ -2251,7 +2273,18 @@ struct SimParams {
     drone_half_extents: [f32; 4],
     gate_frame_thickness: f32,
     gate_depth_half: f32,
+    forward_progress_reward_scale: f32,
+    backward_progress_reward_scale: f32,
+    gate_pass_reward: f32,
+    gate_pass_speed_reward_scale: f32,
+    gate_pass_speed_reward_cap: f32,
+    course_completion_reward: f32,
+    time_penalty_base: f32,
+    time_penalty_delay: f32,
+    time_penalty_scale: f32,
+    time_penalty_cap: f32,
     collision_penalty: f32,
+    out_of_bounds_penalty: f32,
     dynamics_randomization_scale: f32,
     actuator_randomization_scale: f32,
     spawn_randomization_scale: f32,
@@ -2261,7 +2294,10 @@ struct SimParams {
     max_obstacles_per_env: u32,
     _pad_uniform: u32,
     _pad_uniform_tail: u32,
+    _pad_uniform_tail2: u32,
 }
+
+const _: [(); 160] = [(); std::mem::size_of::<SimParams>()];
 
 #[derive(Debug, Clone, Copy)]
 pub struct GpuSimulationConfig {
@@ -2274,6 +2310,18 @@ pub struct GpuSimulationConfig {
     pub dynamics_randomization_scale: f32,
     pub actuator_randomization_scale: f32,
     pub spawn_randomization_scale: f32,
+    pub forward_progress_reward_scale: f32,
+    pub backward_progress_reward_scale: f32,
+    pub gate_pass_reward: f32,
+    pub gate_pass_speed_reward_scale: f32,
+    pub gate_pass_speed_reward_cap: f32,
+    pub course_completion_reward: f32,
+    pub time_penalty_base: f32,
+    pub time_penalty_delay: f32,
+    pub time_penalty_scale: f32,
+    pub time_penalty_cap: f32,
+    pub collision_penalty: f32,
+    pub out_of_bounds_penalty: f32,
 }
 
 impl Default for GpuSimulationConfig {
@@ -2288,6 +2336,18 @@ impl Default for GpuSimulationConfig {
             dynamics_randomization_scale: 1.0,
             actuator_randomization_scale: 1.0,
             spawn_randomization_scale: 1.0,
+            forward_progress_reward_scale: 0.35,
+            backward_progress_reward_scale: 0.6,
+            gate_pass_reward: 8.0,
+            gate_pass_speed_reward_scale: 0.35,
+            gate_pass_speed_reward_cap: 12.0,
+            course_completion_reward: 32.0,
+            time_penalty_base: 0.001,
+            time_penalty_delay: 1.5,
+            time_penalty_scale: 0.012,
+            time_penalty_cap: 0.05,
+            collision_penalty: 14.0,
+            out_of_bounds_penalty: 24.0,
         }
     }
 }
@@ -2376,7 +2436,18 @@ impl GpuSimulation {
             drone_half_extents: [0.10, 0.045, 0.10, 0.0],
             gate_frame_thickness: 0.08,
             gate_depth_half: 0.04,
-            collision_penalty: 14.0,
+            forward_progress_reward_scale: config.forward_progress_reward_scale,
+            backward_progress_reward_scale: config.backward_progress_reward_scale,
+            gate_pass_reward: config.gate_pass_reward,
+            gate_pass_speed_reward_scale: config.gate_pass_speed_reward_scale,
+            gate_pass_speed_reward_cap: config.gate_pass_speed_reward_cap,
+            course_completion_reward: config.course_completion_reward,
+            time_penalty_base: config.time_penalty_base,
+            time_penalty_delay: config.time_penalty_delay,
+            time_penalty_scale: config.time_penalty_scale,
+            time_penalty_cap: config.time_penalty_cap,
+            collision_penalty: config.collision_penalty,
+            out_of_bounds_penalty: config.out_of_bounds_penalty,
             dynamics_randomization_scale: config.dynamics_randomization_scale,
             actuator_randomization_scale: config.actuator_randomization_scale,
             spawn_randomization_scale: config.spawn_randomization_scale,
@@ -2386,6 +2457,7 @@ impl GpuSimulation {
             max_obstacles_per_env: max_obstacles_per_env as u32,
             _pad_uniform: 0,
             _pad_uniform_tail: 0,
+            _pad_uniform_tail2: 0,
         };
 
         let state = renderer

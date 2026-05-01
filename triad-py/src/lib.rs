@@ -97,6 +97,18 @@ pub struct TriadSimConfig {
     pub dynamics_randomization_scale: f32,
     pub actuator_randomization_scale: f32,
     pub spawn_randomization_scale: f32,
+    pub forward_progress_reward_scale: f32,
+    pub backward_progress_reward_scale: f32,
+    pub gate_pass_reward: f32,
+    pub gate_pass_speed_reward_scale: f32,
+    pub gate_pass_speed_reward_cap: f32,
+    pub course_completion_reward: f32,
+    pub time_penalty_base: f32,
+    pub time_penalty_delay: f32,
+    pub time_penalty_scale: f32,
+    pub time_penalty_cap: f32,
+    pub collision_penalty: f32,
+    pub out_of_bounds_penalty: f32,
 }
 
 #[repr(C)]
@@ -229,6 +241,18 @@ impl From<GpuSimulationConfig> for TriadSimConfig {
             dynamics_randomization_scale: config.dynamics_randomization_scale,
             actuator_randomization_scale: config.actuator_randomization_scale,
             spawn_randomization_scale: config.spawn_randomization_scale,
+            forward_progress_reward_scale: config.forward_progress_reward_scale,
+            backward_progress_reward_scale: config.backward_progress_reward_scale,
+            gate_pass_reward: config.gate_pass_reward,
+            gate_pass_speed_reward_scale: config.gate_pass_speed_reward_scale,
+            gate_pass_speed_reward_cap: config.gate_pass_speed_reward_cap,
+            course_completion_reward: config.course_completion_reward,
+            time_penalty_base: config.time_penalty_base,
+            time_penalty_delay: config.time_penalty_delay,
+            time_penalty_scale: config.time_penalty_scale,
+            time_penalty_cap: config.time_penalty_cap,
+            collision_penalty: config.collision_penalty,
+            out_of_bounds_penalty: config.out_of_bounds_penalty,
         }
     }
 }
@@ -245,6 +269,18 @@ impl From<TriadSimConfig> for GpuSimulationConfig {
             dynamics_randomization_scale: config.dynamics_randomization_scale,
             actuator_randomization_scale: config.actuator_randomization_scale,
             spawn_randomization_scale: config.spawn_randomization_scale,
+            forward_progress_reward_scale: config.forward_progress_reward_scale,
+            backward_progress_reward_scale: config.backward_progress_reward_scale,
+            gate_pass_reward: config.gate_pass_reward,
+            gate_pass_speed_reward_scale: config.gate_pass_speed_reward_scale,
+            gate_pass_speed_reward_cap: config.gate_pass_speed_reward_cap,
+            course_completion_reward: config.course_completion_reward,
+            time_penalty_base: config.time_penalty_base,
+            time_penalty_delay: config.time_penalty_delay,
+            time_penalty_scale: config.time_penalty_scale,
+            time_penalty_cap: config.time_penalty_cap,
+            collision_penalty: config.collision_penalty,
+            out_of_bounds_penalty: config.out_of_bounds_penalty,
         }
     }
 }

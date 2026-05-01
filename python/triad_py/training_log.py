@@ -133,6 +133,14 @@ class PPOTrainingLogger:
                 0,
             )
 
+    def emit_status(self, message: str, **payload: object) -> None:
+        event_payload = {"event": "ppo.status", "message": message}
+        if payload:
+            event_payload["status"] = dict(payload)
+        self._emit(event_payload)
+        if self._pretty_output:
+            self._emit_pretty(f"[ppo] {message}")
+
     def emit_update(
         self,
         stats: Mapping[str, object],

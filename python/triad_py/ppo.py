@@ -87,6 +87,18 @@ class PPOConfig:
     dynamics_randomization_scale: float = 1.0
     actuator_randomization_scale: float = 1.0
     spawn_randomization_scale: float = 1.0
+    forward_progress_reward_scale: float = 0.35
+    backward_progress_reward_scale: float = 0.6
+    gate_pass_reward: float = 8.0
+    gate_pass_speed_reward_scale: float = 0.35
+    gate_pass_speed_reward_cap: float = 12.0
+    course_completion_reward: float = 32.0
+    time_penalty_base: float = 0.001
+    time_penalty_delay: float = 1.5
+    time_penalty_scale: float = 0.012
+    time_penalty_cap: float = 0.05
+    collision_penalty: float = 14.0
+    out_of_bounds_penalty: float = 24.0
     learning_rate: float = 3.0e-4
     anneal_learning_rate: bool = True
     gamma: float = 0.99
@@ -473,6 +485,18 @@ def _training_sim_config(course: CourseSpec, config: PPOConfig) -> SimulationCon
     sim_config.dynamics_randomization_scale = config.dynamics_randomization_scale
     sim_config.actuator_randomization_scale = config.actuator_randomization_scale
     sim_config.spawn_randomization_scale = config.spawn_randomization_scale
+    sim_config.forward_progress_reward_scale = config.forward_progress_reward_scale
+    sim_config.backward_progress_reward_scale = config.backward_progress_reward_scale
+    sim_config.gate_pass_reward = config.gate_pass_reward
+    sim_config.gate_pass_speed_reward_scale = config.gate_pass_speed_reward_scale
+    sim_config.gate_pass_speed_reward_cap = config.gate_pass_speed_reward_cap
+    sim_config.course_completion_reward = config.course_completion_reward
+    sim_config.time_penalty_base = config.time_penalty_base
+    sim_config.time_penalty_delay = config.time_penalty_delay
+    sim_config.time_penalty_scale = config.time_penalty_scale
+    sim_config.time_penalty_cap = config.time_penalty_cap
+    sim_config.collision_penalty = config.collision_penalty
+    sim_config.out_of_bounds_penalty = config.out_of_bounds_penalty
     return sim_config
 
 
