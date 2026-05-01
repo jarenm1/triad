@@ -1277,6 +1277,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train = subparsers.add_parser(
         "ppo-train", help="Train a PPO teacher on the Triad sim"
     )
+    ppo_train.add_argument("--task-name", default="drone-racing-basic-lap")
+    ppo_train.add_argument("--task-version", default="v1")
     ppo_train.add_argument("--env-count", type=int, default=256)
     ppo_train.add_argument("--horizon", type=int, default=128)
     ppo_train.add_argument("--total-updates", type=int, default=500)
@@ -1582,6 +1584,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "ppo-train":
         config = PPOConfig(
+            task_name=args.task_name,
+            task_version=args.task_version,
             env_count=args.env_count,
             horizon=args.horizon,
             total_updates=args.total_updates,

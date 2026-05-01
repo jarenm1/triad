@@ -100,6 +100,7 @@ class PPOTrainingLogger:
         pretty_output: bool = True,
         tensorboard_writer: Any | None = None,
         tensorboard_log_dir: str | None = None,
+        task_metadata: Mapping[str, object] | None = None,
     ) -> None:
         self._config = dict(config)
         self._env_steps_per_update = int(config["env_count"]) * int(config["horizon"])
@@ -107,6 +108,7 @@ class PPOTrainingLogger:
         self._pretty_output = pretty_output
         self._tensorboard_writer = tensorboard_writer
         self._tensorboard_log_dir = tensorboard_log_dir
+        self._task_metadata = None if task_metadata is None else dict(task_metadata)
 
     def emit_started(self, *, initial_phase: str) -> None:
         self._emit(
@@ -115,6 +117,7 @@ class PPOTrainingLogger:
                 "config": self._config,
                 "rollout": {"env_steps_per_update": self._env_steps_per_update},
                 "curriculum": {"initial_phase": initial_phase},
+                "task": self._task_metadata,
             }
         )
         if self._pretty_output:
@@ -123,6 +126,10 @@ class PPOTrainingLogger:
                 f"envs={self._config['env_count']} horizon={self._config['horizon']} "
                 f"device={self._config['device']}"
             )
+            if self._task_metadata is not None:
+                task_name = self._task_metadata.get("task_name")
+                task_hash = self._task_metadata.get("task_hash")
+                message += f" task={task_name}#{task_hash}"
             if self._tensorboard_log_dir is not None:
                 message += f" tb={self._tensorboard_log_dir}"
             self._emit_pretty(message)

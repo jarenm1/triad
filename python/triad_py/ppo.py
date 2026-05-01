@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import random
@@ -18,7 +19,10 @@ from . import (
     CurriculumStage,
     SimulationConfig,
     SimulationCore,
+    StageKind,
+    StageSpec,
     TriadFastVecEnv,
+    TurnDirection,
     build_teacher_curriculum_schedule,
 )
 from .training_log import DONE_REASON_BITS, DoneReasonTracker, PPOTrainingLogger
@@ -33,6 +37,123 @@ except ImportError:  # pragma: no cover - runtime dependency
 
 ACTION_SPACE_VERSION = "velocity_yaw_setpoint_v2"
 OBSERVATION_SPACE_VERSION = "teacher_privileged_v1"
+TASK_SPEC_SCHEMA_VERSION = 1
+
+DEFAULT_TRAINING_COURSE_SPEC: dict[str, object] = {
+    "name": "basic-lap",
+    "loop_enabled": True,
+    "laps_required": 1,
+    "stages": [
+        {
+            "kind": "INTRO",
+            "gate_count": 1,
+            "spacing": 3.2,
+            "lateral_amp": 0.0,
+            "turn_degrees": 0.0,
+            "radius": 0.0,
+            "vertical_amp": 0.08,
+            "hole_half_width": 0.6,
+            "hole_half_height": 0.6,
+            "direction": "LEFT",
+        },
+        {
+            "kind": "STRAIGHT",
+            "gate_count": 2,
+            "spacing": 4.8,
+            "lateral_amp": 0.0,
+            "turn_degrees": 0.0,
+            "radius": 0.0,
+            "vertical_amp": 0.12,
+            "hole_half_width": 0.6,
+            "hole_half_height": 0.6,
+            "direction": "LEFT",
+        },
+        {
+            "kind": "TURN90",
+            "gate_count": 1,
+            "spacing": 1.5,
+            "lateral_amp": 0.0,
+            "turn_degrees": 90.0,
+            "radius": 4.8,
+            "vertical_amp": 0.22,
+            "hole_half_width": 0.6,
+            "hole_half_height": 0.6,
+            "direction": "LEFT",
+        },
+        {
+            "kind": "STRAIGHT",
+            "gate_count": 2,
+            "spacing": 5.1,
+            "lateral_amp": 0.0,
+            "turn_degrees": 0.0,
+            "radius": 0.0,
+            "vertical_amp": 0.18,
+            "hole_half_width": 0.6,
+            "hole_half_height": 0.6,
+            "direction": "LEFT",
+        },
+        {
+            "kind": "OFFSET",
+            "gate_count": 2,
+            "spacing": 4.4,
+            "lateral_amp": 1.5,
+            "turn_degrees": 0.0,
+            "radius": 0.0,
+            "vertical_amp": 0.3,
+            "hole_half_width": 0.6,
+            "hole_half_height": 0.6,
+            "direction": "LEFT",
+        },
+        {
+            "kind": "TURN90",
+            "gate_count": 1,
+            "spacing": 1.5,
+            "lateral_amp": 0.0,
+            "turn_degrees": 90.0,
+            "radius": 4.5,
+            "vertical_amp": 0.38,
+            "hole_half_width": 0.6,
+            "hole_half_height": 0.6,
+            "direction": "RIGHT",
+        },
+        {
+            "kind": "STRAIGHT",
+            "gate_count": 2,
+            "spacing": 5.0,
+            "lateral_amp": 0.0,
+            "turn_degrees": 0.0,
+            "radius": 0.0,
+            "vertical_amp": 0.28,
+            "hole_half_width": 0.6,
+            "hole_half_height": 0.6,
+            "direction": "LEFT",
+        },
+        {
+            "kind": "TURN90",
+            "gate_count": 1,
+            "spacing": 1.5,
+            "lateral_amp": 0.0,
+            "turn_degrees": 90.0,
+            "radius": 4.7,
+            "vertical_amp": 0.2,
+            "hole_half_width": 0.6,
+            "hole_half_height": 0.6,
+            "direction": "RIGHT",
+        },
+        {
+            "kind": "STRAIGHT",
+            "gate_count": 2,
+            "spacing": 4.6,
+            "lateral_amp": 0.0,
+            "turn_degrees": 0.0,
+            "radius": 0.0,
+            "vertical_amp": 0.14,
+            "hole_half_width": 0.6,
+            "hole_half_height": 0.6,
+            "direction": "LEFT",
+        },
+    ],
+}
 
 
 def _require_torch():
@@ -80,6 +201,8 @@ def _resolve_device(requested: str) -> str:
 @dataclass
 class PPOConfig:
     env_count: int = 256
+    task_name: str = "drone-racing-basic-lap"
+    task_version: str = "v1"
     horizon: int = 128
     total_updates: int = 500
     warmup_updates: int = 25
@@ -245,6 +368,9 @@ class PPOEvalResult:
     eval_env_count: int
     max_episode_steps: int
     per_env: bool
+    task_name: str | None
+    task_version: str | None
+    task_hash: str | None
     results: list[CurriculumEvalStats]
 
 
@@ -363,6 +489,7 @@ class LoadedPPOPolicy:
     device: str
     config: dict[str, object]
     observation_normalizer: "RunningMeanStd | None"
+    task_spec: dict[str, object] | None
 
     def predict(
         self, observations: np.ndarray, deterministic: bool = True
@@ -471,8 +598,37 @@ def _set_global_seeds(seed: int) -> None:
         torch_module.cuda.manual_seed_all(seed)
 
 
+def _copy_json_value(value: object) -> object:
+    return json.loads(json.dumps(value))
+
+
+def _build_default_training_course() -> CourseSpec:
+    course = (
+        CourseSpec(str(DEFAULT_TRAINING_COURSE_SPEC["name"]))
+        .set_loop_enabled(bool(DEFAULT_TRAINING_COURSE_SPEC["loop_enabled"]))
+        .set_laps_required(int(DEFAULT_TRAINING_COURSE_SPEC["laps_required"]))
+    )
+    for stage in DEFAULT_TRAINING_COURSE_SPEC["stages"]:
+        assert isinstance(stage, dict)
+        course.add_stage(
+            StageSpec(
+                kind=StageKind[str(stage["kind"])],
+                gate_count=int(stage["gate_count"]),
+                spacing=float(stage["spacing"]),
+                lateral_amp=float(stage["lateral_amp"]),
+                turn_degrees=float(stage["turn_degrees"]),
+                radius=float(stage["radius"]),
+                vertical_amp=float(stage["vertical_amp"]),
+                hole_half_width=float(stage["hole_half_width"]),
+                hole_half_height=float(stage["hole_half_height"]),
+                direction=TurnDirection[str(stage["direction"])],
+            )
+        )
+    return course
+
+
 def _default_training_course() -> CourseSpec:
-    return CourseSpec.default_drone_course()
+    return _build_default_training_course()
 
 
 def _training_sim_config(course: CourseSpec, config: PPOConfig) -> SimulationConfig:
@@ -506,6 +662,120 @@ def _evaluation_sim_config(course: CourseSpec, config: PPOConfig) -> SimulationC
         1, min(config.curriculum_eval_env_count, config.env_count)
     )
     return sim_config
+
+
+def _task_reward_config(config: PPOConfig) -> dict[str, object]:
+    return {
+        "forward_progress_reward_scale": config.forward_progress_reward_scale,
+        "backward_progress_reward_scale": config.backward_progress_reward_scale,
+        "gate_pass_reward": config.gate_pass_reward,
+        "gate_pass_speed_reward_scale": config.gate_pass_speed_reward_scale,
+        "gate_pass_speed_reward_cap": config.gate_pass_speed_reward_cap,
+        "course_completion_reward": config.course_completion_reward,
+        "time_penalty_base": config.time_penalty_base,
+        "time_penalty_delay": config.time_penalty_delay,
+        "time_penalty_scale": config.time_penalty_scale,
+        "time_penalty_cap": config.time_penalty_cap,
+        "collision_penalty": config.collision_penalty,
+        "out_of_bounds_penalty": config.out_of_bounds_penalty,
+    }
+
+
+def _task_randomization_config(config: PPOConfig) -> dict[str, object]:
+    return {
+        "dynamics_randomization_scale": config.dynamics_randomization_scale,
+        "actuator_randomization_scale": config.actuator_randomization_scale,
+        "spawn_randomization_scale": config.spawn_randomization_scale,
+    }
+
+
+def _task_curriculum_config(config: PPOConfig, schedule) -> dict[str, object]:
+    return {
+        "schedule_name": "teacher_v1",
+        "phases": [
+            {
+                "name": phase.name,
+                "progress_end": phase.progress_end,
+                "curriculum_stage": int(phase.curriculum_stage),
+                "difficulty_min": phase.difficulty_min,
+                "difficulty_max": phase.difficulty_max,
+                "grammar_ids": list(phase.grammar_ids),
+            }
+            for phase in schedule.phases
+        ],
+        "mastery_window": config.curriculum_mastery_window,
+        "min_stage_updates": config.curriculum_min_stage_updates,
+        "completion_threshold": config.curriculum_completion_threshold,
+        "progress_threshold": config.curriculum_progress_threshold,
+        "current_weight": config.curriculum_current_weight,
+        "previous_weight": config.curriculum_previous_weight,
+        "easy_weight": config.curriculum_easy_weight,
+        "holdout_seed": config.curriculum_holdout_seed,
+    }
+
+
+def _build_training_task_spec(config: PPOConfig, schedule) -> dict[str, object]:
+    course = _default_training_course()
+    try:
+        sim_config = _training_sim_config(course, config)
+    finally:
+        course.close()
+    payload = {
+        "schema_version": TASK_SPEC_SCHEMA_VERSION,
+        "task_name": config.task_name,
+        "task_version": config.task_version,
+        "action_space_version": ACTION_SPACE_VERSION,
+        "observation_space_version": OBSERVATION_SPACE_VERSION,
+        "environment": {
+            "dt_seconds": sim_config.dt_seconds,
+            "bounds": sim_config.bounds,
+            "max_episode_steps": config.max_episode_steps,
+            "max_gates_per_env": sim_config.max_gates_per_env,
+            "laps_required": sim_config.laps_required,
+        },
+        "course": {
+            "template": "basic-lap",
+            **_copy_json_value(DEFAULT_TRAINING_COURSE_SPEC),
+        },
+        "reward": _task_reward_config(config),
+        "randomization": _task_randomization_config(config),
+        "curriculum": _task_curriculum_config(config, schedule),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    payload["task_hash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return payload
+
+
+def _resolve_artifact_dir(
+    config: PPOConfig,
+    *,
+    tensorboard_log_dir: str | None,
+) -> Path | None:
+    if tensorboard_log_dir is not None:
+        return Path(tensorboard_log_dir)
+    if config.checkpoint_path:
+        checkpoint_path = Path(config.checkpoint_path)
+        return checkpoint_path.parent / f"{checkpoint_path.stem}_artifacts"
+    return None
+
+
+def _save_run_artifacts(
+    artifact_dir: Path | None,
+    *,
+    config: PPOConfig,
+    task_spec: dict[str, object],
+) -> None:
+    if artifact_dir is None:
+        return
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "task_spec.json").write_text(
+        json.dumps(task_spec, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (artifact_dir / "training_config.json").write_text(
+        json.dumps(asdict(config), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _hash_to_unit(seed: int) -> float:
@@ -1345,6 +1615,7 @@ def _save_checkpoint(
     model: ActorCritic,
     optimizer,
     config: PPOConfig,
+    task_spec: dict[str, object],
     observation_normalizer: RunningMeanStd | None,
     curriculum: MasteryCurriculumController,
     update_index: int,
@@ -1357,6 +1628,7 @@ def _save_checkpoint(
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "config": asdict(config),
+            "task_spec": _copy_json_value(task_spec),
             "action_space_version": ACTION_SPACE_VERSION,
             "observation_space_version": OBSERVATION_SPACE_VERSION,
             "observation_normalizer": None
@@ -1465,6 +1737,7 @@ def load_ppo_policy(
         observation_normalizer=None
         if observation_normalizer_state is None
         else RunningMeanStd.from_state_dict(observation_normalizer_state),
+        task_spec=checkpoint.get("task_spec"),
     )
 
 
@@ -1545,6 +1818,15 @@ def evaluate_ppo_checkpoint(
         eval_env_count=resolved_eval_env_count,
         max_episode_steps=config.max_episode_steps,
         per_env=per_env,
+        task_name=None
+        if policy.task_spec is None
+        else str(policy.task_spec.get("task_name")),
+        task_version=None
+        if policy.task_spec is None
+        else str(policy.task_spec.get("task_version")),
+        task_hash=None
+        if policy.task_spec is None
+        else str(policy.task_spec.get("task_hash")),
         results=results,
     )
 
@@ -1582,6 +1864,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
 
     schedule = build_teacher_curriculum_schedule()
     curriculum = MasteryCurriculumController(schedule, config)
+    task_spec = _build_training_task_spec(config, schedule)
 
     course = _default_training_course()
     sim = SimulationCore(_training_sim_config(course, config))
@@ -1628,10 +1911,27 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
             tensorboard_log_dir=(
                 None if tensorboard_log_dir is None else str(tensorboard_log_dir)
             ),
+            task_metadata={
+                "task_name": task_spec["task_name"],
+                "task_version": task_spec["task_version"],
+                "task_hash": task_spec["task_hash"],
+            },
         )
+        artifact_dir = _resolve_artifact_dir(
+            config,
+            tensorboard_log_dir=(
+                None if tensorboard_log_dir is None else str(tensorboard_log_dir)
+            ),
+        )
+        _save_run_artifacts(artifact_dir, config=config, task_spec=task_spec)
         start_update = 0
         total_env_steps = 0
+        training_logger.emit_started(initial_phase=curriculum.current_phase().name)
         if resume_path is not None:
+            training_logger.emit_status(
+                f"loading checkpoint {resume_path}",
+                resume_from=str(resume_path),
+            )
             checkpoint = torch_module.load(
                 resume_path, map_location=device, weights_only=False
             )
@@ -1653,6 +1953,12 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
             start_update = max(0, int(checkpoint.get("update_index", -1)) + 1)
             total_env_steps = max(0, int(checkpoint.get("total_env_steps", 0)))
         elif config.pretrain_updates > 0:
+            training_logger.emit_status(
+                "running behavior-clone pretrain",
+                pretrain_updates=config.pretrain_updates,
+                pretrain_epochs=config.pretrain_epochs,
+                pretrain_minibatch_size=config.pretrain_minibatch_size,
+            )
             observation_normalizer = _behavior_clone_pretrain(
                 env,
                 model,
@@ -1680,7 +1986,6 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
         final_phase = curriculum.current_phase().name
         final_progress = curriculum.progress()
         best_phase_snapshot: PhaseBestEvalSnapshot | None = None
-        training_logger.emit_started(initial_phase=final_phase)
         end_update = start_update + config.total_updates
 
         for update_index in range(start_update, end_update):
@@ -1893,6 +2198,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                             model=model,
                             optimizer=optimizer,
                             config=config,
+                            task_spec=task_spec,
                             observation_normalizer=observation_normalizer,
                             curriculum=curriculum,
                             update_index=update_index,
@@ -1921,6 +2227,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                             model=model,
                             optimizer=optimizer,
                             config=config,
+                            task_spec=task_spec,
                             observation_normalizer=observation_normalizer,
                             curriculum=curriculum,
                             update_index=best_phase_snapshot.update_index,
@@ -2006,6 +2313,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                     model=model,
                     optimizer=optimizer,
                     config=config,
+                    task_spec=task_spec,
                     observation_normalizer=observation_normalizer,
                     curriculum=curriculum,
                     update_index=update_index,
@@ -2023,6 +2331,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                 model=model,
                 optimizer=optimizer,
                 config=config,
+                task_spec=task_spec,
                 observation_normalizer=observation_normalizer,
                 curriculum=curriculum,
                 update_index=end_update - 1,
