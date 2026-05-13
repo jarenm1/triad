@@ -562,7 +562,14 @@ impl RendererManager for VisualizerManager {
             self.refresh_layout_cache(renderer, registry)?;
         }
 
-        if !replay_advancing || readback_due {
+        if replay_advancing {
+            self.refresh_state_cache(renderer, registry)?;
+            self.update_trails();
+            if readback_due {
+                self.refresh_observation_cache(renderer, registry)?;
+                self.refresh_reward_done_cache(renderer, registry)?;
+            }
+        } else {
             self.refresh_dynamic_caches(renderer, registry)?;
         }
 
@@ -578,11 +585,19 @@ impl RendererManager for VisualizerManager {
         let selected_state = self.cached_states.get(self.selected_env).copied();
         let selected_observation = self.cached_observations.get(self.selected_env).copied();
         let selected_reward_done = self.cached_reward_done.get(self.selected_env).copied();
+        let selected_gate_count = self.selected_gate_count();
+        let selected_course_complete = selected_state
+            .map(|state| {
+                state.done != 0
+                    || (selected_gate_count > 0 && state.current_gate >= selected_gate_count)
+            })
+            .unwrap_or(false);
         if snapshot.replay.auto_pause_on_terminal
             && snapshot.replay.playback == ReplayPlayback::Playing
-            && selected_reward_done
-                .map(|value| value.done != 0)
-                .unwrap_or(false)
+            && (selected_course_complete
+                || selected_reward_done
+                    .map(|value| value.done != 0)
+                    .unwrap_or(false))
         {
             {
                 let mut ui = self.ui_state.lock().expect("ui state poisoned");
@@ -590,6 +605,8 @@ impl RendererManager for VisualizerManager {
             }
             if let Some(reward_done) = selected_reward_done {
                 self.set_replay_status(terminal_pause_status(reward_done));
+            } else if selected_course_complete {
+                self.set_replay_status("Replay paused at terminal course state");
             }
         }
         self.rebuild_instances(selected_state);

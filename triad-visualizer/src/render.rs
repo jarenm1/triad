@@ -334,9 +334,22 @@ pub(crate) fn target_instance(gate: Gate) -> RenderInstance {
 }
 
 pub(crate) fn autopilot_action(state: EnvState, target_gate: Gate) -> Action {
-    let delta_x = target_gate.center[0] - state.position[0];
-    let delta_y = target_gate.center[1] - state.position[1];
-    let delta_z = target_gate.center[2] - state.position[2];
+    let gate_forward_length = (target_gate.forward[0] * target_gate.forward[0]
+        + target_gate.forward[2] * target_gate.forward[2])
+        .sqrt()
+        .max(1.0e-6);
+    let gate_forward = [
+        target_gate.forward[0] / gate_forward_length,
+        target_gate.forward[2] / gate_forward_length,
+    ];
+    let exit_target = [
+        target_gate.center[0] + gate_forward[0] * 1.4,
+        target_gate.center[1],
+        target_gate.center[2] + gate_forward[1] * 1.4,
+    ];
+    let delta_x = exit_target[0] - state.position[0];
+    let delta_y = exit_target[1] - state.position[1];
+    let delta_z = exit_target[2] - state.position[2];
     let yaw = state.attitude[2];
     let heading = [yaw.cos(), yaw.sin()];
     let right = [heading[1], -heading[0]];
@@ -349,14 +362,6 @@ pub(crate) fn autopilot_action(state: EnvState, target_gate: Gate) -> Action {
     let approach_dir = [
         horizontal_delta[0] / safe_distance,
         horizontal_delta[1] / safe_distance,
-    ];
-    let gate_forward_length = (target_gate.forward[0] * target_gate.forward[0]
-        + target_gate.forward[2] * target_gate.forward[2])
-        .sqrt()
-        .max(1.0e-6);
-    let gate_forward = [
-        target_gate.forward[0] / gate_forward_length,
-        target_gate.forward[2] / gate_forward_length,
     ];
     let gate_align_weight = (1.0 - horizontal_distance / 6.0).clamp(0.0, 1.0);
     let desired_dir_raw = [
@@ -375,8 +380,12 @@ pub(crate) fn autopilot_action(state: EnvState, target_gate: Gate) -> Action {
     let yaw_error = ((desired_yaw - yaw) + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
         - std::f32::consts::PI;
     let gate_right = [gate_forward[1], -gate_forward[0]];
+    let gate_center_delta = [
+        target_gate.center[0] - state.position[0],
+        target_gate.center[2] - state.position[2],
+    ];
     let cross_track_error =
-        (horizontal_delta[0] * gate_right[0] + horizontal_delta[1] * gate_right[1]).abs();
+        (gate_center_delta[0] * gate_right[0] + gate_center_delta[1] * gate_right[1]).abs();
     let yaw_scale = 1.0 - ((yaw_error.abs() - 0.16) / 0.32).clamp(0.0, 1.0);
     let cross_track_scale = 1.0 - ((cross_track_error - 0.08) / 0.32).clamp(0.0, 1.0);
     let approach_scale = (yaw_scale * yaw_scale * cross_track_scale)
