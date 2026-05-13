@@ -1,12 +1,8 @@
 use std::collections::VecDeque;
 use std::error::Error;
-use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use glam::Vec3;
-use serde::{Deserialize, Serialize};
 use tracing::info;
 use triad_gpu::{
     BindingType, BufferUsage, ColorLoadOp, DepthLoadOp, ExecutableFrameGraph, FrameGraphError,
@@ -192,15 +188,12 @@ impl RenderInstance {
 #[derive(Debug)]
 struct UiState {
     replay_active: bool,
-    use_checkpoint_policy: bool,
     selected_env: usize,
     difficulty: f32,
     curriculum_phase: usize,
     curriculum_stage: u32,
     seed_base: u32,
-    checkpoint_path: String,
-    checkpoint_status: String,
-    request_load_checkpoint: bool,
+    replay_status: String,
     request_reset_selected: bool,
     request_reset_all: bool,
     request_randomize: bool,
@@ -218,22 +211,18 @@ struct UiState {
     time_penalty: f32,
     sparse_objective_reward: f32,
     collision_penalty: f32,
-    last_value_estimate: f32,
 }
 
 impl Default for UiState {
     fn default() -> Self {
         Self {
             replay_active: false,
-            use_checkpoint_policy: false,
             selected_env: 0,
             difficulty: 0.35,
             curriculum_phase: 0,
             curriculum_stage: 0,
             seed_base: 1,
-            checkpoint_path: "checkpoints/v11-gate-discovery-oob-control.pt".to_string(),
-            checkpoint_status: "Heuristic replay ready".to_string(),
-            request_load_checkpoint: false,
+            replay_status: "Heuristic replay ready".to_string(),
             request_reset_selected: false,
             request_reset_all: false,
             request_randomize: false,
@@ -251,7 +240,6 @@ impl Default for UiState {
             time_penalty: 0.0,
             sparse_objective_reward: 0.0,
             collision_penalty: 0.0,
-            last_value_estimate: 0.0,
         }
     }
 }
@@ -259,36 +247,14 @@ impl Default for UiState {
 #[derive(Debug, Clone)]
 struct UiSnapshot {
     replay_active: bool,
-    use_checkpoint_policy: bool,
     selected_env: usize,
     difficulty: f32,
     curriculum_phase: usize,
     curriculum_stage: u32,
     seed_base: u32,
-    checkpoint_path: String,
-    load_checkpoint: bool,
     reset_selected: bool,
     reset_all: bool,
     randomize: bool,
-}
-
-#[derive(Serialize)]
-struct PpoPolicyRequest {
-    observations: Vec<Vec<f32>>,
-    deterministic: bool,
-}
-
-#[derive(Deserialize)]
-struct PpoPolicyResponse {
-    actions: Option<Vec<Vec<f32>>>,
-    values: Option<Vec<f32>>,
-    error: Option<String>,
-}
-
-struct PpoPolicyClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
 }
 
 #[derive(Clone, Copy)]
@@ -359,98 +325,6 @@ const CURRICULUM_PHASES: &[CurriculumPhaseProfile] = &[
     },
 ];
 
-impl PpoPolicyClient {
-    fn spawn(checkpoint_path: &str) -> Result<Self, Box<dyn Error>> {
-        if checkpoint_path.trim().is_empty() {
-            return Err(io::Error::other("checkpoint path is empty").into());
-        }
-
-        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .ok_or_else(|| io::Error::other("workspace root missing"))?
-            .to_path_buf();
-        let mut child = Command::new("uv")
-            .args([
-                "run",
-                "--extra",
-                "training",
-                "python",
-                "-m",
-                "triad_py",
-                "ppo-policy-server",
-                "--checkpoint",
-                checkpoint_path,
-                "--device",
-                "cpu",
-            ])
-            .current_dir(workspace_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| io::Error::other("policy server stdin unavailable"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("policy server stdout unavailable"))?;
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        })
-    }
-
-    fn predict(
-        &mut self,
-        observations: &[Observation],
-    ) -> Result<(Vec<[f32; 4]>, Vec<f32>), Box<dyn Error>> {
-        let request = PpoPolicyRequest {
-            observations: observations.iter().map(flatten_observation).collect(),
-            deterministic: true,
-        };
-        writeln!(self.stdin, "{}", serde_json::to_string(&request)?)?;
-        self.stdin.flush()?;
-
-        let mut line = String::new();
-        if self.stdout.read_line(&mut line)? == 0 {
-            return Err(io::Error::other("policy server exited unexpectedly").into());
-        }
-
-        let response: PpoPolicyResponse = serde_json::from_str(line.trim())?;
-        if let Some(error) = response.error {
-            return Err(io::Error::other(error).into());
-        }
-
-        let action_rows = response
-            .actions
-            .ok_or_else(|| io::Error::other("policy response missing actions"))?;
-        let mut actions = Vec::with_capacity(action_rows.len());
-        for row in action_rows {
-            if row.len() != 4 {
-                return Err(io::Error::other(format!(
-                    "expected 4 action values, got {}",
-                    row.len()
-                ))
-                .into());
-            }
-            actions.push([row[0], row[1], row[2], row[3]]);
-        }
-        Ok((actions, response.values.unwrap_or_default()))
-    }
-}
-
-impl Drop for PpoPolicyClient {
-    fn drop(&mut self) {
-        let _ = writeln!(self.stdin, "{{\"kind\":\"shutdown\"}}");
-        let _ = self.stdin.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 struct VisualizerManager {
     sim: GpuSimulation,
     ui_state: Arc<Mutex<UiState>>,
@@ -468,8 +342,6 @@ struct VisualizerManager {
     actions: Vec<Action>,
     instances: Vec<RenderInstance>,
     trail_points: Vec<VecDeque<[f32; 3]>>,
-    checkpoint_client: Option<PpoPolicyClient>,
-    last_value_estimates: Vec<f32>,
     selected_env: usize,
     layouts_dirty: bool,
     applied_difficulty: f32,
@@ -605,8 +477,6 @@ impl VisualizerManager {
             actions: zero_actions,
             instances: hidden_instances,
             trail_points,
-            checkpoint_client: None,
-            last_value_estimates: vec![0.0; VISUALIZER_ENV_COUNT],
             selected_env: 0,
             layouts_dirty: true,
             applied_difficulty: 0.35,
@@ -646,7 +516,6 @@ impl VisualizerManager {
             Self::curriculum_phase_profile(state.curriculum_phase).curriculum_stage;
         let snapshot = UiSnapshot {
             replay_active: state.replay_active,
-            use_checkpoint_policy: state.use_checkpoint_policy,
             selected_env: state
                 .selected_env
                 .min(self.sim.env_count().saturating_sub(1)),
@@ -654,24 +523,21 @@ impl VisualizerManager {
             curriculum_phase: state.curriculum_phase,
             curriculum_stage: state.curriculum_stage,
             seed_base: state.seed_base,
-            checkpoint_path: state.checkpoint_path.clone(),
-            load_checkpoint: state.request_load_checkpoint,
             reset_selected: state.request_reset_selected,
             reset_all: state.request_reset_all,
             randomize: state.request_randomize,
         };
-        state.request_load_checkpoint = false;
         state.request_reset_selected = false;
         state.request_reset_all = false;
         state.request_randomize = false;
         snapshot
     }
 
-    fn set_checkpoint_status(&self, status: impl Into<String>) {
+    fn set_replay_status(&self, status: impl Into<String>) {
         self.ui_state
             .lock()
             .expect("ui state poisoned")
-            .checkpoint_status = status.into();
+            .replay_status = status.into();
     }
 
     fn randomize_reset_params(
@@ -762,43 +628,12 @@ impl VisualizerManager {
 
     fn apply_heuristic_actions(&mut self) {
         self.actions.fill(Action::idle());
-        self.last_value_estimates.fill(0.0);
         for (env_index, state) in self.cached_states.iter().copied().enumerate() {
             if let Some(target_gate) = self.target_gate_for_env(env_index, &state) {
                 self.actions[env_index] = autopilot_action(state, target_gate);
             }
         }
-        self.set_checkpoint_status("Replay active with heuristic policy");
-    }
-
-    fn apply_checkpoint_actions(&mut self) -> Result<(), Box<dyn Error>> {
-        let Some(client) = self.checkpoint_client.as_mut() else {
-            return Err(io::Error::other("checkpoint policy is not loaded").into());
-        };
-
-        let (action_rows, values) = client.predict(&self.cached_observations)?;
-        if action_rows.len() != self.actions.len() {
-            return Err(io::Error::other(format!(
-                "policy returned {} action rows for {} envs",
-                action_rows.len(),
-                self.actions.len(),
-            ))
-            .into());
-        }
-
-        for (slot, action_row) in self.actions.iter_mut().zip(action_rows.iter().copied()) {
-            *slot = Action::new(action_row);
-        }
-        self.last_value_estimates.fill(0.0);
-        for (slot, value) in self
-            .last_value_estimates
-            .iter_mut()
-            .zip(values.iter().copied())
-        {
-            *slot = value;
-        }
-        self.set_checkpoint_status("Replay active with PPO checkpoint (all envs)");
-        Ok(())
+        self.set_replay_status("Replay active with heuristic controller");
     }
 
     fn rebuild_instances(&mut self, selected_state: Option<EnvState>) {
@@ -883,17 +718,11 @@ impl VisualizerManager {
             ui.current_gate = state.current_gate;
             ui.done = state.done != 0;
             ui.position = state.position;
-            ui.last_value_estimate = self
-                .last_value_estimates
-                .get(self.selected_env)
-                .copied()
-                .unwrap_or(0.0);
         } else {
             ui.gate_count = 0;
             ui.current_gate = 0;
             ui.done = false;
             ui.position = [0.0, 0.0, 0.0];
-            ui.last_value_estimate = 0.0;
         }
 
         if let Some(observation) = selected_observation {
@@ -985,22 +814,6 @@ impl RendererManager for VisualizerManager {
         let generation_changed = (snapshot.difficulty - self.applied_difficulty).abs() > 1e-5
             || snapshot.curriculum_phase != self.applied_curriculum_phase;
 
-        if snapshot.load_checkpoint {
-            match PpoPolicyClient::spawn(&snapshot.checkpoint_path) {
-                Ok(client) => {
-                    self.checkpoint_client = Some(client);
-                    self.set_checkpoint_status(format!(
-                        "Loaded checkpoint {}",
-                        snapshot.checkpoint_path
-                    ));
-                }
-                Err(error) => {
-                    self.checkpoint_client = None;
-                    self.set_checkpoint_status(format!("Checkpoint load failed: {error}"));
-                }
-            }
-        }
-
         let mut forced_reset_step = false;
         if self.layouts_dirty {
             self.sim.step(renderer, registry);
@@ -1052,37 +865,19 @@ impl RendererManager for VisualizerManager {
         self.update_trails();
 
         if snapshot.replay_active {
-            let apply_result = if snapshot.use_checkpoint_policy {
-                self.apply_checkpoint_actions()
-            } else {
-                self.apply_heuristic_actions();
-                Ok(())
-            };
-
-            match apply_result {
-                Ok(()) => {
-                    self.sim.set_actions(renderer, registry, &self.actions)?;
-                    self.sim.step(renderer, registry);
-                    self.refresh_state_cache(renderer, registry)?;
-                    self.refresh_observation_cache(renderer, registry)?;
-                    self.refresh_reward_done_cache(renderer, registry)?;
-                    self.update_trails();
-                }
-                Err(error) => {
-                    {
-                        let mut ui = self.ui_state.lock().expect("ui state poisoned");
-                        ui.replay_active = false;
-                    }
-                    self.set_checkpoint_status(format!("Replay paused: {error}"));
-                }
-            }
+            self.apply_heuristic_actions();
+            self.sim.set_actions(renderer, registry, &self.actions)?;
+            self.sim.step(renderer, registry);
+            self.refresh_state_cache(renderer, registry)?;
+            self.refresh_observation_cache(renderer, registry)?;
+            self.refresh_reward_done_cache(renderer, registry)?;
+            self.update_trails();
         }
 
         let selected_state = self.cached_states.get(self.selected_env).copied();
         let selected_observation = self.cached_observations.get(self.selected_env).copied();
         let selected_reward_done = self.cached_reward_done.get(self.selected_env).copied();
         if snapshot.replay_active
-            && !snapshot.use_checkpoint_policy
             && selected_reward_done
                 .map(|value| value.done != 0)
                 .unwrap_or(false)
@@ -1092,7 +887,7 @@ impl RendererManager for VisualizerManager {
                 ui.replay_active = false;
             }
             if let Some(reward_done) = selected_reward_done {
-                self.set_checkpoint_status(format!(
+                self.set_replay_status(format!(
                     "Replay paused at terminal state: {}",
                     format_done_reasons(reward_done.done_reason)
                 ));
@@ -1185,15 +980,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .default_pos(egui::pos2(12.0, 84.0))
                     .show(ctx, |panel| {
                         panel.checkbox(&mut ui.replay_active, "Replay Active");
-                        panel.checkbox(&mut ui.use_checkpoint_policy, "Use Checkpoint Policy");
-                        panel.horizontal(|row| {
-                            row.label("Checkpoint");
-                            row.text_edit_singleline(&mut ui.checkpoint_path);
-                        });
-                        if panel.button("Load Checkpoint").clicked() {
-                            ui.request_load_checkpoint = true;
-                        }
-                        panel.label(format!("Policy Status: {}", ui.checkpoint_status));
+                        panel.label(format!("Replay Status: {}", ui.replay_status));
                         if panel.button("Reset Selected").clicked() {
                             ui.request_reset_selected = true;
                         }
@@ -1254,7 +1041,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                             format_done_reasons(ui.done_reason_bits)
                         ));
                         panel.label(format!("Reward: {:.3}", ui.reward));
-                        panel.label(format!("Value Estimate: {:.3}", ui.last_value_estimate));
                         panel.label(format!("Progress: {:.3}", ui.progress));
                         panel.label(format!("Distance To Gate: {:.3}", ui.distance_to_gate));
                         panel.label(format!("Gate Alignment: {:.3}", ui.gate_alignment));
@@ -1312,48 +1098,6 @@ fn required_gate_capacity(course: &CourseSpec) -> usize {
 
 fn visualizer_course() -> CourseSpec {
     CourseSpec::default_drone_course()
-}
-
-fn flatten_observation(observation: &Observation) -> Vec<f32> {
-    vec![
-        observation.position[0],
-        observation.position[1],
-        observation.position[2],
-        observation.velocity[0],
-        observation.velocity[1],
-        observation.velocity[2],
-        observation.attitude[0],
-        observation.attitude[1],
-        observation.attitude[2],
-        observation.angular_velocity[0],
-        observation.angular_velocity[1],
-        observation.angular_velocity[2],
-        observation.target_gate_position[0],
-        observation.target_gate_position[1],
-        observation.target_gate_position[2],
-        observation.target_gate_forward[0],
-        observation.target_gate_forward[1],
-        observation.target_gate_forward[2],
-        observation.progress,
-        observation.distance_to_gate,
-        observation.gate_alignment,
-        observation.mean_motor_thrust,
-        observation.privileged_velocity_body[0],
-        observation.privileged_velocity_body[1],
-        observation.privileged_velocity_body[2],
-        observation.privileged_target_gate_body[0],
-        observation.privileged_target_gate_body[1],
-        observation.privileged_target_gate_body[2],
-        observation.privileged_target_gate_forward_body[0],
-        observation.privileged_target_gate_forward_body[1],
-        observation.privileged_target_gate_forward_body[2],
-        observation.privileged_next_gate_body[0],
-        observation.privileged_next_gate_body[1],
-        observation.privileged_next_gate_body[2],
-        observation.privileged_next_gate_forward_body[0],
-        observation.privileged_next_gate_forward_body[1],
-        observation.privileged_next_gate_forward_body[2],
-    ]
 }
 
 fn format_done_reasons(done_reason_bits: u32) -> String {
