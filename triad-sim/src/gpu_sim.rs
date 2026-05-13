@@ -240,12 +240,25 @@ fn early_stage_assist_strength(curriculum_stage: u32) -> f32 {
 
 fn early_stage_penalty_relief_strength(curriculum_stage: u32) -> f32 {
     if (is_bootstrap_stage(curriculum_stage)) {
-        return 1.0;
+        return 0.7;
     }
     if (curriculum_stage == 1u) {
-        return 0.6;
+        return 0.2;
     }
     return 0.0;
+}
+
+fn early_stage_gate_pass_reward_scale(curriculum_stage: u32) -> f32 {
+    if (is_bootstrap_stage(curriculum_stage)) {
+        return 2.0;
+    }
+    if (curriculum_stage == 1u) {
+        return 1.35;
+    }
+    if (curriculum_stage == 2u) {
+        return 1.15;
+    }
+    return 1.0;
 }
 
 fn randomized_positive_scale(seed: u32, salt: u32, magnitude: f32) -> f32 {
@@ -2154,8 +2167,10 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         * (1.0
             - penalty_relief_strength
                 * (1.0 - params.bootstrap_gate_pass_speed_reward_scale));
+    let gate_pass_reward =
+        params.gate_pass_reward * early_stage_gate_pass_reward_scale(reset.curriculum_stage);
     let sparse_objective_reward =
-        select(0.0, params.gate_pass_reward + pass_speed_bonus, passed_gate)
+        select(0.0, gate_pass_reward + pass_speed_bonus, passed_gate)
         + select(0.0, params.course_completion_reward, (done_reason & DONE_REASON_COMPLETE) != 0u);
     let time_penalty =
         (params.time_penalty_base

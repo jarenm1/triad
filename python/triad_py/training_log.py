@@ -306,6 +306,9 @@ class PPOTrainingLogger:
             "eval/completion_rate", float(stats["eval_completion_rate"]), env_step
         )
         writer.add_scalar(
+            "eval/gate_pass_rate", float(stats.get("eval_gate_pass_rate", 0.0)), env_step
+        )
+        writer.add_scalar(
             "eval/mean_progress", float(stats["eval_mean_progress"]), env_step
         )
         writer.add_scalar(
@@ -366,6 +369,7 @@ class PPOTrainingLogger:
             eval_text = (
                 f" | eval prog={float(eval_payload['mean_progress']):.3f}"
                 f" comp={float(eval_payload['completion_rate']):.1%}"
+                f" pass={float(eval_payload.get('gate_pass_rate', 0.0)):.1%}"
                 f" ret={float(eval_payload['mean_episode_return']):.1f}"
             )
 

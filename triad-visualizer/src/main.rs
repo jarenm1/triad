@@ -48,7 +48,6 @@ const THRUST_VECTOR_LENGTH: f32 = 0.55;
 const VELOCITY_VECTOR_SCALE: f32 = 0.22;
 const VELOCITY_VECTOR_MAX_LENGTH: f32 = 0.9;
 const VISUALIZER_ENV_COUNT: usize = 128;
-const MAX_CURRICULUM_STAGE: u32 = 4;
 const DONE_REASON_COMPLETE: u32 = 1 << 0;
 const DONE_REASON_GATE_COLLISION: u32 = 1 << 1;
 const DONE_REASON_OBSTACLE_COLLISION: u32 = 1 << 2;
@@ -196,6 +195,7 @@ struct UiState {
     use_checkpoint_policy: bool,
     selected_env: usize,
     difficulty: f32,
+    curriculum_phase: usize,
     curriculum_stage: u32,
     seed_base: u32,
     checkpoint_path: String,
@@ -228,9 +228,10 @@ impl Default for UiState {
             use_checkpoint_policy: false,
             selected_env: 0,
             difficulty: 0.35,
+            curriculum_phase: 0,
             curriculum_stage: 0,
             seed_base: 1,
-            checkpoint_path: "checkpoints/ppo.pt".to_string(),
+            checkpoint_path: "checkpoints/v11-gate-discovery-oob-control.pt".to_string(),
             checkpoint_status: "Heuristic replay ready".to_string(),
             request_load_checkpoint: false,
             request_reset_selected: false,
@@ -261,6 +262,7 @@ struct UiSnapshot {
     use_checkpoint_policy: bool,
     selected_env: usize,
     difficulty: f32,
+    curriculum_phase: usize,
     curriculum_stage: u32,
     seed_base: u32,
     checkpoint_path: String,
@@ -289,11 +291,73 @@ struct PpoPolicyClient {
     stdout: BufReader<ChildStdout>,
 }
 
-struct CurriculumStageProfile {
+#[derive(Clone, Copy)]
+struct CurriculumPhaseProfile {
+    name: &'static str,
+    curriculum_stage: u32,
     grammar_ids: &'static [u32],
     difficulty_min: f32,
     difficulty_max: f32,
 }
+
+const CURRICULUM_PHASES: &[CurriculumPhaseProfile] = &[
+    CurriculumPhaseProfile {
+        name: "discover_gate",
+        curriculum_stage: 0,
+        grammar_ids: &[0],
+        difficulty_min: 0.0,
+        difficulty_max: 0.005,
+    },
+    CurriculumPhaseProfile {
+        name: "align_gate",
+        curriculum_stage: 0,
+        grammar_ids: &[0],
+        difficulty_min: 0.005,
+        difficulty_max: 0.015,
+    },
+    CurriculumPhaseProfile {
+        name: "pass_gate",
+        curriculum_stage: 0,
+        grammar_ids: &[0],
+        difficulty_min: 0.015,
+        difficulty_max: 0.03,
+    },
+    CurriculumPhaseProfile {
+        name: "exit_gate",
+        curriculum_stage: 1,
+        grammar_ids: &[0],
+        difficulty_min: 0.0,
+        difficulty_max: 0.02,
+    },
+    CurriculumPhaseProfile {
+        name: "chain_two",
+        curriculum_stage: 1,
+        grammar_ids: &[0],
+        difficulty_min: 0.02,
+        difficulty_max: 0.04,
+    },
+    CurriculumPhaseProfile {
+        name: "offset",
+        curriculum_stage: 2,
+        grammar_ids: &[0, 1],
+        difficulty_min: 0.05,
+        difficulty_max: 0.22,
+    },
+    CurriculumPhaseProfile {
+        name: "arena",
+        curriculum_stage: 3,
+        grammar_ids: &[0, 1, 2, 3],
+        difficulty_min: 0.3,
+        difficulty_max: 0.65,
+    },
+    CurriculumPhaseProfile {
+        name: "hard",
+        curriculum_stage: 4,
+        grammar_ids: &[0, 1, 2, 3],
+        difficulty_min: 0.6,
+        difficulty_max: 1.0,
+    },
+];
 
 impl PpoPolicyClient {
     fn spawn(checkpoint_path: &str) -> Result<Self, Box<dyn Error>> {
@@ -409,38 +473,13 @@ struct VisualizerManager {
     selected_env: usize,
     layouts_dirty: bool,
     applied_difficulty: f32,
+    applied_curriculum_phase: usize,
     applied_curriculum_stage: u32,
 }
 
 impl VisualizerManager {
-    fn curriculum_stage_profile(curriculum_stage: u32) -> CurriculumStageProfile {
-        match curriculum_stage {
-            0 => CurriculumStageProfile {
-                grammar_ids: &[0],
-                difficulty_min: 0.0,
-                difficulty_max: 0.04,
-            },
-            1 => CurriculumStageProfile {
-                grammar_ids: &[0],
-                difficulty_min: 0.0,
-                difficulty_max: 0.08,
-            },
-            2 => CurriculumStageProfile {
-                grammar_ids: &[0, 1, 2],
-                difficulty_min: 0.1,
-                difficulty_max: 0.35,
-            },
-            3 => CurriculumStageProfile {
-                grammar_ids: &[0, 1, 2, 3],
-                difficulty_min: 0.3,
-                difficulty_max: 0.65,
-            },
-            _ => CurriculumStageProfile {
-                grammar_ids: &[0, 1, 2, 3],
-                difficulty_min: 0.6,
-                difficulty_max: 1.0,
-            },
-        }
+    fn curriculum_phase_profile(curriculum_phase: usize) -> CurriculumPhaseProfile {
+        CURRICULUM_PHASES[curriculum_phase.min(CURRICULUM_PHASES.len().saturating_sub(1))]
     }
 
     fn new(
@@ -571,21 +610,28 @@ impl VisualizerManager {
             selected_env: 0,
             layouts_dirty: true,
             applied_difficulty: 0.35,
+            applied_curriculum_phase: 0,
             applied_curriculum_stage: 0,
         };
 
-        let (seed_base, difficulty, curriculum_stage) = {
+        let (seed_base, difficulty, curriculum_phase, curriculum_stage) = {
             let state = manager.ui_state.lock().expect("ui state poisoned");
+            let curriculum_phase =
+                state.curriculum_phase.min(CURRICULUM_PHASES.len().saturating_sub(1));
+            let curriculum_stage =
+                Self::curriculum_phase_profile(curriculum_phase).curriculum_stage;
             (
                 state.seed_base,
                 state.difficulty,
-                state.curriculum_stage.min(MAX_CURRICULUM_STAGE),
+                curriculum_phase,
+                curriculum_stage,
             )
         };
-        let params = manager.randomize_reset_params(seed_base, difficulty, curriculum_stage);
+        let params = manager.randomize_reset_params(seed_base, difficulty, curriculum_phase);
         manager.sim.set_reset_params(renderer, registry, &params)?;
         manager.sim.reset_all(renderer, registry)?;
         manager.applied_difficulty = difficulty;
+        manager.applied_curriculum_phase = curriculum_phase;
         manager.applied_curriculum_stage = curriculum_stage;
 
         Ok(manager)
@@ -593,6 +639,11 @@ impl VisualizerManager {
 
     fn snapshot_ui(&self) -> UiSnapshot {
         let mut state = self.ui_state.lock().expect("ui state poisoned");
+        state.curriculum_phase = state
+            .curriculum_phase
+            .min(CURRICULUM_PHASES.len().saturating_sub(1));
+        state.curriculum_stage =
+            Self::curriculum_phase_profile(state.curriculum_phase).curriculum_stage;
         let snapshot = UiSnapshot {
             replay_active: state.replay_active,
             use_checkpoint_policy: state.use_checkpoint_policy,
@@ -600,7 +651,8 @@ impl VisualizerManager {
                 .selected_env
                 .min(self.sim.env_count().saturating_sub(1)),
             difficulty: state.difficulty,
-            curriculum_stage: state.curriculum_stage.min(MAX_CURRICULUM_STAGE),
+            curriculum_phase: state.curriculum_phase,
+            curriculum_stage: state.curriculum_stage,
             seed_base: state.seed_base,
             checkpoint_path: state.checkpoint_path.clone(),
             load_checkpoint: state.request_load_checkpoint,
@@ -626,9 +678,9 @@ impl VisualizerManager {
         &self,
         base_seed: u32,
         difficulty: f32,
-        curriculum_stage: u32,
+        curriculum_phase: usize,
     ) -> Vec<ResetParams> {
-        let profile = Self::curriculum_stage_profile(curriculum_stage);
+        let profile = Self::curriculum_phase_profile(curriculum_phase);
         let difficulty_span = (profile.difficulty_max - profile.difficulty_min).max(0.0);
         let target_difficulty =
             profile.difficulty_min + difficulty.clamp(0.0, 1.0) * difficulty_span;
@@ -642,7 +694,12 @@ impl VisualizerManager {
                     (hash_to_unit(env_seed ^ 0x85eb_ca6b) * 2.0 - 1.0) * jitter_span;
                 let env_difficulty = (target_difficulty + difficulty_jitter)
                     .clamp(profile.difficulty_min, profile.difficulty_max);
-                ResetParams::new(env_seed, grammar_id, env_difficulty, curriculum_stage)
+                ResetParams::new(
+                    env_seed,
+                    grammar_id,
+                    env_difficulty,
+                    profile.curriculum_stage,
+                )
             })
             .collect()
     }
@@ -926,7 +983,7 @@ impl RendererManager for VisualizerManager {
         let snapshot = self.snapshot_ui();
         self.selected_env = snapshot.selected_env;
         let generation_changed = (snapshot.difficulty - self.applied_difficulty).abs() > 1e-5
-            || snapshot.curriculum_stage != self.applied_curriculum_stage;
+            || snapshot.curriculum_phase != self.applied_curriculum_phase;
 
         if snapshot.load_checkpoint {
             match PpoPolicyClient::spawn(&snapshot.checkpoint_path) {
@@ -954,7 +1011,7 @@ impl RendererManager for VisualizerManager {
             let params = self.randomize_reset_params(
                 snapshot.seed_base,
                 snapshot.difficulty,
-                snapshot.curriculum_stage,
+                snapshot.curriculum_phase,
             );
             self.sim.set_reset_params(renderer, registry, &params)?;
             self.sim.reset_all(renderer, registry)?;
@@ -963,6 +1020,7 @@ impl RendererManager for VisualizerManager {
             self.layouts_dirty = true;
             forced_reset_step = true;
             self.applied_difficulty = snapshot.difficulty;
+            self.applied_curriculum_phase = snapshot.curriculum_phase;
             self.applied_curriculum_stage = snapshot.curriculum_stage;
         } else if snapshot.reset_selected {
             self.sim
@@ -974,7 +1032,7 @@ impl RendererManager for VisualizerManager {
             let params = self.randomize_reset_params(
                 snapshot.seed_base,
                 snapshot.difficulty,
-                snapshot.curriculum_stage,
+                snapshot.curriculum_phase,
             );
             self.sim.set_reset_params(renderer, registry, &params)?;
             self.sim.reset_all(renderer, registry)?;
@@ -1156,12 +1214,36 @@ fn main() -> Result<(), Box<dyn Error>> {
                             .text("Selected Env"),
                         );
                         panel.add(
-                            egui::Slider::new(&mut ui.difficulty, 0.0..=1.0).text("Difficulty"),
+                            egui::Slider::new(&mut ui.difficulty, 0.0..=1.0)
+                                .text("Phase Difficulty"),
                         );
-                        panel.add(
-                            egui::Slider::new(&mut ui.curriculum_stage, 0..=MAX_CURRICULUM_STAGE)
-                                .text("Curriculum"),
-                        );
+                        let selected_phase =
+                            ui.curriculum_phase.min(CURRICULUM_PHASES.len().saturating_sub(1));
+                        egui::ComboBox::from_label("Curriculum Phase")
+                            .selected_text(CURRICULUM_PHASES[selected_phase].name)
+                            .show_ui(panel, |combo| {
+                                for (phase_index, phase) in CURRICULUM_PHASES.iter().enumerate() {
+                                    combo.selectable_value(
+                                        &mut ui.curriculum_phase,
+                                        phase_index,
+                                        phase.name,
+                                    );
+                                }
+                            });
+                        ui.curriculum_phase =
+                            ui.curriculum_phase.min(CURRICULUM_PHASES.len().saturating_sub(1));
+                        let phase = CURRICULUM_PHASES[ui.curriculum_phase];
+                        ui.curriculum_stage = phase.curriculum_stage;
+                        let actual_difficulty = phase.difficulty_min
+                            + ui.difficulty.clamp(0.0, 1.0)
+                                * (phase.difficulty_max - phase.difficulty_min).max(0.0);
+                        panel.label(format!(
+                            "Sim Stage: {} | Difficulty: {:.4}..{:.4} -> {:.4}",
+                            phase.curriculum_stage,
+                            phase.difficulty_min,
+                            phase.difficulty_max,
+                            actual_difficulty
+                        ));
 
                         panel.separator();
                         panel.label(format!("Gate Count: {}", ui.gate_count));

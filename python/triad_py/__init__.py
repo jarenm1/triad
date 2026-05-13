@@ -1383,6 +1383,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--curriculum-min-stage-updates", type=int, default=20)
     ppo_train.add_argument("--curriculum-completion-threshold", type=float, default=0.6)
     ppo_train.add_argument("--curriculum-progress-threshold", type=float, default=0.9)
+    ppo_train.add_argument("--curriculum-gate-pass-threshold", type=float, default=0.85)
     ppo_train.add_argument("--curriculum-current-weight", type=float, default=0.7)
     ppo_train.add_argument("--curriculum-previous-weight", type=float, default=0.2)
     ppo_train.add_argument("--curriculum-easy-weight", type=float, default=0.1)
@@ -1585,6 +1586,7 @@ def _ppo_train_cli_overrides(args, argv: Sequence[str]) -> dict[str, object]:
         "--curriculum-min-stage-updates": "curriculum_min_stage_updates",
         "--curriculum-completion-threshold": "curriculum_completion_threshold",
         "--curriculum-progress-threshold": "curriculum_progress_threshold",
+        "--curriculum-gate-pass-threshold": "curriculum_gate_pass_threshold",
         "--curriculum-current-weight": "curriculum_current_weight",
         "--curriculum-previous-weight": "curriculum_previous_weight",
         "--curriculum-easy-weight": "curriculum_easy_weight",
@@ -1695,6 +1697,7 @@ def _ppo_train_config_from_args(args, argv: Sequence[str]) -> PPOConfig:
         curriculum_min_stage_updates=args.curriculum_min_stage_updates,
         curriculum_completion_threshold=args.curriculum_completion_threshold,
         curriculum_progress_threshold=args.curriculum_progress_threshold,
+        curriculum_gate_pass_threshold=args.curriculum_gate_pass_threshold,
         curriculum_current_weight=args.curriculum_current_weight,
         curriculum_previous_weight=args.curriculum_previous_weight,
         curriculum_easy_weight=args.curriculum_easy_weight,
