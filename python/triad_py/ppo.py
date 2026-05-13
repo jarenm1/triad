@@ -262,6 +262,7 @@ class PPOConfig:
     curriculum_min_stage_updates: int = 20
     curriculum_completion_threshold: float = 0.6
     curriculum_progress_threshold: float = 0.9
+    curriculum_gate_pass_threshold: float = 0.85
     curriculum_current_weight: float = 0.7
     curriculum_previous_weight: float = 0.2
     curriculum_easy_weight: float = 0.1
@@ -287,6 +288,7 @@ class PPOUpdateStats:
     mean_episode_return: float
     mean_episode_length: float
     eval_completion_rate: float
+    eval_gate_pass_rate: float
     eval_mean_progress: float
     eval_mean_episode_return: float
     eval_mean_episode_length: float
@@ -319,6 +321,7 @@ class CurriculumEvalStats:
     phase_index: int
     phase: str
     completion_rate: float
+    gate_pass_rate: float
     mean_progress: float
     mean_episode_return: float
     mean_episode_length: float
@@ -431,6 +434,9 @@ def _curriculum_eval_stats_from_dict(
         phase_index=int(payload["phase_index"]),
         phase=str(payload["phase"]),
         completion_rate=float(payload["completion_rate"]),
+        gate_pass_rate=float(
+            payload.get("gate_pass_rate", payload["completion_rate"])
+        ),
         mean_progress=float(payload["mean_progress"]),
         mean_episode_return=float(payload["mean_episode_return"]),
         mean_episode_length=float(payload["mean_episode_length"]),
@@ -462,9 +468,12 @@ def _best_checkpoint_path(checkpoint_path: Path) -> Path:
     )
 
 
-def _eval_score(eval_stats: CurriculumEvalStats) -> tuple[float, float, float, float]:
+def _eval_score(
+    eval_stats: CurriculumEvalStats,
+) -> tuple[float, float, float, float, float]:
     return (
         float(eval_stats.completion_rate),
+        float(eval_stats.gate_pass_rate),
         float(eval_stats.mean_progress),
         float(eval_stats.mean_episode_return),
         -float(eval_stats.mean_episode_length),
@@ -728,7 +737,7 @@ def _task_randomization_config(config: PPOConfig) -> dict[str, object]:
 
 def _task_curriculum_config(config: PPOConfig, schedule) -> dict[str, object]:
     return {
-        "schedule_name": "teacher_v1",
+        "schedule_name": "teacher_gate_discovery_v2",
         "phases": [
             {
                 "name": phase.name,
@@ -744,6 +753,7 @@ def _task_curriculum_config(config: PPOConfig, schedule) -> dict[str, object]:
         "min_stage_updates": config.curriculum_min_stage_updates,
         "completion_threshold": config.curriculum_completion_threshold,
         "progress_threshold": config.curriculum_progress_threshold,
+        "gate_pass_threshold": config.curriculum_gate_pass_threshold,
         "current_weight": config.curriculum_current_weight,
         "previous_weight": config.curriculum_previous_weight,
         "easy_weight": config.curriculum_easy_weight,
@@ -1215,6 +1225,23 @@ class MasteryCurriculumController:
             or update_index == total_updates - 1
         )
 
+    def _mastery_thresholds(self, phase_name: str) -> tuple[float, float, float]:
+        early_thresholds = {
+            "discover_gate": (0.0, 0.55, 0.75),
+            "align_gate": (0.0, 0.58, 0.80),
+            "pass_gate": (0.0, 0.70, 0.90),
+            "exit_gate": (0.20, 0.70, 0.80),
+            "chain_two": (0.30, 0.75, 0.75),
+        }
+        return early_thresholds.get(
+            phase_name,
+            (
+                self.config.curriculum_completion_threshold,
+                self.config.curriculum_gate_pass_threshold,
+                self.config.curriculum_progress_threshold,
+            ),
+        )
+
     def record_eval(self, eval_stats: CurriculumEvalStats, update_index: int) -> bool:
         self.latest_eval_stats = eval_stats
         history = self._history[eval_stats.phase_index]
@@ -1230,10 +1257,15 @@ class MasteryCurriculumController:
             return False
 
         mean_completion = float(np.mean([item.completion_rate for item in history]))
+        mean_gate_pass = float(np.mean([item.gate_pass_rate for item in history]))
         mean_progress = float(np.mean([item.mean_progress for item in history]))
+        completion_threshold, gate_pass_threshold, progress_threshold = (
+            self._mastery_thresholds(eval_stats.phase)
+        )
         if (
-            mean_completion < self.config.curriculum_completion_threshold
-            or mean_progress < self.config.curriculum_progress_threshold
+            mean_completion < completion_threshold
+            or mean_gate_pass < gate_pass_threshold
+            or mean_progress < progress_threshold
         ):
             return False
 
@@ -1451,6 +1483,7 @@ def _evaluate_curriculum_phase(
         phase_index=phase_index,
         phase=phase.name,
         completion_rate=float(np.mean(completed)),
+        gate_pass_rate=float(np.mean(best_progress > 0.0)),
         mean_progress=float(np.mean(best_progress)),
         mean_episode_return=float(np.mean(returns)),
         mean_episode_length=float(np.mean(lengths)),
@@ -2322,6 +2355,9 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                 eval_completion_rate=0.0
                 if eval_stats is None
                 else eval_stats.completion_rate,
+                eval_gate_pass_rate=0.0
+                if eval_stats is None
+                else eval_stats.gate_pass_rate,
                 eval_mean_progress=0.0
                 if eval_stats is None
                 else eval_stats.mean_progress,
@@ -2362,6 +2398,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                         if eval_stats is None
                         else {
                             "completion_rate": eval_stats.completion_rate,
+                            "gate_pass_rate": eval_stats.gate_pass_rate,
                             "mean_progress": eval_stats.mean_progress,
                             "mean_episode_return": eval_stats.mean_episode_return,
                             "mean_episode_length": eval_stats.mean_episode_length,
