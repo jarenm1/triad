@@ -1,6 +1,6 @@
 use crate::constants::{
-    DONE_REASON_COMPLETE, DONE_REASON_EXCESSIVE_TILT, DONE_REASON_FLOOR_COLLISION,
-    DONE_REASON_GATE_COLLISION, DONE_REASON_OBSTACLE_COLLISION, DONE_REASON_OUT_OF_BOUNDS,
+    DONE_REASON_COMPLETE, DONE_REASON_FLOOR_COLLISION, DONE_REASON_GATE_COLLISION,
+    DONE_REASON_MISSED_GATE, DONE_REASON_OBSTACLE_COLLISION, DONE_REASON_OUT_OF_BOUNDS,
     DONE_REASON_STEP_LIMIT, VISUALIZER_ENV_COUNT,
 };
 use crate::replay::{ReplayPlayback, ReplaySnapshot, ReplayState};
@@ -28,6 +28,7 @@ pub(crate) struct UiState {
     pub(crate) gate_alignment: f32,
     pub(crate) mean_motor_thrust: f32,
     pub(crate) shaping_reward: f32,
+    pub(crate) out_of_bounds_penalty: f32,
     pub(crate) time_penalty: f32,
     pub(crate) sparse_objective_reward: f32,
     pub(crate) collision_penalty: f32,
@@ -56,6 +57,7 @@ impl Default for UiState {
             gate_alignment: 0.0,
             mean_motor_thrust: 0.0,
             shaping_reward: 0.0,
+            out_of_bounds_penalty: 0.0,
             time_penalty: 0.0,
             sparse_objective_reward: 0.0,
             collision_penalty: 0.0,
@@ -117,13 +119,6 @@ pub(crate) const CURRICULUM_PHASES: &[CurriculumPhaseProfile] = &[
         curriculum_stage: 0,
         grammar_ids: &[0],
         difficulty_min: 0.0,
-        difficulty_max: 0.005,
-    },
-    CurriculumPhaseProfile {
-        name: "align_gate",
-        curriculum_stage: 0,
-        grammar_ids: &[0],
-        difficulty_min: 0.005,
         difficulty_max: 0.015,
     },
     CurriculumPhaseProfile {
@@ -143,15 +138,29 @@ pub(crate) const CURRICULUM_PHASES: &[CurriculumPhaseProfile] = &[
     CurriculumPhaseProfile {
         name: "chain_two",
         curriculum_stage: 1,
-        grammar_ids: &[0],
+        grammar_ids: &[1],
         difficulty_min: 0.02,
-        difficulty_max: 0.04,
+        difficulty_max: 0.05,
+    },
+    CurriculumPhaseProfile {
+        name: "offset_intro",
+        curriculum_stage: 2,
+        grammar_ids: &[0],
+        difficulty_min: 0.0,
+        difficulty_max: 0.05,
+    },
+    CurriculumPhaseProfile {
+        name: "offset_mix",
+        curriculum_stage: 2,
+        grammar_ids: &[0, 1],
+        difficulty_min: 0.05,
+        difficulty_max: 0.1,
     },
     CurriculumPhaseProfile {
         name: "offset",
         curriculum_stage: 2,
         grammar_ids: &[0, 1],
-        difficulty_min: 0.05,
+        difficulty_min: 0.1,
         difficulty_max: 0.22,
     },
     CurriculumPhaseProfile {
@@ -278,6 +287,7 @@ pub(crate) fn draw_visualizer_ui(ctx: &egui::Context, ui: &mut UiState) {
                 "  sparse objective: +{:.3}",
                 ui.sparse_objective_reward
             ));
+            panel.label(format!("  out of bounds: -{:.3}", ui.out_of_bounds_penalty));
             panel.label(format!("  time: -{:.3}", ui.time_penalty));
             panel.label(format!("  collision: -{:.3}", ui.collision_penalty));
         });
@@ -307,8 +317,8 @@ pub(crate) fn format_done_reasons(done_reason_bits: u32) -> String {
     if done_reason_bits & DONE_REASON_STEP_LIMIT != 0 {
         labels.push("step_limit");
     }
-    if done_reason_bits & DONE_REASON_EXCESSIVE_TILT != 0 {
-        labels.push("excessive_tilt");
+    if done_reason_bits & DONE_REASON_MISSED_GATE != 0 {
+        labels.push("missed_gate");
     }
     labels.join(", ")
 }

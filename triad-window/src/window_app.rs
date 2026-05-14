@@ -721,7 +721,10 @@ impl ViewerState {
         self.surface.reconfigure(self.renderer.device(), config);
 
         let actual_mode = self.surface.config().present_mode;
-        tracing::info!("Surface reconfigured - actual present mode: {:?}", actual_mode);
+        tracing::info!(
+            "Surface reconfigured - actual present mode: {:?}",
+            actual_mode
+        );
         if actual_mode != present_mode {
             tracing::warn!(
                 "Present mode mismatch! Requested {:?} but got {:?}",
@@ -1000,7 +1003,8 @@ impl ViewerState {
             command_buffers.push(egui_encoder.finish());
 
             {
-                let _span = debug_span!("queue_submit_all", count = command_buffers.len()).entered();
+                let _span =
+                    debug_span!("queue_submit_all", count = command_buffers.len()).entered();
                 self.renderer.queue().submit(command_buffers);
             }
 
@@ -1035,9 +1039,14 @@ fn create_web_window(
     let document = browser_window
         .document()
         .ok_or_else(|| "browser document is unavailable".to_string())?;
-    let element = document.get_element_by_id(&web_config.canvas_id).ok_or_else(|| {
-        format!("canvas element with id '{}' was not found", web_config.canvas_id)
-    })?;
+    let element = document
+        .get_element_by_id(&web_config.canvas_id)
+        .ok_or_else(|| {
+            format!(
+                "canvas element with id '{}' was not found",
+                web_config.canvas_id
+            )
+        })?;
     let canvas = element
         .dyn_into::<web_sys::HtmlCanvasElement>()
         .map_err(|_| format!("element '{}' is not a canvas", web_config.canvas_id))?;

@@ -1355,3 +1355,46 @@ pub extern "C" fn triad_curriculum_stage_elevated() -> u32 {
     clear_last_error();
     CURRICULUM_STAGE_ELEVATED
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flatten_observations_preserves_metric_order() {
+        let observation = Observation {
+            position: [1.0, 2.0, 3.0],
+            _pad0: 0.0,
+            velocity: [4.0, 5.0, 6.0],
+            _pad1: 0.0,
+            attitude: [0.1, 0.2, 0.3],
+            _pad2: 0.0,
+            angular_velocity: [0.4, 0.5, 0.6],
+            _pad3: 0.0,
+            target_gate_position: [7.0, 8.0, 9.0],
+            _pad4: 0.0,
+            target_gate_forward: [0.0, 0.0, 1.0],
+            progress: 0.25,
+            distance_to_gate: 5.5,
+            gate_alignment: 0.75,
+            mean_motor_thrust: 0.42,
+            _pad5_metrics: 0.0,
+            privileged_velocity_body: [0.0, 0.0, 0.0],
+            _pad6: 0.0,
+            privileged_target_gate_body: [0.0, 0.0, 0.0],
+            _pad7: 0.0,
+            privileged_target_gate_forward_body: [0.0, 0.0, 0.0],
+            _pad8: 0.0,
+            privileged_next_gate_body: [0.0, 0.0, 0.0],
+            _pad9: 0.0,
+            privileged_next_gate_forward_body: [0.0, 0.0, 0.0],
+            _pad10: 0.0,
+        };
+
+        let flat = flatten_observations(&[observation]);
+        assert_eq!(flat[18], 0.25);
+        assert_eq!(flat[19], 5.5);
+        assert_eq!(flat[20], 0.75);
+        assert_eq!(flat[21], 0.42);
+    }
+}

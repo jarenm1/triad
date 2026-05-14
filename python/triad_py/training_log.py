@@ -15,6 +15,7 @@ DONE_REASON_BITS: tuple[tuple[int, str], ...] = (
     (1 << 3, "floor_collision"),
     (1 << 4, "out_of_bounds"),
     (1 << 5, "step_limit"),
+    (1 << 6, "missed_gate"),
 )
 _KNOWN_DONE_REASON_MASK = sum(bit for bit, _ in DONE_REASON_BITS)
 _DONE_REASON_SHORT_LABELS = {
@@ -24,6 +25,7 @@ _DONE_REASON_SHORT_LABELS = {
     "floor_collision": "floor",
     "out_of_bounds": "oob",
     "step_limit": "step",
+    "missed_gate": "miss",
     "unknown": "unk",
 }
 
@@ -182,6 +184,13 @@ class PPOTrainingLogger:
                 "entropy": float(stats["entropy"]),
                 "approx_kl": float(stats["approx_kl"]),
                 "clip_fraction": float(stats["clip_fraction"]),
+                "action_smoothness_loss": float(
+                    stats.get("action_smoothness_loss", 0.0)
+                ),
+                "mean_action_delta": float(stats.get("mean_action_delta", 0.0)),
+                "mean_action_smoothness_penalty": float(
+                    stats.get("mean_action_smoothness_penalty", 0.0)
+                ),
                 "explained_variance": float(stats["explained_variance"]),
                 "learning_rate": float(stats["learning_rate"]),
             },
@@ -278,6 +287,21 @@ class PPOTrainingLogger:
             "optimization/clip_fraction", float(stats["clip_fraction"]), env_step
         )
         writer.add_scalar(
+            "optimization/action_smoothness_loss",
+            float(stats.get("action_smoothness_loss", 0.0)),
+            env_step,
+        )
+        writer.add_scalar(
+            "actions/mean_action_delta",
+            float(stats.get("mean_action_delta", 0.0)),
+            env_step,
+        )
+        writer.add_scalar(
+            "actions/mean_action_smoothness_penalty",
+            float(stats.get("mean_action_smoothness_penalty", 0.0)),
+            env_step,
+        )
+        writer.add_scalar(
             "optimization/explained_variance",
             float(stats["explained_variance"]),
             env_step,
@@ -332,6 +356,20 @@ class PPOTrainingLogger:
                         float(weight),
                         env_step,
                     )
+            adaptive = curriculum.get("adaptive")
+            if isinstance(adaptive, Mapping):
+                for key in (
+                    "adaptive_noise_level",
+                    "training_noise_level",
+                    "soft_failure_level",
+                    "training_soft_failure_level",
+                ):
+                    if key in adaptive:
+                        writer.add_scalar(
+                            f"curriculum/{key}",
+                            float(adaptive[key]),
+                            env_step,
+                        )
         writer.flush()
 
     def _format_update_line(self, payload: Mapping[str, object]) -> str:
@@ -382,6 +420,7 @@ class PPOTrainingLogger:
             f" | done {done_text}"
             f" | kl={float(optimization['approx_kl']):.4f}"
             f" clip={float(optimization['clip_fraction']):.3f}"
+            f" dact={float(optimization.get('mean_action_delta', 0.0)):.3f}"
             f" lr={float(optimization['learning_rate']):.2e}"
             f" | {float(timing['env_steps_per_second']) / 1000.0:.1f}k/s"
         )

@@ -137,7 +137,7 @@ class DoneReason(IntFlag):
     FLOOR_COLLISION = 1 << 3
     OUT_OF_BOUNDS = 1 << 4
     STEP_LIMIT = 1 << 5
-    EXCESSIVE_TILT = 1 << 6
+    MISSED_GATE = 1 << 6
 
 
 class _TriadStageDesc(ctypes.Structure):
@@ -265,7 +265,21 @@ class _TriadObservation(ctypes.Structure):
         ("distance_to_gate", ctypes.c_float),
         ("gate_alignment", ctypes.c_float),
         ("mean_motor_thrust", ctypes.c_float),
-        ("_pad5", ctypes.c_float),
+        ("privileged_velocity_body_x", ctypes.c_float),
+        ("privileged_velocity_body_y", ctypes.c_float),
+        ("privileged_velocity_body_z", ctypes.c_float),
+        ("privileged_target_gate_body_x", ctypes.c_float),
+        ("privileged_target_gate_body_y", ctypes.c_float),
+        ("privileged_target_gate_body_z", ctypes.c_float),
+        ("privileged_target_gate_forward_body_x", ctypes.c_float),
+        ("privileged_target_gate_forward_body_y", ctypes.c_float),
+        ("privileged_target_gate_forward_body_z", ctypes.c_float),
+        ("privileged_next_gate_body_x", ctypes.c_float),
+        ("privileged_next_gate_body_y", ctypes.c_float),
+        ("privileged_next_gate_body_z", ctypes.c_float),
+        ("privileged_next_gate_forward_body_x", ctypes.c_float),
+        ("privileged_next_gate_forward_body_y", ctypes.c_float),
+        ("privileged_next_gate_forward_body_z", ctypes.c_float),
     ]
 
 
@@ -276,8 +290,7 @@ class _TriadRewardDone(ctypes.Structure):
         ("done_reason", ctypes.c_uint32),
         ("_pad0", ctypes.c_uint32),
         ("shaping_reward", ctypes.c_float),
-        ("_unused_reward0", ctypes.c_float),
-        ("_unused_reward1", ctypes.c_float),
+        ("out_of_bounds_penalty", ctypes.c_float),
         ("time_penalty", ctypes.c_float),
         ("sparse_objective_reward", ctypes.c_float),
         ("collision_penalty", ctypes.c_float),
@@ -998,6 +1011,7 @@ class SimulationCore:
                     and int(value.done_reason) & int(reason)
                 ],
                 "shaping_reward": float(value.shaping_reward),
+                "out_of_bounds_penalty": float(value.out_of_bounds_penalty),
                 "time_penalty": float(value.time_penalty),
                 "sparse_objective_reward": float(value.sparse_objective_reward),
                 "collision_penalty": float(value.collision_penalty),
@@ -1325,16 +1339,16 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--dynamics-randomization-scale", type=float, default=1.0)
     ppo_train.add_argument("--actuator-randomization-scale", type=float, default=1.0)
     ppo_train.add_argument("--spawn-randomization-scale", type=float, default=1.0)
-    ppo_train.add_argument("--forward-progress-reward-scale", type=float, default=0.35)
-    ppo_train.add_argument("--backward-progress-reward-scale", type=float, default=0.6)
-    ppo_train.add_argument("--gate-pass-reward", type=float, default=8.0)
+    ppo_train.add_argument("--forward-progress-reward-scale", type=float, default=0.45)
+    ppo_train.add_argument("--backward-progress-reward-scale", type=float, default=0.8)
+    ppo_train.add_argument("--gate-pass-reward", type=float, default=10.0)
     ppo_train.add_argument("--gate-pass-speed-reward-scale", type=float, default=0.35)
     ppo_train.add_argument("--gate-pass-speed-reward-cap", type=float, default=12.0)
-    ppo_train.add_argument("--course-completion-reward", type=float, default=32.0)
-    ppo_train.add_argument("--time-penalty-base", type=float, default=0.001)
-    ppo_train.add_argument("--time-penalty-delay", type=float, default=1.5)
-    ppo_train.add_argument("--time-penalty-scale", type=float, default=0.012)
-    ppo_train.add_argument("--time-penalty-cap", type=float, default=0.05)
+    ppo_train.add_argument("--course-completion-reward", type=float, default=48.0)
+    ppo_train.add_argument("--time-penalty-base", type=float, default=0.0005)
+    ppo_train.add_argument("--time-penalty-delay", type=float, default=3.0)
+    ppo_train.add_argument("--time-penalty-scale", type=float, default=0.004)
+    ppo_train.add_argument("--time-penalty-cap", type=float, default=0.001)
     ppo_train.add_argument("--collision-penalty", type=float, default=14.0)
     ppo_train.add_argument("--out-of-bounds-penalty", type=float, default=24.0)
     ppo_train.add_argument("--bootstrap-distance-reward-scale", type=float, default=1.6)
@@ -1364,6 +1378,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--value-clip-coef", type=float, default=0.2)
     ppo_train.add_argument("--value-coef", type=float, default=0.5)
     ppo_train.add_argument("--entropy-coef", type=float, default=0.001)
+    ppo_train.add_argument("--action-smoothness-reward-scale", type=float, default=0.035)
+    ppo_train.add_argument("--action-smoothness-loss-coef", type=float, default=0.015)
     ppo_train.add_argument("--max-grad-norm", type=float, default=0.5)
     ppo_train.add_argument("--ppo-epochs", type=int, default=4)
     ppo_train.add_argument("--minibatch-size", type=int, default=4096)
@@ -1376,6 +1392,11 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--tensorboard-dir", default="runs")
     ppo_train.add_argument("--checkpoint", default=None)
     ppo_train.add_argument("--resume-from", default=None)
+    ppo_train.add_argument(
+        "--resume-model-only",
+        action="store_true",
+        help="Load checkpoint weights and observation stats but restart optimizer/curriculum",
+    )
     ppo_train.add_argument("--checkpoint-interval", type=int, default=0)
     ppo_train.add_argument("--curriculum-eval-interval", type=int, default=10)
     ppo_train.add_argument("--curriculum-eval-env-count", type=int, default=64)
@@ -1388,7 +1409,22 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     ppo_train.add_argument("--curriculum-previous-weight", type=float, default=0.2)
     ppo_train.add_argument("--curriculum-easy-weight", type=float, default=0.1)
     ppo_train.add_argument("--curriculum-holdout-seed", type=int, default=131071)
-    ppo_train.add_argument("--pretrain-updates", type=int, default=16)
+    ppo_train.add_argument("--adaptive-noise-initial", type=float, default=0.05)
+    ppo_train.add_argument("--adaptive-noise-min", type=float, default=0.0)
+    ppo_train.add_argument("--adaptive-noise-max", type=float, default=0.55)
+    ppo_train.add_argument("--adaptive-noise-step-up", type=float, default=0.025)
+    ppo_train.add_argument("--adaptive-noise-step-down", type=float, default=0.05)
+    ppo_train.add_argument(
+        "--adaptive-noise-target-failure-rate", type=float, default=0.25
+    )
+    ppo_train.add_argument("--soft-failure-initial", type=float, default=1.0)
+    ppo_train.add_argument("--soft-failure-min", type=float, default=0.0)
+    ppo_train.add_argument("--soft-failure-step-up", type=float, default=0.025)
+    ppo_train.add_argument("--soft-failure-step-down", type=float, default=0.04)
+    ppo_train.add_argument(
+        "--soft-failure-target-failure-rate", type=float, default=0.18
+    )
+    ppo_train.add_argument("--pretrain-updates", type=int, default=0)
     ppo_train.add_argument("--pretrain-epochs", type=int, default=4)
     ppo_train.add_argument("--pretrain-minibatch-size", type=int, default=4096)
     ppo_train.add_argument("--pretrain-bootstrap-weight", type=float, default=1.0)
@@ -1406,6 +1442,16 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "--no-observation-norm",
         action="store_true",
         help="Disable running observation normalization",
+    )
+    ppo_train.add_argument(
+        "--no-adaptive-noise",
+        action="store_true",
+        help="Disable adaptive gate-pose noise curriculum",
+    )
+    ppo_train.add_argument(
+        "--no-soft-failure-curriculum",
+        action="store_true",
+        help="Disable early soft missed-gate curriculum",
     )
     ppo_train.add_argument(
         "--no-pretty-log",
@@ -1567,6 +1613,8 @@ def _ppo_train_cli_overrides(args, argv: Sequence[str]) -> dict[str, object]:
         "--value-clip-coef": "value_clip_coef",
         "--value-coef": "value_coef",
         "--entropy-coef": "entropy_coef",
+        "--action-smoothness-reward-scale": "action_smoothness_reward_scale",
+        "--action-smoothness-loss-coef": "action_smoothness_loss_coef",
         "--max-grad-norm": "max_grad_norm",
         "--ppo-epochs": "ppo_epochs",
         "--minibatch-size": "minibatch_size",
@@ -1579,6 +1627,7 @@ def _ppo_train_cli_overrides(args, argv: Sequence[str]) -> dict[str, object]:
         "--tensorboard-dir": "tensorboard_dir",
         "--checkpoint": "checkpoint_path",
         "--resume-from": "resume_from",
+        "--resume-model-only": "resume_model_only",
         "--checkpoint-interval": "checkpoint_interval",
         "--curriculum-eval-interval": "curriculum_eval_interval",
         "--curriculum-eval-env-count": "curriculum_eval_env_count",
@@ -1591,6 +1640,17 @@ def _ppo_train_cli_overrides(args, argv: Sequence[str]) -> dict[str, object]:
         "--curriculum-previous-weight": "curriculum_previous_weight",
         "--curriculum-easy-weight": "curriculum_easy_weight",
         "--curriculum-holdout-seed": "curriculum_holdout_seed",
+        "--adaptive-noise-initial": "adaptive_noise_initial",
+        "--adaptive-noise-min": "adaptive_noise_min",
+        "--adaptive-noise-max": "adaptive_noise_max",
+        "--adaptive-noise-step-up": "adaptive_noise_step_up",
+        "--adaptive-noise-step-down": "adaptive_noise_step_down",
+        "--adaptive-noise-target-failure-rate": "adaptive_noise_target_failure_rate",
+        "--soft-failure-initial": "soft_failure_initial",
+        "--soft-failure-min": "soft_failure_min",
+        "--soft-failure-step-up": "soft_failure_step_up",
+        "--soft-failure-step-down": "soft_failure_step_down",
+        "--soft-failure-target-failure-rate": "soft_failure_target_failure_rate",
         "--pretrain-updates": "pretrain_updates",
         "--pretrain-epochs": "pretrain_epochs",
         "--pretrain-minibatch-size": "pretrain_minibatch_size",
@@ -1610,12 +1670,18 @@ def _ppo_train_cli_overrides(args, argv: Sequence[str]) -> dict[str, object]:
         overrides["normalize_advantages"] = False
     if _cli_option_present(argv, "--no-observation-norm"):
         overrides["normalize_observations"] = False
+    if _cli_option_present(argv, "--no-adaptive-noise"):
+        overrides["adaptive_noise_enabled"] = False
+    if _cli_option_present(argv, "--no-soft-failure-curriculum"):
+        overrides["soft_failure_curriculum_enabled"] = False
     if _cli_option_present(argv, "--no-pretty-log"):
         overrides["pretty_log"] = False
     if _cli_option_present(argv, "--no-json-log"):
         overrides["json_log"] = False
     if _cli_option_present(argv, "--no-tensorboard"):
         overrides["tensorboard_dir"] = None
+    if _cli_option_present(argv, "--resume-model-only"):
+        overrides["resume_model_only"] = True
     return overrides
 
 
@@ -1673,6 +1739,8 @@ def _ppo_train_config_from_args(args, argv: Sequence[str]) -> PPOConfig:
         value_clip_coef=None if args.value_clip_coef <= 0.0 else args.value_clip_coef,
         value_coef=args.value_coef,
         entropy_coef=args.entropy_coef,
+        action_smoothness_reward_scale=args.action_smoothness_reward_scale,
+        action_smoothness_loss_coef=args.action_smoothness_loss_coef,
         max_grad_norm=args.max_grad_norm,
         ppo_epochs=args.ppo_epochs,
         minibatch_size=args.minibatch_size,
@@ -1690,6 +1758,7 @@ def _ppo_train_config_from_args(args, argv: Sequence[str]) -> PPOConfig:
         run_name=args.run_name,
         checkpoint_path=args.checkpoint,
         resume_from=args.resume_from,
+        resume_model_only=args.resume_model_only,
         checkpoint_interval=args.checkpoint_interval,
         curriculum_eval_interval=args.curriculum_eval_interval,
         curriculum_eval_env_count=args.curriculum_eval_env_count,
@@ -1702,6 +1771,19 @@ def _ppo_train_config_from_args(args, argv: Sequence[str]) -> PPOConfig:
         curriculum_previous_weight=args.curriculum_previous_weight,
         curriculum_easy_weight=args.curriculum_easy_weight,
         curriculum_holdout_seed=args.curriculum_holdout_seed,
+        adaptive_noise_enabled=not args.no_adaptive_noise,
+        adaptive_noise_initial=args.adaptive_noise_initial,
+        adaptive_noise_min=args.adaptive_noise_min,
+        adaptive_noise_max=args.adaptive_noise_max,
+        adaptive_noise_step_up=args.adaptive_noise_step_up,
+        adaptive_noise_step_down=args.adaptive_noise_step_down,
+        adaptive_noise_target_failure_rate=args.adaptive_noise_target_failure_rate,
+        soft_failure_curriculum_enabled=not args.no_soft_failure_curriculum,
+        soft_failure_initial=args.soft_failure_initial,
+        soft_failure_min=args.soft_failure_min,
+        soft_failure_step_up=args.soft_failure_step_up,
+        soft_failure_step_down=args.soft_failure_step_down,
+        soft_failure_target_failure_rate=args.soft_failure_target_failure_rate,
         pretrain_updates=args.pretrain_updates,
         pretrain_epochs=args.pretrain_epochs,
         pretrain_minibatch_size=args.pretrain_minibatch_size,
