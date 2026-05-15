@@ -40,6 +40,8 @@ __all__ = [
     "apply_curriculum_update",
     "BenchmarkResult",
     "CourseSpec",
+    "CurriculumAxes",
+    "CurriculumAxisRanges",
     "CurriculumPhase",
     "CurriculumProgression",
     "CurriculumSchedule",
@@ -213,6 +215,17 @@ class _TriadResetParams(ctypes.Structure):
         ("grammar_id", ctypes.c_uint32),
         ("difficulty", ctypes.c_float),
         ("curriculum_stage", ctypes.c_uint32),
+        ("gate_count_level", ctypes.c_float),
+        ("gate_size_level", ctypes.c_float),
+        ("spacing_level", ctypes.c_float),
+        ("verticality_level", ctypes.c_float),
+        ("gate_pose_noise_level", ctypes.c_float),
+        ("spawn_noise_level", ctypes.c_float),
+        ("dynamics_noise_level", ctypes.c_float),
+        ("obstacle_density_level", ctypes.c_float),
+        ("path_curvature_level", ctypes.c_float),
+        ("soft_failure_level", ctypes.c_float),
+        ("start_gate", ctypes.c_uint32),
     ]
 
 
@@ -430,6 +443,8 @@ ACTION_STRIDE = int(_lib.triad_action_stride())
 OBSERVATION_STRIDE = int(_lib.triad_observation_stride())
 
 from .curriculum import (  # noqa: E402
+    CurriculumAxes,
+    CurriculumAxisRanges,
     CurriculumPhase,
     CurriculumProgression,
     CurriculumSchedule,
@@ -782,26 +797,108 @@ class SimulationCore:
 
     def set_reset_params(
         self,
-        reset_params: Sequence[tuple[int, int, float] | tuple[int, int, float, int]],
+        reset_params: Sequence[Sequence[float]],
     ) -> "SimulationCore":
         ffi_values = []
         for params in reset_params:
             if len(params) == 3:
                 seed, grammar_id, difficulty = params
                 curriculum_stage = int(CurriculumStage.ARENA)
+                axis_values = (
+                    difficulty,
+                    difficulty,
+                    difficulty,
+                    difficulty,
+                    0.0,
+                    difficulty,
+                    difficulty,
+                    0.0,
+                    difficulty,
+                    0.0,
+                    0,
+                )
             elif len(params) == 4:
                 seed, grammar_id, difficulty, curriculum_stage = params
+                axis_values = (
+                    difficulty,
+                    difficulty,
+                    difficulty,
+                    difficulty,
+                    0.0,
+                    difficulty,
+                    difficulty,
+                    0.0,
+                    difficulty,
+                    0.0,
+                    0,
+                )
+            elif len(params) == 15:
+                (
+                    seed,
+                    grammar_id,
+                    difficulty,
+                    curriculum_stage,
+                    gate_count_level,
+                    gate_size_level,
+                    spacing_level,
+                    verticality_level,
+                    gate_pose_noise_level,
+                    spawn_noise_level,
+                    dynamics_noise_level,
+                    obstacle_density_level,
+                    path_curvature_level,
+                    soft_failure_level,
+                    start_gate,
+                ) = params
+                axis_values = (
+                    gate_count_level,
+                    gate_size_level,
+                    spacing_level,
+                    verticality_level,
+                    gate_pose_noise_level,
+                    spawn_noise_level,
+                    dynamics_noise_level,
+                    obstacle_density_level,
+                    path_curvature_level,
+                    soft_failure_level,
+                    start_gate,
+                )
             else:
                 raise ValueError(
-                    "reset params must be (seed, grammar_id, difficulty) or "
-                    "(seed, grammar_id, difficulty, curriculum_stage)"
+                    "reset params must be legacy (seed, grammar_id, difficulty), "
+                    "legacy (seed, grammar_id, difficulty, curriculum_stage), or "
+                    "axis-based 15-value reset params"
                 )
+            (
+                gate_count_level,
+                gate_size_level,
+                spacing_level,
+                verticality_level,
+                gate_pose_noise_level,
+                spawn_noise_level,
+                dynamics_noise_level,
+                obstacle_density_level,
+                path_curvature_level,
+                soft_failure_level,
+                start_gate,
+            ) = axis_values
             ffi_values.append(
                 _TriadResetParams(
                     seed=seed,
                     grammar_id=grammar_id,
                     difficulty=difficulty,
                     curriculum_stage=curriculum_stage,
+                    gate_count_level=gate_count_level,
+                    gate_size_level=gate_size_level,
+                    spacing_level=spacing_level,
+                    verticality_level=verticality_level,
+                    gate_pose_noise_level=gate_pose_noise_level,
+                    spawn_noise_level=spawn_noise_level,
+                    dynamics_noise_level=dynamics_noise_level,
+                    obstacle_density_level=obstacle_density_level,
+                    path_curvature_level=path_curvature_level,
+                    soft_failure_level=soft_failure_level,
+                    start_gate=start_gate,
                 )
             )
         ffi_params = (_TriadResetParams * len(reset_params))(*ffi_values)
@@ -1025,7 +1122,7 @@ def apply_curriculum_progress(
     progress: float,
     base_seed: int = 0,
     schedule: CurriculumSchedule | None = None,
-) -> list[tuple[int, int, float, int]]:
+) -> list[tuple]:
     reset_params = sample_curriculum_reset_params(
         env_count=sim.env_count,
         progress=progress,
@@ -1042,7 +1139,7 @@ def apply_curriculum_update(
     progression: CurriculumProgression,
     base_seed: int = 0,
     schedule: CurriculumSchedule | None = None,
-) -> list[tuple[int, int, float, int]]:
+) -> list[tuple]:
     return progression.apply(
         sim=sim,
         update_index=update_index,

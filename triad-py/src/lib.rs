@@ -135,6 +135,17 @@ pub struct TriadResetParams {
     pub grammar_id: u32,
     pub difficulty: f32,
     pub curriculum_stage: u32,
+    pub gate_count_level: f32,
+    pub gate_size_level: f32,
+    pub spacing_level: f32,
+    pub verticality_level: f32,
+    pub gate_pose_noise_level: f32,
+    pub spawn_noise_level: f32,
+    pub dynamics_noise_level: f32,
+    pub obstacle_density_level: f32,
+    pub path_curvature_level: f32,
+    pub soft_failure_level: f32,
+    pub start_gate: u32,
 }
 
 #[repr(C)]
@@ -455,11 +466,22 @@ fn convert_reset_params(reset_params: &[TriadResetParams]) -> Vec<ResetParams> {
     reset_params
         .iter()
         .map(|params| {
-            ResetParams::new(
+            ResetParams::from_axes(
                 params.seed,
                 params.grammar_id,
                 params.difficulty,
                 params.curriculum_stage,
+                params.gate_count_level,
+                params.gate_size_level,
+                params.spacing_level,
+                params.verticality_level,
+                params.gate_pose_noise_level,
+                params.spawn_noise_level,
+                params.dynamics_noise_level,
+                params.obstacle_density_level,
+                params.path_curvature_level,
+                params.soft_failure_level,
+                params.start_gate,
             )
         })
         .collect()

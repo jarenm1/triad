@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
+from typing import Sequence
 
 import numpy as np
 
@@ -781,7 +782,7 @@ def _task_randomization_config(config: PPOConfig) -> dict[str, object]:
 
 def _task_curriculum_config(config: PPOConfig, schedule) -> dict[str, object]:
     return {
-        "schedule_name": "teacher_gate_discovery_v2",
+        "schedule_name": "axis_primitive_curriculum_v3",
         "phases": [
             {
                 "name": phase.name,
@@ -790,6 +791,7 @@ def _task_curriculum_config(config: PPOConfig, schedule) -> dict[str, object]:
                 "difficulty_min": phase.difficulty_min,
                 "difficulty_max": phase.difficulty_max,
                 "grammar_ids": list(phase.grammar_ids),
+                "axis_ranges": asdict(phase.axis_ranges),
             }
             for phase in schedule.phases
         ],
@@ -986,27 +988,29 @@ def _summarize_array(values: np.ndarray) -> dict[str, float]:
 
 
 def _randomization_preview(
-    reset_params: list[tuple[int, int, float, int]],
+    reset_params: list[tuple],
     config: PPOConfig,
 ) -> dict[str, object]:
     if not reset_params:
         return {}
 
-    seeds = np.asarray([item[0] for item in reset_params], dtype=np.uint32)
-    grammar_ids = np.asarray([item[1] for item in reset_params], dtype=np.uint32)
-    difficulties = np.asarray([item[2] for item in reset_params], dtype=np.float32)
-    curriculum_stages = np.asarray([item[3] for item in reset_params], dtype=np.uint32)
-    adaptive_noise_levels = (
-        (grammar_ids >> np.uint32(RESET_ADAPTIVE_NOISE_SHIFT))
-        & np.uint32(RESET_CURRICULUM_BUCKETS)
-    ).astype(np.float32) / float(RESET_CURRICULUM_BUCKETS)
-    soft_failure_levels = (
-        (grammar_ids >> np.uint32(RESET_SOFT_FAILURE_SHIFT))
-        & np.uint32(RESET_CURRICULUM_BUCKETS)
-    ).astype(np.float32) / float(RESET_CURRICULUM_BUCKETS)
+    expanded = [_expand_reset_param(item) for item in reset_params]
+    seeds = np.asarray([item[0] for item in expanded], dtype=np.uint32)
+    difficulties = np.asarray([item[2] for item in expanded], dtype=np.float32)
+    curriculum_stages = np.asarray([item[3] for item in expanded], dtype=np.uint32)
+    gate_count_levels = np.asarray([item[4] for item in expanded], dtype=np.float32)
+    gate_size_levels = np.asarray([item[5] for item in expanded], dtype=np.float32)
+    spacing_levels = np.asarray([item[6] for item in expanded], dtype=np.float32)
+    verticality_levels = np.asarray([item[7] for item in expanded], dtype=np.float32)
+    adaptive_noise_levels = np.asarray([item[8] for item in expanded], dtype=np.float32)
+    spawn_noise_levels = np.asarray([item[9] for item in expanded], dtype=np.float32)
+    dynamics_noise_levels = np.asarray([item[10] for item in expanded], dtype=np.float32)
+    obstacle_density_levels = np.asarray([item[11] for item in expanded], dtype=np.float32)
+    path_curvature_levels = np.asarray([item[12] for item in expanded], dtype=np.float32)
+    soft_failure_levels = np.asarray([item[13] for item in expanded], dtype=np.float32)
 
     dynamics_strength = (
-        (0.04 + np.clip(difficulties, 0.0, 1.0) * 0.18)
+        (0.04 + np.clip(dynamics_noise_levels, 0.0, 1.0) * 0.18)
         * np.asarray(
             [_curriculum_dynamics_scale(int(stage)) for stage in curriculum_stages],
             dtype=np.float32,
@@ -1051,9 +1055,9 @@ def _randomization_preview(
     lateral_spawn_offset = np.asarray(
         [
             _hash_to_signed(int(seed) ^ 0x611)
-            * (0.08 + float(diff) * 0.18)
+            * (0.08 + float(spawn_level) * 0.18)
             * spawn_scale
-            for seed, diff in zip(seeds, difficulties, strict=True)
+            for seed, spawn_level in zip(seeds, spawn_noise_levels, strict=True)
         ],
         dtype=np.float32,
     )
@@ -1064,7 +1068,15 @@ def _randomization_preview(
 
     return {
         "difficulty": _summarize_array(difficulties),
+        "gate_count_level": _summarize_array(gate_count_levels),
+        "gate_size_level": _summarize_array(gate_size_levels),
+        "spacing_level": _summarize_array(spacing_levels),
+        "verticality_level": _summarize_array(verticality_levels),
         "adaptive_gate_noise": _summarize_array(adaptive_noise_levels),
+        "spawn_noise_level": _summarize_array(spawn_noise_levels),
+        "dynamics_noise_level": _summarize_array(dynamics_noise_levels),
+        "obstacle_density_level": _summarize_array(obstacle_density_levels),
+        "path_curvature_level": _summarize_array(path_curvature_levels),
         "soft_failure": _summarize_array(soft_failure_levels),
         "dynamics_strength": _summarize_array(dynamics_strength),
         "mass_scale": _summarize_array(scales(0x4001, 0.35)),
@@ -1273,36 +1285,133 @@ RESET_START_GATE_MASK = 0xFF
 RESET_ADAPTIVE_NOISE_SHIFT = 16
 RESET_SOFT_FAILURE_SHIFT = 20
 RESET_CURRICULUM_BUCKETS = 15
+RESET_PARAM_AXIS_FIELD_COUNT = 15
 DEFAULT_TRAINING_GATE_COUNT = int(
     sum(int(stage["gate_count"]) for stage in DEFAULT_TRAINING_COURSE_SPEC["stages"])
 )
 
 
+def _legacy_axis_values(
+    difficulty: float,
+) -> tuple[float, float, float, float, float, float, float, float, float, float, int]:
+    return (
+        float(difficulty),
+        float(difficulty),
+        float(difficulty),
+        float(difficulty),
+        0.0,
+        float(difficulty),
+        float(difficulty),
+        0.0,
+        float(difficulty),
+        0.0,
+        0,
+    )
+
+
+def _expand_reset_param(
+    params: Sequence[float],
+) -> tuple[
+    int,
+    int,
+    float,
+    int,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    float,
+    int,
+]:
+    if len(params) == 4:
+        seed, grammar_id, difficulty, curriculum_stage = params
+        return (
+            int(seed),
+            int(grammar_id),
+            float(difficulty),
+            int(curriculum_stage),
+            *_legacy_axis_values(float(difficulty)),
+        )
+    if len(params) != RESET_PARAM_AXIS_FIELD_COUNT:
+        raise ValueError(f"expected reset param length 4 or 15, got {len(params)}")
+    (
+        seed,
+        grammar_id,
+        difficulty,
+        curriculum_stage,
+        gate_count_level,
+        gate_size_level,
+        spacing_level,
+        verticality_level,
+        gate_pose_noise_level,
+        spawn_noise_level,
+        dynamics_noise_level,
+        obstacle_density_level,
+        path_curvature_level,
+        soft_failure_level,
+        start_gate,
+    ) = params
+    return (
+        int(seed),
+        int(grammar_id),
+        float(difficulty),
+        int(curriculum_stage),
+        float(gate_count_level),
+        float(gate_size_level),
+        float(spacing_level),
+        float(verticality_level),
+        float(gate_pose_noise_level),
+        float(spawn_noise_level),
+        float(dynamics_noise_level),
+        float(obstacle_density_level),
+        float(path_curvature_level),
+        float(soft_failure_level),
+        int(start_gate),
+    )
+
+
 def _estimated_curriculum_gate_count(
     curriculum_stage: int,
-    difficulty: float,
+    gate_count_level: float,
     *,
     base_gate_count: int = DEFAULT_TRAINING_GATE_COUNT,
 ) -> int:
     if curriculum_stage == int(CurriculumStage.BOOTSTRAP):
-        return 2 if difficulty >= 0.015 and base_gate_count >= 2 else 1
+        return 2 if gate_count_level >= 0.015 and base_gate_count >= 2 else 1
     if curriculum_stage == int(CurriculumStage.INTRO):
-        if difficulty < 0.02:
+        if gate_count_level < 0.02:
             return 2
-        if difficulty < 0.04:
+        if gate_count_level < 0.04:
             return 3
         return 4
     if curriculum_stage == int(CurriculumStage.ARENA):
-        if difficulty < 0.05:
+        if gate_count_level < 0.05:
             return 3
-        if difficulty < 0.1:
+        if gate_count_level < 0.1:
             return 4
-        if difficulty < 0.18:
+        if gate_count_level < 0.18:
             return 5
         return max(5, min(6, (base_gate_count + 1) // 2))
     if curriculum_stage == int(CurriculumStage.TECHNICAL):
-        return max(6, min(8, max(base_gate_count - 2, 1)))
-    return base_gate_count
+        max_stage_count = min(max(base_gate_count, 1), 8)
+        min_stage_count = min(6, max_stage_count)
+        if gate_count_level < 0.45:
+            return min_stage_count
+        if gate_count_level < 0.65:
+            return min(min_stage_count + 1, max_stage_count)
+        return max_stage_count
+    max_stage_count = max(base_gate_count, 1)
+    min_stage_count = min(8, max_stage_count)
+    scaled_count = int(
+        (min_stage_count + (max_stage_count - min_stage_count) * gate_count_level)
+        + 0.5
+    )
+    return max(min_stage_count, min(scaled_count, max_stage_count))
 
 
 def _stage_adaptive_noise_cap(curriculum_stage: int) -> float:
@@ -1325,6 +1434,13 @@ def _stage_soft_failure_cap(curriculum_stage: int) -> float:
     if curriculum_stage == int(CurriculumStage.ARENA):
         return 0.35
     return 0.0
+
+
+def _phase_soft_failure_cap(phase) -> float:
+    stage_cap = _stage_soft_failure_cap(int(phase.curriculum_stage))
+    if str(phase.name).startswith("circle_"):
+        return min(stage_cap, 0.25)
+    return stage_cap
 
 
 def _quantize_curriculum_level(value: float) -> int:
@@ -1359,20 +1475,35 @@ def _encode_training_controls_in_grammar_id(
 
 
 def _with_training_start_gate_resets(
-    reset_params: list[tuple[int, int, float, int]],
+    reset_params: list[tuple],
     *,
     base_seed: int,
     adaptive_noise_level: float,
     soft_failure_level: float,
-) -> list[tuple[int, int, float, int]]:
-    encoded: list[tuple[int, int, float, int]] = []
-    for env_index, (seed, grammar_id, difficulty, curriculum_stage) in enumerate(
-        reset_params
-    ):
+) -> list[tuple]:
+    encoded: list[tuple] = []
+    for env_index, params in enumerate(reset_params):
+        (
+            seed,
+            grammar_id,
+            difficulty,
+            curriculum_stage,
+            gate_count_level,
+            gate_size_level,
+            spacing_level,
+            verticality_level,
+            gate_pose_noise_level,
+            spawn_noise_level,
+            dynamics_noise_level,
+            obstacle_density_level,
+            path_curvature_level,
+            phase_soft_failure_level,
+            _start_gate,
+        ) = _expand_reset_param(params)
         curriculum_stage = int(curriculum_stage)
         gate_count = _estimated_curriculum_gate_count(
             curriculum_stage,
-            float(difficulty),
+            float(gate_count_level),
         )
         start_gate = 0
         if gate_count > 2 and curriculum_stage != int(CurriculumStage.BOOTSTRAP):
@@ -1387,20 +1518,26 @@ def _with_training_start_gate_resets(
         encoded.append(
             (
                 int(seed),
-                _encode_training_controls_in_grammar_id(
-                    int(grammar_id),
-                    start_gate=start_gate,
-                    adaptive_noise_level=min(
-                        float(adaptive_noise_level),
-                        _stage_adaptive_noise_cap(curriculum_stage),
-                    ),
-                    soft_failure_level=min(
-                        float(soft_failure_level),
-                        _stage_soft_failure_cap(curriculum_stage),
-                    ),
-                ),
+                int(grammar_id) & 0xFF,
                 float(difficulty),
                 curriculum_stage,
+                float(gate_count_level),
+                float(gate_size_level),
+                float(spacing_level),
+                float(verticality_level),
+                min(
+                    max(float(gate_pose_noise_level), float(adaptive_noise_level)),
+                    _stage_adaptive_noise_cap(curriculum_stage),
+                ),
+                float(spawn_noise_level),
+                float(dynamics_noise_level),
+                float(obstacle_density_level),
+                float(path_curvature_level),
+                min(
+                    max(float(phase_soft_failure_level), float(soft_failure_level)),
+                    _stage_soft_failure_cap(curriculum_stage),
+                ),
+                int(start_gate),
             )
         )
     return encoded
@@ -1453,7 +1590,7 @@ class MasteryCurriculumController:
     def training_soft_failure_level(self) -> float:
         if not self.config.soft_failure_curriculum_enabled:
             return 0.0
-        phase_cap = _stage_soft_failure_cap(int(self.current_phase().curriculum_stage))
+        phase_cap = _phase_soft_failure_cap(self.current_phase())
         return float(max(self.config.soft_failure_min, min(self.soft_failure_level, phase_cap)))
 
     def adaptive_curriculum_state(self) -> dict[str, float | bool]:
@@ -1515,15 +1652,30 @@ class MasteryCurriculumController:
             }
 
         raw_mix: dict[int, float] = {}
+        current_weight = self.config.curriculum_current_weight
+        previous_weight = self.config.curriculum_previous_weight
+        easy_weight = self.config.curriculum_easy_weight
+        if self.current_phase().name == "straight_chain":
+            current_weight = 0.80
+            previous_weight = 0.15
+            easy_weight = 0.05
+        if self.current_phase().name in {
+            "circle_intro",
+            "circle_mastery",
+            "circle_chain",
+        }:
+            current_weight = 0.85
+            previous_weight = 0.10
+            easy_weight = 0.05
 
         def add_weight(phase_index: int, weight: float) -> None:
             if phase_index < 0 or weight <= 0.0:
                 return
             raw_mix[phase_index] = raw_mix.get(phase_index, 0.0) + weight
 
-        add_weight(self.current_phase_index, self.config.curriculum_current_weight)
-        add_weight(self.current_phase_index - 1, self.config.curriculum_previous_weight)
-        add_weight(0, self.config.curriculum_easy_weight)
+        add_weight(self.current_phase_index, current_weight)
+        add_weight(self.current_phase_index - 1, previous_weight)
+        add_weight(0, easy_weight)
 
         total = sum(raw_mix.values())
         if total <= 0.0:
@@ -1536,7 +1688,7 @@ class MasteryCurriculumController:
 
     def sample_training_reset_params(
         self, env_count: int, base_seed: int
-    ) -> list[tuple[int, int, float, int]]:
+    ) -> list[tuple]:
         if self.current_phase_index <= 0:
             reset_params = self.schedule.sample_reset_params_for_phase(
                 env_count=env_count,
@@ -1582,10 +1734,13 @@ class MasteryCurriculumController:
 
     def _mastery_thresholds(self, phase_name: str) -> tuple[float, float, float]:
         early_thresholds = {
-            "discover_gate": (0.70, 0.70, 0.70),
-            "pass_gate": (0.75, 0.85, 0.80),
-            "exit_gate": (0.70, 0.85, 0.75),
-            "chain_two": (0.65, 0.85, 0.75),
+            "gate_approach": (0.70, 0.70, 0.70),
+            "gate_pass": (0.75, 0.85, 0.80),
+            "straight_intro": (0.70, 0.85, 0.75),
+            "straight_chain": (0.70, 0.88, 0.82),
+            "circle_intro": (0.50, 0.72, 0.65),
+            "circle_mastery": (0.60, 0.82, 0.75),
+            "circle_chain": (0.62, 0.84, 0.78),
         }
         return early_thresholds.get(
             phase_name,
@@ -1868,7 +2023,8 @@ def _evaluate_curriculum_phase(
                 grammar_id,
                 difficulty,
                 curriculum_stage,
-            ) in enumerate(reset_params)
+                *_axis_values,
+            ) in enumerate(_expand_reset_param(item) for item in reset_params)
         ]
     return CurriculumEvalStats(
         phase_index=phase_index,

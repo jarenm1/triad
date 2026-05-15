@@ -119,6 +119,17 @@ struct ResetParams {
     grammar_id: u32,
     difficulty: f32,
     curriculum_stage: u32,
+    gate_count_level: f32,
+    gate_size_level: f32,
+    spacing_level: f32,
+    verticality_level: f32,
+    gate_pose_noise_level: f32,
+    spawn_noise_level: f32,
+    dynamics_noise_level: f32,
+    obstacle_density_level: f32,
+    path_curvature_level: f32,
+    soft_failure_level: f32,
+    start_gate: u32,
 };
 
 struct EnvLayoutHeader {
@@ -210,16 +221,64 @@ const RESET_ADAPTIVE_NOISE_SHIFT: u32 = 16u;
 const RESET_SOFT_FAILURE_SHIFT: u32 = 20u;
 const RESET_CURRICULUM_BUCKET_MASK: u32 = 0x0fu;
 
-fn reset_base_grammar_id(grammar_id: u32) -> u32 {
-    return grammar_id & 0xffu;
+fn reset_base_grammar_id(reset: ResetParams) -> u32 {
+    return reset.grammar_id & 0xffu;
 }
 
-fn reset_adaptive_noise_level(grammar_id: u32) -> f32 {
+fn reset_encoded_adaptive_noise_level(grammar_id: u32) -> f32 {
     return f32((grammar_id >> RESET_ADAPTIVE_NOISE_SHIFT) & RESET_CURRICULUM_BUCKET_MASK) / 15.0;
 }
 
-fn reset_soft_failure_level(grammar_id: u32) -> f32 {
+fn reset_encoded_soft_failure_level(grammar_id: u32) -> f32 {
     return f32((grammar_id >> RESET_SOFT_FAILURE_SHIFT) & RESET_CURRICULUM_BUCKET_MASK) / 15.0;
+}
+
+fn reset_gate_count_level(reset: ResetParams) -> f32 {
+    return clamp(reset.gate_count_level, 0.0, 1.0);
+}
+
+fn reset_gate_size_level(reset: ResetParams) -> f32 {
+    return clamp(reset.gate_size_level, 0.0, 1.0);
+}
+
+fn reset_spacing_level(reset: ResetParams) -> f32 {
+    return clamp(reset.spacing_level, 0.0, 1.0);
+}
+
+fn reset_verticality_level(reset: ResetParams) -> f32 {
+    return clamp(reset.verticality_level, 0.0, 1.0);
+}
+
+fn reset_gate_pose_noise_level(reset: ResetParams) -> f32 {
+    return clamp(
+        max(reset.gate_pose_noise_level, reset_encoded_adaptive_noise_level(reset.grammar_id)),
+        0.0,
+        1.0,
+    );
+}
+
+fn reset_spawn_noise_level(reset: ResetParams) -> f32 {
+    return clamp(reset.spawn_noise_level, 0.0, 1.0);
+}
+
+fn reset_dynamics_noise_level(reset: ResetParams) -> f32 {
+    return clamp(reset.dynamics_noise_level, 0.0, 1.0);
+}
+
+fn reset_obstacle_density_level(reset: ResetParams) -> f32 {
+    return clamp(reset.obstacle_density_level, 0.0, 1.0);
+}
+
+fn reset_path_curvature_level(reset: ResetParams) -> f32 {
+    return clamp(reset.path_curvature_level, 0.0, 1.0);
+}
+
+fn reset_soft_failure_level(reset: ResetParams) -> f32 {
+    return clamp(
+        max(reset.soft_failure_level, reset_encoded_soft_failure_level(reset.grammar_id)),
+        0.0,
+        1.0,
+    );
 }
 
 fn hash_to_unit(seed: u32) -> f32 {
@@ -604,8 +663,129 @@ fn generated_obstacle_count() -> u32 {
     return 0u;
 }
 
+const PRIMITIVE_STRAIGHT: u32 = 0u;
+const PRIMITIVE_CIRCLE_CW: u32 = 1u;
+const PRIMITIVE_CIRCLE_CCW: u32 = 2u;
+const PRIMITIVE_ZIGZAG: u32 = 3u;
+const PRIMITIVE_ELLIPSE: u32 = 4u;
+const PRIMITIVE_MIXED: u32 = 5u;
+
+fn resolved_primitive_id(grammar_id: u32, seed: u32) -> u32 {
+    let primitive_id = grammar_id % 6u;
+    if (primitive_id == PRIMITIVE_MIXED) {
+        return min(u32(floor(hash_to_unit(seed ^ 0x7c15u) * 5.0)), 4u);
+    }
+    return primitive_id;
+}
+
 fn env_gate_offset(index: u32) -> u32 {
     return layout_headers.values[index].gate_offset;
+}
+
+fn primitive_gate(
+    primitive_id: u32,
+    seed: u32,
+    gate_index: u32,
+    gate_count: u32,
+    spacing_level: f32,
+    verticality_level: f32,
+    gate_size_level: f32,
+    path_curvature_level: f32,
+    curriculum_stage: u32,
+    course_angle: f32,
+) -> Gate {
+    let max_progress_index = max(gate_count, 1u) - 1u;
+    let progress = select(
+        0.0,
+        f32(gate_index) / max(f32(max_progress_index), 1.0),
+        gate_count > 1u,
+    );
+    let span = max(f32(max(gate_count, 2u) - 1u), 1.0);
+    let spacing = 3.35 + spacing_level * 1.35;
+    let total_length = spacing * span;
+    let pi = 3.141592653589793;
+    let two_pi = 6.283185307179586;
+
+    var local_center = vec2<f32>(progress * total_length, 0.0);
+    var local_forward = vec2<f32>(1.0, 0.0);
+
+    if (primitive_id == PRIMITIVE_CIRCLE_CW || primitive_id == PRIMITIVE_CIRCLE_CCW) {
+        let turn_sign = select(-1.0, 1.0, primitive_id == PRIMITIVE_CIRCLE_CCW);
+        let arc = (0.12 + path_curvature_level * 1.10) * pi;
+        let radius = max(total_length / max(arc, 0.35), 3.2);
+        let theta = progress * arc;
+        local_center = vec2<f32>(
+            sin(theta) * radius,
+            turn_sign * (1.0 - cos(theta)) * radius,
+        );
+        local_forward = normalize(vec2<f32>(cos(theta), turn_sign * sin(theta)));
+    } else if (primitive_id == PRIMITIVE_ZIGZAG) {
+        let waves = 1.0 + path_curvature_level * 1.5;
+        let amplitude = 0.35 + path_curvature_level * 1.85;
+        let theta = progress * two_pi * waves;
+        local_center = vec2<f32>(
+            progress * total_length,
+            sin(theta) * amplitude,
+        );
+        local_forward = normalize(vec2<f32>(
+            total_length,
+            cos(theta) * amplitude * two_pi * waves,
+        ));
+    } else if (primitive_id == PRIMITIVE_ELLIPSE) {
+        let turn_sign =
+            select(-1.0, 1.0, hash_to_unit(seed ^ 0x51a1u) > 0.5);
+        let arc = (0.16 + path_curvature_level * 1.05) * pi;
+        let major_radius = max(total_length / max(arc, 0.35), 3.4);
+        let minor_radius =
+            major_radius * (0.48 + hash_to_unit(seed ^ 0x51a3u) * 0.22);
+        let theta = progress * arc;
+        local_center = vec2<f32>(
+            sin(theta) * major_radius,
+            turn_sign * (1.0 - cos(theta)) * minor_radius,
+        );
+        local_forward = normalize(vec2<f32>(
+            cos(theta) * major_radius,
+            turn_sign * sin(theta) * minor_radius,
+        ));
+    }
+
+    let center_2d = rotate_vec2(local_center, course_angle);
+    let forward_2d = normalize(rotate_vec2(local_forward, course_angle));
+    let elevation_phase = hash_to_unit(seed ^ 0x44f1u) * two_pi;
+    var elevation =
+        sin(progress * two_pi + elevation_phase) * (0.06 + verticality_level * 0.30)
+        + hash_to_signed(seed ^ (gate_index * 97u + 0x0f0fu)) * verticality_level * 0.08;
+    if (primitive_id == PRIMITIVE_ZIGZAG) {
+        elevation = elevation
+            + sin(progress * two_pi * 1.5 + elevation_phase * 0.7)
+                * verticality_level * 0.10;
+    } else if (primitive_id == PRIMITIVE_ELLIPSE) {
+        elevation = elevation
+            + exp(-pow((progress - 0.5) * 4.0, 2.0)) * verticality_level * 0.18;
+    }
+    elevation = elevation * curriculum_vertical_scale(curriculum_stage);
+
+    let hole_scale = curriculum_hole_scale(curriculum_stage);
+    let hole_half_width = max(0.46, (0.60 - gate_size_level * 0.10) * hole_scale);
+    let hole_half_height = max(0.48, (0.60 - gate_size_level * 0.08) * hole_scale);
+    let min_gate_center_y =
+        params.min_altitude + hole_half_height + params.gate_frame_thickness + 0.12;
+
+    var gate: Gate;
+    gate.center = vec4<f32>(
+        center_2d.x,
+        max(min_gate_center_y, min_gate_center_y + elevation),
+        center_2d.y,
+        0.0,
+    );
+    gate.forward = vec4<f32>(forward_2d.x, 0.0, forward_2d.y, 0.0);
+    gate.half_extents = vec4<f32>(
+        hole_half_width,
+        hole_half_height,
+        params.gate_depth_half,
+        0.0,
+    );
+    return gate;
 }
 
 fn gate_from_stage(
@@ -988,9 +1168,9 @@ fn curriculum_length_scale(curriculum_stage: u32) -> f32 {
     return 1.14;
 }
 
-fn curriculum_length_difficulty_scale(curriculum_stage: u32, difficulty: f32) -> f32 {
+fn curriculum_length_difficulty_scale(curriculum_stage: u32, spacing_level: f32) -> f32 {
     if (curriculum_stage == 2u) {
-        return 0.34 + clamp(difficulty, 0.0, 1.0) * 1.4;
+        return 0.34 + spacing_level * 1.4;
     }
     return 1.0;
 }
@@ -1025,7 +1205,7 @@ fn family_segment_length(
     grammar_id: u32,
     segment_index: u32,
     seed: u32,
-    difficulty: f32,
+    spacing_level: f32,
     curriculum_stage: u32,
     path_scale: f32,
 ) -> f32 {
@@ -1173,157 +1353,164 @@ fn family_segment_length(
         jitter = 0.95;
     }
     let random = hash_to_unit(seed ^ (grammar_id * 0x9e37u + segment_index * 0x85ebu));
-    return (base + (random - 0.5) * jitter + difficulty * 0.8)
+    return (base + (random - 0.5) * jitter + spacing_level * 0.8)
         * curriculum_length_scale(curriculum_stage)
-        * curriculum_length_difficulty_scale(curriculum_stage, difficulty)
+        * curriculum_length_difficulty_scale(curriculum_stage, spacing_level)
         * path_scale;
 }
 
-fn family_turn_radians(curriculum_stage: u32, grammar_id: u32, segment_index: u32) -> f32 {
+fn family_turn_radians(
+    curriculum_stage: u32,
+    grammar_id: u32,
+    segment_index: u32,
+    path_curvature_level: f32,
+) -> f32 {
     let quarter_turn = 1.5707963267948966;
+    let curvature_scale = 0.35 + path_curvature_level * 0.65;
     if (curriculum_stage == 1u) {
         if (grammar_id == 0u) {
             if (segment_index == 0u) {
-                return 0.18;
+                return 0.18 * curvature_scale;
             }
             if (segment_index == 1u) {
-                return -0.14;
+                return -0.14 * curvature_scale;
             }
             return 0.0;
         }
         if (segment_index == 0u) {
-            return -0.16;
+            return -0.16 * curvature_scale;
         }
         if (segment_index == 1u) {
-            return 0.12;
+            return 0.12 * curvature_scale;
         }
         return 0.0;
     }
     if (curriculum_stage == 2u) {
         if (grammar_id == 0u) {
             if (segment_index == 0u) {
-                return 0.34;
+                return 0.34 * curvature_scale;
             }
             if (segment_index == 1u) {
-                return -0.28;
+                return -0.28 * curvature_scale;
             }
             if (segment_index == 2u) {
-                return 0.18;
+                return 0.18 * curvature_scale;
             }
             return 0.0;
         }
         if (grammar_id == 1u) {
             if (segment_index == 0u) {
-                return -0.32;
+                return -0.32 * curvature_scale;
             }
             if (segment_index == 1u) {
-                return 0.26;
+                return 0.26 * curvature_scale;
             }
             if (segment_index == 2u) {
-                return -0.18;
+                return -0.18 * curvature_scale;
             }
             return 0.0;
         }
         if (segment_index == 0u) {
-            return 0.22;
+            return 0.22 * curvature_scale;
         }
         if (segment_index == 1u) {
             return 0.0;
         }
         if (segment_index == 2u) {
-            return -0.24;
+            return -0.24 * curvature_scale;
         }
         return 0.0;
     }
+    let hard_curvature_scale = 0.75 + path_curvature_level * 0.25;
     if (curriculum_stage == 3u) {
         if (grammar_id == 0u) {
             if (segment_index == 0u) {
-                return quarter_turn;
+                return quarter_turn * hard_curvature_scale;
             }
             if (segment_index == 1u) {
-                return -quarter_turn;
+                return -quarter_turn * hard_curvature_scale;
             }
             if (segment_index == 2u) {
-                return -quarter_turn;
+                return -quarter_turn * hard_curvature_scale;
             }
             if (segment_index == 3u) {
-                return quarter_turn;
+                return quarter_turn * hard_curvature_scale;
             }
-            return quarter_turn;
+            return quarter_turn * hard_curvature_scale;
         }
         if (grammar_id == 1u) {
             if (segment_index < 3u) {
-                return quarter_turn;
+                return quarter_turn * hard_curvature_scale;
             }
             return 0.0;
         }
         if (grammar_id == 2u) {
             if (segment_index < 3u) {
-                return quarter_turn;
+                return quarter_turn * hard_curvature_scale;
             }
             return 0.0;
         }
         if (segment_index == 0u) {
-            return -quarter_turn;
+            return -quarter_turn * hard_curvature_scale;
         }
         if (segment_index == 1u) {
-            return quarter_turn;
+            return quarter_turn * hard_curvature_scale;
         }
         if (segment_index == 2u) {
-            return quarter_turn;
+            return quarter_turn * hard_curvature_scale;
         }
         if (segment_index == 3u) {
-            return -quarter_turn;
+            return -quarter_turn * hard_curvature_scale;
         }
         return 0.0;
     }
     if (grammar_id == 0u) {
         if (segment_index == 0u) {
-            return quarter_turn;
+            return quarter_turn * hard_curvature_scale;
         }
         if (segment_index == 1u) {
-            return -quarter_turn;
+            return -quarter_turn * hard_curvature_scale;
         }
         if (segment_index == 2u) {
-            return quarter_turn;
+            return quarter_turn * hard_curvature_scale;
         }
         if (segment_index == 3u) {
-            return -quarter_turn;
+            return -quarter_turn * hard_curvature_scale;
         }
-        return quarter_turn;
+        return quarter_turn * hard_curvature_scale;
     }
     if (grammar_id == 1u) {
         if (segment_index < 4u) {
-            return quarter_turn;
+            return quarter_turn * hard_curvature_scale;
         }
         return 0.0;
     }
     if (grammar_id == 2u) {
         if (segment_index == 0u) {
-            return quarter_turn;
+            return quarter_turn * hard_curvature_scale;
         }
         if (segment_index == 1u) {
-            return quarter_turn;
+            return quarter_turn * hard_curvature_scale;
         }
         if (segment_index == 2u) {
-            return -quarter_turn;
+            return -quarter_turn * hard_curvature_scale;
         }
         if (segment_index == 3u) {
-            return -quarter_turn;
+            return -quarter_turn * hard_curvature_scale;
         }
-        return quarter_turn;
+        return quarter_turn * hard_curvature_scale;
     }
     if (segment_index == 0u) {
-        return -quarter_turn;
+        return -quarter_turn * hard_curvature_scale;
     }
     if (segment_index == 1u) {
-        return quarter_turn;
+        return quarter_turn * hard_curvature_scale;
     }
     if (segment_index == 2u) {
-        return quarter_turn;
+        return quarter_turn * hard_curvature_scale;
     }
     if (segment_index == 3u) {
-        return -quarter_turn;
+        return -quarter_turn * hard_curvature_scale;
     }
     return 0.0;
 }
@@ -1331,7 +1518,7 @@ fn family_turn_radians(curriculum_stage: u32, grammar_id: u32, segment_index: u3
 fn path_total_length(
     grammar_id: u32,
     seed: u32,
-    difficulty: f32,
+    spacing_level: f32,
     curriculum_stage: u32,
     path_scale: f32,
 ) -> f32 {
@@ -1346,7 +1533,7 @@ fn path_total_length(
             grammar_id,
             segment_index,
             seed,
-            difficulty,
+            spacing_level,
             curriculum_stage,
             path_scale,
         );
@@ -1357,14 +1544,14 @@ fn path_total_length(
 
 fn family_path_scale(
     gate_count: u32,
-    difficulty: f32,
+    spacing_level: f32,
     curriculum_stage: u32,
     base_total_length: f32,
 ) -> f32 {
     if (curriculum_stage == 1u) {
         return 1.0;
     }
-    let required_usable = max(f32(max(gate_count, 1u) - 1u), 0.0) * minimum_gate_path_spacing(difficulty);
+    let required_usable = max(f32(max(gate_count, 1u) - 1u), 0.0) * minimum_gate_path_spacing(spacing_level);
     let required_total = required_usable + 3.6;
     return max(1.0, required_total / max(base_total_length, 1.0));
 }
@@ -1372,7 +1559,10 @@ fn family_path_scale(
 fn sample_family_path(
     grammar_id: u32,
     seed: u32,
-    difficulty: f32,
+    spacing_level: f32,
+    verticality_level: f32,
+    gate_size_level: f32,
+    path_curvature_level: f32,
     curriculum_stage: u32,
     course_angle: f32,
     distance_along_path: f32,
@@ -1394,7 +1584,7 @@ fn sample_family_path(
                 grammar_id,
                 segment_index,
                 seed,
-                difficulty,
+                spacing_level,
                 curriculum_stage,
                 path_scale,
             );
@@ -1408,7 +1598,7 @@ fn sample_family_path(
                     path_total_length(
                         grammar_id,
                         seed,
-                        difficulty,
+                        spacing_level,
                         curriculum_stage,
                         path_scale,
                     ),
@@ -1416,7 +1606,7 @@ fn sample_family_path(
                 );
             let phase = hash_to_unit(seed ^ 0x44f1u) * 6.283185307179586;
             var elevation =
-                sin(path_progress * 6.283185307179586 + phase) * (0.18 + difficulty * 0.16)
+                sin(path_progress * 6.283185307179586 + phase) * (0.18 + verticality_level * 0.16)
                 + (hash_to_unit(seed ^ (segment_index * 97u + 0x0f0fu)) - 0.5) * 0.12;
             if (grammar_id == 1u) {
                 elevation = elevation
@@ -1427,13 +1617,13 @@ fn sample_family_path(
                     + sin(path_progress * 9.42477796076938 + phase) * 0.08;
             } else if (grammar_id == 3u) {
                 let hump =
-                    exp(-pow((path_progress - 0.45) * 4.0, 2.0)) * (0.32 + difficulty * 0.14);
+                    exp(-pow((path_progress - 0.45) * 4.0, 2.0)) * (0.32 + verticality_level * 0.14);
                 elevation = elevation + hump;
             }
             elevation = elevation * curriculum_vertical_scale(curriculum_stage);
             let hole_scale = curriculum_hole_scale(curriculum_stage);
-            let hole_half_width = (0.58 - difficulty * 0.08) * hole_scale;
-            let hole_half_height = (0.58 - difficulty * 0.06) * hole_scale;
+            let hole_half_width = (0.58 - gate_size_level * 0.08) * hole_scale;
+            let hole_half_height = (0.58 - gate_size_level * 0.06) * hole_scale;
             let min_gate_center_y =
                 params.min_altitude + hole_half_height + params.gate_frame_thickness + 0.12;
             var gate: Gate;
@@ -1457,7 +1647,7 @@ fn sample_family_path(
         cursor_position = cursor_position + cursor_forward * segment_length;
         cursor_forward = normalize(rotate_vec2(
             cursor_forward,
-            family_turn_radians(curriculum_stage, grammar_id, segment_index),
+            family_turn_radians(curriculum_stage, grammar_id, segment_index, path_curvature_level),
         ));
         segment_index = segment_index + 1u;
     }
@@ -1495,8 +1685,9 @@ fn apply_adaptive_gate_noise(
     reset: ResetParams,
     gate_index: u32,
 ) -> Gate {
+    let gate_pose_noise_level = reset_gate_pose_noise_level(reset);
     let noise_level =
-        reset_adaptive_noise_level(reset.grammar_id)
+        gate_pose_noise_level
         * adaptive_gate_noise_stage_scale(reset.curriculum_stage);
     if (noise_level <= 0.0) {
         return gate;
@@ -1506,15 +1697,15 @@ fn apply_adaptive_gate_noise(
     let right = normalize(vec3<f32>(-gate.forward.z, 0.0, gate.forward.x));
     let lateral_noise =
         hash_to_signed(reset.seed ^ (gate_index * 0x1f1fu) ^ 0x7101u)
-        * (0.08 + reset.difficulty * 0.45)
+        * (0.08 + gate_pose_noise_level * 0.45)
         * noise_level;
     let vertical_noise =
         hash_to_signed(reset.seed ^ (gate_index * 0x2f2fu) ^ 0x7103u)
-        * (0.04 + reset.difficulty * 0.22)
+        * (0.04 + gate_pose_noise_level * 0.22)
         * noise_level;
     let yaw_noise =
         hash_to_signed(reset.seed ^ (gate_index * 0x3f3fu) ^ 0x7105u)
-        * (0.04 + reset.difficulty * 0.18)
+        * (0.04 + gate_pose_noise_level * 0.18)
         * noise_level;
     noisy_gate.center = vec4<f32>(
         gate.center.xyz + right * lateral_noise + gate_up_axis() * vertical_noise,
@@ -1537,7 +1728,7 @@ fn apply_adaptive_gate_noise(
 fn soft_failure_gate_contains(
     gate: Gate,
     position: vec3<f32>,
-    difficulty: f32,
+    gate_size_level: f32,
     softness: f32,
 ) -> bool {
     let offset = position - gate.center.xyz;
@@ -1546,7 +1737,7 @@ fn soft_failure_gate_contains(
     let plane_distance = abs(dot(offset, gate_forward));
     let right_distance = abs(dot(offset, gate_right));
     let up_distance = abs(dot(offset, gate_up_axis()));
-    let relaxed_margin = (0.18 + difficulty * 0.28) * softness;
+    let relaxed_margin = (0.18 + gate_size_level * 0.28) * softness;
     return plane_distance <= params.gate_depth_half + 0.35
         && right_distance <= gate.half_extents.x + params.gate_frame_thickness + relaxed_margin
         && up_distance <= gate.half_extents.y + params.gate_frame_thickness + relaxed_margin;
@@ -1562,14 +1753,14 @@ fn minimum_previous_gate_forward_clearance(previous_gate: Gate, attitude: vec3<f
     return params.gate_depth_half + forward_support + 0.18;
 }
 
-fn bootstrap_target_gate(seed: u32, difficulty: f32) -> Gate {
+fn bootstrap_target_gate(seed: u32, spacing_level: f32, gate_size_level: f32) -> Gate {
     let course_angle = hash_to_unit(seed ^ 0x12345u) * 6.283185307179586;
     let gate_forward = vec3<f32>(cos(course_angle), 0.0, sin(course_angle));
     let gate_right = gate_right_axis(gate_forward);
-    let approach_distance = 2.35 + hash_to_unit(seed ^ 0x5101u) * 0.18 + difficulty * 0.05;
-    let lateral_offset = hash_to_signed(seed ^ 0x5103u) * (0.08 + difficulty * 0.04);
-    let hole_half_width = 1.18 - difficulty * 0.02;
-    let hole_half_height = 1.18 - difficulty * 0.02;
+    let approach_distance = 2.35 + hash_to_unit(seed ^ 0x5101u) * 0.18 + spacing_level * 0.05;
+    let lateral_offset = hash_to_signed(seed ^ 0x5103u) * (0.08 + spacing_level * 0.04);
+    let hole_half_width = 1.18 - gate_size_level * 0.02;
+    let hole_half_height = 1.18 - gate_size_level * 0.02;
     let min_gate_center_y =
         params.min_altitude + hole_half_height + params.gate_frame_thickness + 0.12;
     let center =
@@ -1588,30 +1779,37 @@ fn bootstrap_target_gate(seed: u32, difficulty: f32) -> Gate {
     return gate;
 }
 
-fn bootstrap_gate_count(difficulty: f32, base_gate_count: u32) -> u32 {
-    if (difficulty >= 0.015 && base_gate_count >= 2u) {
+fn bootstrap_gate_count(gate_count_level: f32, base_gate_count: u32) -> u32 {
+    if (gate_count_level >= 0.015 && base_gate_count >= 2u) {
         return 2u;
     }
     return 1u;
 }
 
-fn bootstrap_chain_gate(seed: u32, difficulty: f32, gate_index: u32) -> Gate {
+fn bootstrap_chain_gate(
+    seed: u32,
+    gate_size_level: f32,
+    spacing_level: f32,
+    verticality_level: f32,
+    path_curvature_level: f32,
+    gate_index: u32,
+) -> Gate {
     let clamped_index = min(gate_index, 1u);
-    let base_gate = bootstrap_target_gate(seed, difficulty);
+    let base_gate = bootstrap_target_gate(seed, spacing_level, gate_size_level);
     if (clamped_index == 0u) {
         return base_gate;
     }
 
     let base_forward = normalize(base_gate.forward.xyz);
     let base_right = gate_right_axis(base_forward);
-    let yaw_jitter = hash_to_signed(seed ^ 0x5211u) * (0.04 + difficulty * 0.03);
+    let yaw_jitter = hash_to_signed(seed ^ 0x5211u) * (0.04 + path_curvature_level * 0.03);
     let chain_forward_xz = normalize(rotate_vec2(base_forward.xz, yaw_jitter));
     let chain_forward = vec3<f32>(chain_forward_xz.x, 0.0, chain_forward_xz.y);
     let chain_right = gate_right_axis(chain_forward);
-    let spacing = 2.35 + hash_to_unit(seed ^ 0x5213u) * 0.28 + difficulty * 0.25;
-    let lateral_offset = hash_to_signed(seed ^ 0x5215u) * (0.08 + difficulty * 0.06);
-    let vertical_offset = hash_to_signed(seed ^ 0x5217u) * (0.04 + difficulty * 0.03);
-    let hole_scale = 0.99 - difficulty * 0.03;
+    let spacing = 2.35 + hash_to_unit(seed ^ 0x5213u) * 0.28 + spacing_level * 0.25;
+    let lateral_offset = hash_to_signed(seed ^ 0x5215u) * (0.08 + path_curvature_level * 0.06);
+    let vertical_offset = hash_to_signed(seed ^ 0x5217u) * (0.04 + verticality_level * 0.03);
+    let hole_scale = 0.99 - gate_size_level * 0.03;
     let hole_half_width = max(1.08, base_gate.half_extents.x * hole_scale);
     let hole_half_height = max(1.08, base_gate.half_extents.y * hole_scale);
     let min_gate_center_y =
@@ -1647,8 +1845,11 @@ fn previous_target_gate(index: u32, current_gate: u32, current_lap: u32) -> Gate
     return gates.values[env_gate_offset(index)];
 }
 
-fn reset_start_gate_index(grammar_id: u32, gate_count: u32) -> u32 {
-    return min((grammar_id >> RESET_START_GATE_SHIFT) & RESET_START_GATE_MASK, max(gate_count, 1u) - 1u);
+fn reset_start_gate_index(reset: ResetParams, gate_count: u32) -> u32 {
+    let encoded_start_gate =
+        (reset.grammar_id >> RESET_START_GATE_SHIFT) & RESET_START_GATE_MASK;
+    let requested_start_gate = select(encoded_start_gate, reset.start_gate, reset.start_gate > 0u);
+    return min(requested_start_gate, max(gate_count, 1u) - 1u);
 }
 
 fn has_cleared_previous_gate_zone(
@@ -1670,43 +1871,63 @@ fn has_cleared_previous_gate_zone(
         >= minimum_previous_gate_forward_clearance(previous_gate, state.attitude.xyz);
 }
 
-fn curriculum_gate_count(curriculum_stage: u32, difficulty: f32, base_gate_count: u32) -> u32 {
+fn curriculum_gate_count(curriculum_stage: u32, gate_count_level: f32, base_gate_count: u32) -> u32 {
     if (is_bootstrap_stage(curriculum_stage)) {
-        return bootstrap_gate_count(difficulty, base_gate_count);
+        return bootstrap_gate_count(gate_count_level, base_gate_count);
     }
     if (curriculum_stage == 1u) {
-        if (difficulty < 0.02) {
+        if (gate_count_level < 0.02) {
             return 2u;
         }
-        if (difficulty < 0.04) {
+        if (gate_count_level < 0.04) {
             return 3u;
         }
         return 4u;
     }
     if (curriculum_stage == 2u) {
-        if (difficulty < 0.05) {
+        if (gate_count_level < 0.05) {
             return 3u;
         }
-        if (difficulty < 0.1) {
+        if (gate_count_level < 0.1) {
             return 4u;
         }
-        if (difficulty < 0.18) {
+        if (gate_count_level < 0.18) {
             return 5u;
         }
         return clamp((base_gate_count + 1u) / 2u, 5u, 6u);
     }
     if (curriculum_stage == 3u) {
-        return clamp(max(select(0u, base_gate_count - 2u, base_gate_count >= 2u), 1u), 6u, 8u);
+        let max_stage_count = min(max(base_gate_count, 1u), 8u);
+        let min_stage_count = min(6u, max_stage_count);
+        if (gate_count_level < 0.45) {
+            return min_stage_count;
+        }
+        if (gate_count_level < 0.65) {
+            return min(min_stage_count + 1u, max_stage_count);
+        }
+        return max_stage_count;
     }
-    return base_gate_count;
+    let max_stage_count = max(base_gate_count, 1u);
+    let min_stage_count = min(8u, max_stage_count);
+    let scaled_count =
+        u32(floor(f32(min_stage_count) + f32(max_stage_count - min_stage_count) * gate_count_level + 0.5));
+    return clamp(scaled_count, min_stage_count, max_stage_count);
 }
 
 fn reset_env(index: u32) {
     let reset = reset_params.values[index];
-    let base_grammar_id = reset_base_grammar_id(reset.grammar_id);
+    let base_grammar_id = reset_base_grammar_id(reset);
+    let gate_count_level = reset_gate_count_level(reset);
+    let gate_size_level = reset_gate_size_level(reset);
+    let spacing_level = reset_spacing_level(reset);
+    let verticality_level = reset_verticality_level(reset);
+    let path_curvature_level = reset_path_curvature_level(reset);
+    let spawn_noise_level = reset_spawn_noise_level(reset);
+    let dynamics_noise_level = reset_dynamics_noise_level(reset);
+    let obstacle_density_level = reset_obstacle_density_level(reset);
     let count = curriculum_gate_count(
         reset.curriculum_stage,
-        reset.difficulty,
+        gate_count_level,
         min(course_header.total_gate_count, params.max_gates_per_env),
     );
     let base_slot = env_gate_offset(index);
@@ -1718,12 +1939,23 @@ fn reset_env(index: u32) {
             if (gate_index >= count) {
                 break;
             }
-            var gate = bootstrap_chain_gate(reset.seed, reset.difficulty, gate_index);
+            var gate = bootstrap_chain_gate(
+                reset.seed,
+                gate_size_level,
+                spacing_level,
+                verticality_level,
+                path_curvature_level,
+                gate_index,
+            );
             gate = apply_adaptive_gate_noise(gate, reset, gate_index);
             gates.values[gate_slot(index, gate_index)] = gate;
             gate_index = gate_index + 1u;
         }
-    } else if (reset.curriculum_stage == 4u && course_header.stage_count > 0u) {
+    } else if (
+        reset.curriculum_stage == 4u
+        && course_header.stage_count > 0u
+        && base_grammar_id > PRIMITIVE_MIXED
+    ) {
         let course_angle =
             hash_to_unit(reset.seed ^ 0x12345u) * 6.283185307179586
             + f32(base_grammar_id % 4u) * 0.37;
@@ -1762,128 +1994,31 @@ fn reset_env(index: u32) {
             stage_index = stage_index + 1u;
         }
     } else {
-        let family_id = curriculum_family(reset.curriculum_stage, base_grammar_id);
+        let primitive_id = resolved_primitive_id(base_grammar_id, reset.seed);
         let course_angle =
             hash_to_unit(reset.seed ^ 0x12345u) * 6.283185307179586
-            + f32(family_id) * 0.37;
-        let base_total_path_length = path_total_length(
-            family_id,
-            reset.seed,
-            reset.difficulty,
-            reset.curriculum_stage,
-            1.0,
-        );
-        let path_scale = family_path_scale(
-            count,
-            reset.difficulty,
-            reset.curriculum_stage,
-            base_total_path_length,
-        );
-        let total_path_length = path_total_length(
-            family_id,
-            reset.seed,
-            reset.difficulty,
-            reset.curriculum_stage,
-            path_scale,
-        );
-        let entry_margin = min(1.8, total_path_length * 0.12);
-        let exit_margin = min(1.2, total_path_length * 0.08);
-        let usable_length = max(total_path_length - entry_margin - exit_margin, 0.5);
-        var previous_pair_distance = 0.0;
+            + f32(primitive_id) * 0.37;
 
         loop {
             if (gate_index >= count) {
                 break;
             }
 
-            let gate_t = select(
-                0.5,
-                f32(gate_index) / max(f32(count - 1u), 1.0),
-                count > 1u,
-            );
-            var distance_along_path = entry_margin + gate_t * usable_length;
-            if (gate_index > 0u) {
-                let previous_gate_t = f32(gate_index - 1u) / max(f32(count - 1u), 1.0);
-                let previous_distance = entry_margin + previous_gate_t * usable_length;
-                distance_along_path = max(
-                    distance_along_path,
-                    previous_distance + minimum_gate_path_spacing(reset.difficulty),
-                );
-                distance_along_path = min(entry_margin + usable_length, distance_along_path);
-            }
-            var gate = sample_family_path(
-                family_id,
+            var gate = primitive_gate(
+                primitive_id,
                 reset.seed,
-                reset.difficulty,
+                gate_index,
+                count,
+                spacing_level,
+                verticality_level,
+                gate_size_level,
+                path_curvature_level,
                 reset.curriculum_stage,
                 course_angle,
-                distance_along_path,
-                path_scale,
             );
             gate = apply_adaptive_gate_noise(gate, reset, gate_index);
-            if (gate_index > 0u) {
-                let previous_gate = gates.values[gate_slot(index, gate_index - 1u)];
-                var adjustment = 0u;
-                loop {
-                    let gate_spacing = distance(gate.center.xyz, previous_gate.center.xyz);
-                    let required_spacing =
-                        max(minimum_gate_separation(reset.difficulty), previous_pair_distance);
-                    if (gate_spacing >= required_spacing || adjustment >= 8u) {
-                        break;
-                    }
-                    let pull_forward = 1.2 + f32(adjustment) * 0.7;
-                    distance_along_path = min(entry_margin + usable_length, distance_along_path + pull_forward);
-                    gate = sample_family_path(
-                        family_id,
-                        reset.seed,
-                        reset.difficulty,
-                        reset.curriculum_stage,
-                        course_angle,
-                        distance_along_path,
-                        path_scale,
-                    );
-                    gate = apply_adaptive_gate_noise(gate, reset, gate_index);
-                    adjustment = adjustment + 1u;
-                }
-                previous_pair_distance = max(
-                    previous_pair_distance,
-                    distance(gate.center.xyz, previous_gate.center.xyz),
-                );
-            }
             gates.values[gate_slot(index, gate_index)] = gate;
             gate_index = gate_index + 1u;
-        }
-
-        if (count > 1u) {
-            let first_gate = gates.values[base_slot];
-            let previous_gate = gates.values[gate_slot(index, count - 2u)];
-            let last_slot = gate_slot(index, count - 1u);
-            var last_gate = gates.values[last_slot];
-            var adjustment = 0u;
-            loop {
-                let closure_distance = distance(last_gate.center.xyz, first_gate.center.xyz);
-                if (closure_distance >= 4.2 || adjustment >= 5u) {
-                    break;
-                }
-                let pullback = (f32(adjustment) + 1.0) * 1.9;
-                let adjusted_distance = entry_margin + max(usable_length - pullback, 0.5);
-                var candidate_gate = sample_family_path(
-                    family_id,
-                    reset.seed,
-                    reset.difficulty,
-                    reset.curriculum_stage,
-                    course_angle,
-                    adjusted_distance,
-                    path_scale,
-                );
-                candidate_gate = apply_adaptive_gate_noise(candidate_gate, reset, count - 1u);
-                if (distance(candidate_gate.center.xyz, previous_gate.center.xyz) < previous_pair_distance) {
-                    break;
-                }
-                last_gate = candidate_gate;
-                gates.values[last_slot] = last_gate;
-                adjustment = adjustment + 1u;
-            }
         }
     }
 
@@ -1923,14 +2058,14 @@ fn reset_env(index: u32) {
             hash_to_unit(reset.seed ^ (obstacle_index * 313u + 0x33a1u)) > 0.5,
         );
         let lateral_offset =
-            (gate_a.half_extents.x + 0.55 + reset.difficulty * 0.85
+            (gate_a.half_extents.x + 0.55 + obstacle_density_level * 0.85
                 + hash_to_unit(reset.seed ^ (obstacle_index * 733u + 0x91u)) * 0.35)
             * side_sign;
         let half_width =
             0.16 + hash_to_unit(reset.seed ^ (obstacle_index * 151u + 0x1717u)) * 0.1;
         let half_height =
             0.22
-            + reset.difficulty * 0.18
+            + obstacle_density_level * 0.18
             + hash_to_unit(reset.seed ^ (obstacle_index * 271u + 0x2021u)) * 0.16;
         let half_depth =
             0.16 + hash_to_unit(reset.seed ^ (obstacle_index * 419u + 0x0aa1u)) * 0.1;
@@ -1956,7 +2091,7 @@ fn reset_env(index: u32) {
         obstacle_index = obstacle_index + 1u;
     }
 
-    let initial_gate = reset_start_gate_index(reset.grammar_id, count);
+    let initial_gate = reset_start_gate_index(reset, count);
     let first_gate = gates.values[base_slot + initial_gate];
     let gate_forward = normalize(first_gate.forward.xyz);
     let gate_right = gate_right_axis(gate_forward);
@@ -1964,8 +2099,8 @@ fn reset_env(index: u32) {
     let bootstrap_chain = bootstrap_stage && count > 1u;
     let spawn_offset_scale =
         select(
-            (0.08 + reset.difficulty * 0.18) * params.spawn_randomization_scale,
-            (0.02 + reset.difficulty * 0.025) * params.spawn_randomization_scale,
+            (0.08 + spawn_noise_level * 0.18) * params.spawn_randomization_scale,
+            (0.02 + spawn_noise_level * 0.025) * params.spawn_randomization_scale,
             bootstrap_chain,
         );
     let lateral_spawn_offset =
@@ -1981,7 +2116,7 @@ fn reset_env(index: u32) {
     let start_yaw = atan2(first_gate.forward.z, first_gate.forward.x) + yaw_offset;
     var start_position =
         first_gate.center.xyz
-        - gate_forward * select(1.2, 1.42 + reset.difficulty * 0.08, bootstrap_chain)
+        - gate_forward * select(1.2, 1.42 + spacing_level * 0.08, bootstrap_chain)
         + gate_right * lateral_spawn_offset
         + vec3<f32>(0.0, 0.14 + vertical_spawn_offset, 0.0);
     let spawn_floor_clearance =
@@ -2016,7 +2151,7 @@ fn reset_env(index: u32) {
         * select(0.35, 0.03, bootstrap_chain)
         * params.spawn_randomization_scale;
     let reset_dynamics_strength =
-        (0.04 + clamp(reset.difficulty, 0.0, 1.0) * 0.18)
+        (0.04 + dynamics_noise_level * 0.18)
         * curriculum_dynamics_scale(reset.curriculum_stage)
         * params.dynamics_randomization_scale;
     let reset_mass =
@@ -2198,8 +2333,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         prev_position,
     );
     let command = clamp_pilot_command(actions.values[index].pilot_command);
+    let dynamics_noise_level = reset_dynamics_noise_level(reset);
     let dynamics_strength =
-        (0.04 + clamp(reset.difficulty, 0.0, 1.0) * 0.18)
+        (0.04 + dynamics_noise_level * 0.18)
         * curriculum_dynamics_scale(reset.curriculum_stage)
         * params.dynamics_randomization_scale;
     let mass =
@@ -2342,7 +2478,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var target_forward = normalize(target_gate.forward.xyz);
     var delta = target_position - state.position.xyz;
     var distance_to_gate = length(delta);
-    let initial_gate = reset_start_gate_index(reset.grammar_id, gate_count);
+    let initial_gate = reset_start_gate_index(reset, gate_count);
     let previous_gate_cleared =
         has_cleared_previous_gate_zone(index, state, state.position.xyz, initial_gate);
     let crossed_target_plane =
@@ -2357,7 +2493,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let missed_gate = crossed_target_plane && !passed_gate;
     let collided_gate =
         !passed_gate && gate_frame_collision(target_gate, state.position.xyz, state.attitude.xyz);
-    let soft_failure_strength = reset_soft_failure_level(reset.grammar_id);
+    let soft_failure_strength = reset_soft_failure_level(reset);
     let soft_failed_gate =
         soft_failure_strength > 0.0
         && crossed_target_plane
@@ -2365,7 +2501,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         && soft_failure_gate_contains(
             target_gate,
             state.position.xyz,
-            reset.difficulty,
+            reset_gate_size_level(reset),
             soft_failure_strength,
         );
     let effective_passed_gate = passed_gate || soft_failed_gate;
@@ -2680,16 +2816,76 @@ pub struct ResetParams {
     pub grammar_id: u32,
     pub difficulty: f32,
     pub curriculum_stage: u32,
+    pub gate_count_level: f32,
+    pub gate_size_level: f32,
+    pub spacing_level: f32,
+    pub verticality_level: f32,
+    pub gate_pose_noise_level: f32,
+    pub spawn_noise_level: f32,
+    pub dynamics_noise_level: f32,
+    pub obstacle_density_level: f32,
+    pub path_curvature_level: f32,
+    pub soft_failure_level: f32,
+    pub start_gate: u32,
 }
 
 impl ResetParams {
     #[must_use]
     pub fn new(seed: u32, grammar_id: u32, difficulty: f32, curriculum_stage: u32) -> Self {
+        Self::from_axes(
+            seed,
+            grammar_id,
+            difficulty,
+            curriculum_stage,
+            difficulty,
+            difficulty,
+            difficulty,
+            difficulty,
+            0.0,
+            difficulty,
+            difficulty,
+            0.0,
+            difficulty,
+            0.0,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn from_axes(
+        seed: u32,
+        grammar_id: u32,
+        difficulty: f32,
+        curriculum_stage: u32,
+        gate_count_level: f32,
+        gate_size_level: f32,
+        spacing_level: f32,
+        verticality_level: f32,
+        gate_pose_noise_level: f32,
+        spawn_noise_level: f32,
+        dynamics_noise_level: f32,
+        obstacle_density_level: f32,
+        path_curvature_level: f32,
+        soft_failure_level: f32,
+        start_gate: u32,
+    ) -> Self {
         Self {
             seed,
             grammar_id,
             difficulty,
             curriculum_stage,
+            gate_count_level,
+            gate_size_level,
+            spacing_level,
+            verticality_level,
+            gate_pose_noise_level,
+            spawn_noise_level,
+            dynamics_noise_level,
+            obstacle_density_level,
+            path_curvature_level,
+            soft_failure_level,
+            start_gate,
         }
     }
 }
