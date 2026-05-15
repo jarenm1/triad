@@ -6,7 +6,7 @@ import json
 import math
 import random
 import sys
-from collections import deque
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
@@ -347,6 +347,7 @@ class CurriculumEvalStats:
     mean_episode_return: float
     mean_episode_length: float
     per_env: list["CurriculumEvalEnvResult"] | None = None
+    gate_metrics: dict[str, object] | None = None
 
 
 @dataclass
@@ -462,6 +463,7 @@ def _curriculum_eval_stats_from_dict(
         mean_episode_return=float(payload["mean_episode_return"]),
         mean_episode_length=float(payload["mean_episode_length"]),
         per_env=per_env,
+        gate_metrics=payload.get("gate_metrics"),
     )
 
 
@@ -767,6 +769,7 @@ def _task_reward_config(config: PPOConfig) -> dict[str, object]:
         "bootstrap_time_penalty_scale": config.bootstrap_time_penalty_scale,
         "bootstrap_collision_penalty_scale": config.bootstrap_collision_penalty_scale,
         "bootstrap_out_of_bounds_penalty_scale": config.bootstrap_out_of_bounds_penalty_scale,
+        "camera_alignment_reward": "stage_gated_lookahead_v1",
         "action_smoothness_reward_scale": config.action_smoothness_reward_scale,
         "action_smoothness_loss_coef": config.action_smoothness_loss_coef,
     }
@@ -782,7 +785,9 @@ def _task_randomization_config(config: PPOConfig) -> dict[str, object]:
 
 def _task_curriculum_config(config: PPOConfig, schedule) -> dict[str, object]:
     return {
-        "schedule_name": "axis_primitive_curriculum_v3",
+        "schedule_name": "axis_primitive_curriculum_v7",
+        "start_gate_replay": FAILURE_REPLAY_STRATEGY,
+        "direction_replay": "eval_weak_direction_bias_v1",
         "phases": [
             {
                 "name": phase.name,
@@ -1286,6 +1291,7 @@ RESET_ADAPTIVE_NOISE_SHIFT = 16
 RESET_SOFT_FAILURE_SHIFT = 20
 RESET_CURRICULUM_BUCKETS = 15
 RESET_PARAM_AXIS_FIELD_COUNT = 15
+FAILURE_REPLAY_STRATEGY = "transition_into_failure_v1"
 DEFAULT_TRAINING_GATE_COUNT = int(
     sum(int(stage["gate_count"]) for stage in DEFAULT_TRAINING_COURSE_SPEC["stages"])
 )
@@ -1474,12 +1480,24 @@ def _encode_training_controls_in_grammar_id(
     )
 
 
+def _failure_replay_key(
+    curriculum_stage: int, gate_count: int, grammar_id: int | str
+) -> str:
+    return f"{int(curriculum_stage)}:{int(gate_count)}:{grammar_id}"
+
+
+def _failure_replay_direction_key(curriculum_stage: int, gate_count: int) -> str:
+    return f"{int(curriculum_stage)}:{int(gate_count)}"
+
+
 def _with_training_start_gate_resets(
     reset_params: list[tuple],
     *,
     base_seed: int,
     adaptive_noise_level: float,
     soft_failure_level: float,
+    failure_replay_start_gates: dict[str, int] | None = None,
+    failure_replay_grammar_ids: dict[str, int] | None = None,
 ) -> list[tuple]:
     encoded: list[tuple] = []
     for env_index, params in enumerate(reset_params):
@@ -1505,16 +1523,57 @@ def _with_training_start_gate_resets(
             curriculum_stage,
             float(gate_count_level),
         )
+        env_rng = random.Random(
+            int(seed) ^ int(base_seed) ^ (env_index * 0x9E37_79B9) ^ 0xA511_E9B3
+        )
+        if (
+            failure_replay_grammar_ids
+            and gate_count > 2
+            and curriculum_stage == int(CurriculumStage.INTRO)
+        ):
+            weak_grammar_id = failure_replay_grammar_ids.get(
+                _failure_replay_direction_key(curriculum_stage, gate_count)
+            )
+            if weak_grammar_id is not None and env_rng.random() < 0.35:
+                grammar_id = int(weak_grammar_id)
         start_gate = 0
         if gate_count > 2 and curriculum_stage != int(CurriculumStage.BOOTSTRAP):
-            env_rng = random.Random(
-                int(seed)
-                ^ int(base_seed)
-                ^ (env_index * 0x9E37_79B9)
-                ^ 0xA511_E9B3
-            )
-            if env_rng.random() >= 0.5:
-                start_gate = env_rng.randrange(1, gate_count)
+            start_gate_probability = 0.50
+            if curriculum_stage == int(CurriculumStage.INTRO):
+                start_gate_probability = 0.60
+                if gate_count >= 4:
+                    start_gate_probability = 0.70
+            if env_rng.random() < start_gate_probability:
+                if curriculum_stage == int(CurriculumStage.INTRO):
+                    replay_roll = env_rng.random()
+                    preferred_start_gate = None
+                    if failure_replay_start_gates:
+                        preferred_start_gate = failure_replay_start_gates.get(
+                            _failure_replay_key(
+                                curriculum_stage, gate_count, int(grammar_id) & 0xFF
+                            )
+                        )
+                        if preferred_start_gate is None:
+                            preferred_start_gate = failure_replay_start_gates.get(
+                                _failure_replay_key(curriculum_stage, gate_count, "*")
+                            )
+                    if preferred_start_gate is not None and replay_roll < 0.75:
+                        start_gate = max(
+                            0, min(gate_count - 1, int(preferred_start_gate))
+                        )
+                    elif gate_count == 3:
+                        start_gate = 1 if replay_roll < 0.75 else 0
+                    elif gate_count >= 4:
+                        if replay_roll < 0.60:
+                            start_gate = max(0, gate_count - 2)
+                        elif replay_roll < 0.85:
+                            start_gate = max(0, gate_count - 3)
+                        else:
+                            start_gate = env_rng.randrange(0, gate_count)
+                    else:
+                        start_gate = env_rng.randrange(0, gate_count)
+                else:
+                    start_gate = env_rng.randrange(1, gate_count)
         encoded.append(
             (
                 int(seed),
@@ -1559,6 +1618,8 @@ class MasteryCurriculumController:
             max(config.soft_failure_min, min(1.0, config.soft_failure_initial))
         )
         self.latest_eval_stats: CurriculumEvalStats | None = None
+        self.failure_replay_start_gates: dict[str, int] = {}
+        self.failure_replay_grammar_ids: dict[str, int] = {}
         self._history = {
             phase_index: deque(maxlen=config.curriculum_mastery_window)
             for phase_index in range(len(schedule.phases))
@@ -1655,27 +1716,37 @@ class MasteryCurriculumController:
         current_weight = self.config.curriculum_current_weight
         previous_weight = self.config.curriculum_previous_weight
         easy_weight = self.config.curriculum_easy_weight
+        named_rehearsal: dict[str, float] = {}
         if self.current_phase().name == "straight_chain":
             current_weight = 0.80
             previous_weight = 0.15
             easy_weight = 0.05
-        if self.current_phase().name in {
-            "circle_intro",
-            "circle_mastery",
-            "circle_chain",
-        }:
+        if self.current_phase().name == "circle_intro":
             current_weight = 0.85
             previous_weight = 0.10
             easy_weight = 0.05
+        if self.current_phase().name in {"circle_mastery", "circle_chain"}:
+            current_weight = 0.75
+            previous_weight = 0.10
+            easy_weight = 0.05
+            named_rehearsal["straight_chain"] = 0.10
 
         def add_weight(phase_index: int, weight: float) -> None:
             if phase_index < 0 or weight <= 0.0:
                 return
             raw_mix[phase_index] = raw_mix.get(phase_index, 0.0) + weight
 
+        def add_phase_weight(phase_name: str, weight: float) -> None:
+            for phase_index, phase in enumerate(self.schedule.phases):
+                if phase.name == phase_name:
+                    add_weight(phase_index, weight)
+                    return
+
         add_weight(self.current_phase_index, current_weight)
         add_weight(self.current_phase_index - 1, previous_weight)
         add_weight(0, easy_weight)
+        for phase_name, weight in named_rehearsal.items():
+            add_phase_weight(phase_name, weight)
 
         total = sum(raw_mix.values())
         if total <= 0.0:
@@ -1700,6 +1771,8 @@ class MasteryCurriculumController:
                 base_seed=base_seed,
                 adaptive_noise_level=self.training_adaptive_noise_level(),
                 soft_failure_level=self.training_soft_failure_level(),
+                failure_replay_start_gates=self.failure_replay_start_gates,
+                failure_replay_grammar_ids=self.failure_replay_grammar_ids,
             )
 
         phase_mix = self.training_phase_mix()
@@ -1722,6 +1795,8 @@ class MasteryCurriculumController:
             base_seed=base_seed,
             adaptive_noise_level=self.training_adaptive_noise_level(),
             soft_failure_level=self.training_soft_failure_level(),
+            failure_replay_start_gates=self.failure_replay_start_gates,
+            failure_replay_grammar_ids=self.failure_replay_grammar_ids,
         )
 
     def should_evaluate(self, update_index: int, total_updates: int) -> bool:
@@ -1751,8 +1826,76 @@ class MasteryCurriculumController:
             ),
         )
 
+    def _update_failure_replay(self, eval_stats: CurriculumEvalStats) -> None:
+        gate_metrics = eval_stats.gate_metrics
+        if not isinstance(gate_metrics, dict):
+            return
+        gate_count_distribution = gate_metrics.get("gate_count_distribution")
+        if not isinstance(gate_count_distribution, dict) or not gate_count_distribution:
+            return
+        gate_count_text, _ = max(
+            gate_count_distribution.items(), key=lambda item: int(item[1])
+        )
+        try:
+            gate_count = int(gate_count_text)
+        except ValueError:
+            return
+        if gate_count <= 2:
+            return
+
+        phase = self.schedule.phase_at_index(eval_stats.phase_index)
+        curriculum_stage = int(phase.curriculum_stage)
+
+        failure_counts = gate_metrics.get("failure_counts")
+        if isinstance(failure_counts, dict) and failure_counts:
+            gate_key, _ = max(failure_counts.items(), key=lambda item: int(item[1]))
+            failed_gate = _gate_number_from_metric_key(gate_key)
+            if failed_gate is not None and failed_gate > 1:
+                self.failure_replay_start_gates[
+                    _failure_replay_key(curriculum_stage, gate_count, "*")
+                ] = max(0, min(gate_count - 1, failed_gate - 2))
+
+        direction_metrics = gate_metrics.get("direction_metrics")
+        if isinstance(direction_metrics, dict) and len(direction_metrics) >= 2:
+            candidates: list[tuple[int, float, int]] = []
+            for grammar_id_text, metrics in direction_metrics.items():
+                if not isinstance(metrics, dict):
+                    continue
+                try:
+                    grammar_id = int(grammar_id_text)
+                    completion_rate = float(metrics.get("completion_rate", 0.0))
+                    episodes = int(metrics.get("episodes", 0))
+                except (TypeError, ValueError):
+                    continue
+                if episodes > 0:
+                    candidates.append((grammar_id, completion_rate, episodes))
+            if len(candidates) >= 2:
+                weakest = min(candidates, key=lambda item: item[1])
+                strongest = max(candidates, key=lambda item: item[1])
+                if strongest[1] - weakest[1] >= 0.20:
+                    self.failure_replay_grammar_ids[
+                        _failure_replay_direction_key(curriculum_stage, gate_count)
+                    ] = weakest[0]
+
+        failures_by_direction = gate_metrics.get("failure_counts_by_direction")
+        if not isinstance(failures_by_direction, dict):
+            return
+        for grammar_id_text, direction_failures in failures_by_direction.items():
+            if not isinstance(direction_failures, dict) or not direction_failures:
+                continue
+            gate_key, _ = max(
+                direction_failures.items(), key=lambda item: int(item[1])
+            )
+            failed_gate = _gate_number_from_metric_key(gate_key)
+            if failed_gate is None or failed_gate <= 1:
+                continue
+            self.failure_replay_start_gates[
+                _failure_replay_key(curriculum_stage, gate_count, grammar_id_text)
+            ] = max(0, min(gate_count - 1, failed_gate - 2))
+
     def record_eval(self, eval_stats: CurriculumEvalStats, update_index: int) -> bool:
         self.latest_eval_stats = eval_stats
+        self._update_failure_replay(eval_stats)
         history = self._history[eval_stats.phase_index]
         history.append(eval_stats)
 
@@ -1799,6 +1942,9 @@ class MasteryCurriculumController:
             "latest_eval_stats": None
             if self.latest_eval_stats is None
             else asdict(self.latest_eval_stats),
+            "failure_replay_strategy": FAILURE_REPLAY_STRATEGY,
+            "failure_replay_start_gates": dict(self.failure_replay_start_gates),
+            "failure_replay_grammar_ids": dict(self.failure_replay_grammar_ids),
             "history": {
                 str(phase_index): [asdict(item) for item in history]
                 for phase_index, history in self._history.items()
@@ -1839,6 +1985,20 @@ class MasteryCurriculumController:
         latest_eval_stats = state.get("latest_eval_stats")
         if isinstance(latest_eval_stats, dict):
             self.latest_eval_stats = _curriculum_eval_stats_from_dict(latest_eval_stats)
+
+        if state.get("failure_replay_strategy") == FAILURE_REPLAY_STRATEGY:
+            replay_state = state.get("failure_replay_start_gates")
+            if isinstance(replay_state, dict):
+                self.failure_replay_start_gates = {
+                    str(key): int(value) for key, value in replay_state.items()
+                }
+            replay_grammar_state = state.get("failure_replay_grammar_ids")
+            if isinstance(replay_grammar_state, dict):
+                self.failure_replay_grammar_ids = {
+                    str(key): int(value) for key, value in replay_grammar_state.items()
+                }
+        elif self.latest_eval_stats is not None:
+            self._update_failure_replay(self.latest_eval_stats)
 
         self._history = {
             phase_index: deque(maxlen=self.config.curriculum_mastery_window)
@@ -1893,6 +2053,64 @@ def _done_reason_labels(done_reason: int) -> list[str]:
     return labels or ["none"]
 
 
+def _gate_metric_key(gate_number: int) -> str:
+    return f"gate_{max(1, int(gate_number))}"
+
+
+def _gate_number_from_metric_key(gate_key: object) -> int | None:
+    text = str(gate_key)
+    if not text.startswith("gate_"):
+        return None
+    try:
+        return int(text.removeprefix("gate_"))
+    except ValueError:
+        return None
+
+
+def _counter_to_gate_dict(counter: Counter[int]) -> dict[str, int]:
+    return {
+        _gate_metric_key(gate_number): int(count)
+        for gate_number, count in sorted(counter.items())
+        if int(count) > 0
+    }
+
+
+def _summarize_gate_steps(
+    samples_by_gate: dict[int, list[int]],
+) -> dict[str, dict[str, float | int]]:
+    summary: dict[str, dict[str, float | int]] = {}
+    for gate_number, samples in sorted(samples_by_gate.items()):
+        if not samples:
+            continue
+        values = np.asarray(samples, dtype=np.float32)
+        summary[_gate_metric_key(gate_number)] = {
+            "count": int(values.size),
+            "mean": float(np.mean(values)),
+            "p50": float(np.percentile(values, 50.0)),
+            "p90": float(np.percentile(values, 90.0)),
+        }
+    return summary
+
+
+def _target_gate_number(current_gate: int, gate_count: int) -> int:
+    if gate_count <= 0:
+        return 1
+    return max(1, min(int(current_gate) + 1, int(gate_count)))
+
+
+def _current_gates_from_progress(
+    progress_values: np.ndarray, gate_counts: np.ndarray
+) -> np.ndarray:
+    scaled = np.asarray(progress_values, dtype=np.float32) * np.asarray(
+        gate_counts, dtype=np.float32
+    )
+    return np.clip(
+        np.floor(scaled + 1.0e-4).astype(np.int32),
+        0,
+        np.asarray(gate_counts, dtype=np.int32),
+    )
+
+
 def _evaluate_curriculum_phase(
     env: TriadFastVecEnv,
     model: ActorCritic,
@@ -1911,6 +2129,17 @@ def _evaluate_curriculum_phase(
         phase_index=phase_index,
         base_seed=base_seed,
     )
+    expanded_reset_params = [_expand_reset_param(item) for item in reset_params]
+    grammar_ids = np.asarray(
+        [int(item[1]) & 0xFF for item in expanded_reset_params], dtype=np.int32
+    )
+    gate_counts = np.asarray(
+        [
+            _estimated_curriculum_gate_count(int(item[3]), float(item[4]))
+            for item in expanded_reset_params
+        ],
+        dtype=np.int32,
+    )
     env.sim.set_reset_params(reset_params)
     observations = env.reset_numpy().copy()
 
@@ -1919,6 +2148,24 @@ def _evaluate_curriculum_phase(
     returns = np.zeros(env.sim.env_count, dtype=np.float32)
     lengths = np.zeros(env.sim.env_count, dtype=np.int32)
     best_progress = observations[:, PROGRESS_OBSERVATION_INDEX].copy()
+    last_gate = _current_gates_from_progress(
+        observations[:, PROGRESS_OBSERVATION_INDEX], gate_counts
+    )
+    gate_entry_steps = np.zeros(env.sim.env_count, dtype=np.int32)
+    terminal_recorded = np.zeros(env.sim.env_count, dtype=bool)
+    gate_attempt_counts: Counter[int] = Counter()
+    gate_success_counts: Counter[int] = Counter()
+    gate_failure_counts: Counter[int] = Counter()
+    gate_completion_counts: Counter[int] = Counter()
+    gate_success_steps: dict[int, list[int]] = defaultdict(list)
+    gate_failure_steps: dict[int, list[int]] = defaultdict(list)
+    failure_reason_by_gate: dict[int, Counter[str]] = defaultdict(Counter)
+    failure_gate_by_direction: dict[int, Counter[int]] = defaultdict(Counter)
+    for env_index in range(env.sim.env_count):
+        if int(last_gate[env_index]) < int(gate_counts[env_index]):
+            gate_attempt_counts[
+                _target_gate_number(last_gate[env_index], gate_counts[env_index])
+            ] += 1
 
     for _ in range(max_episode_steps):
         obs_tensor = _observations_to_tensor(
@@ -1945,12 +2192,49 @@ def _evaluate_curriculum_phase(
             best_progress,
             next_observations[:, PROGRESS_OBSERVATION_INDEX],
         )
+        current_gates = _current_gates_from_progress(
+            next_observations[:, PROGRESS_OBSERVATION_INDEX], gate_counts
+        )
+        for env_index in np.flatnonzero(active):
+            previous_gate = int(last_gate[env_index])
+            current_gate = int(current_gates[env_index])
+            gate_count = int(gate_counts[env_index])
+            if current_gate <= previous_gate:
+                continue
+            passed_gate_number = max(1, min(current_gate, gate_count))
+            gate_success_counts[passed_gate_number] += 1
+            gate_success_steps[passed_gate_number].append(
+                max(1, int(lengths[env_index]) - int(gate_entry_steps[env_index]))
+            )
+            gate_entry_steps[env_index] = int(lengths[env_index])
+            last_gate[env_index] = min(current_gate, gate_count)
+            if current_gate < gate_count:
+                gate_attempt_counts[current_gate + 1] += 1
 
         newly_done = active & done_flags
         if np.any(newly_done):
             completed[newly_done] = (
                 done_reasons[newly_done] & np.uint32(COMPLETE_DONE_REASON)
             ) != 0
+            for env_index in np.flatnonzero(newly_done):
+                terminal_recorded[env_index] = True
+                gate_count = int(gate_counts[env_index])
+                if bool(completed[env_index]):
+                    gate_completion_counts[gate_count] += 1
+                    continue
+                target_gate = _target_gate_number(
+                    current_gates[env_index], gate_count
+                )
+                gate_failure_counts[target_gate] += 1
+                gate_failure_steps[target_gate].append(
+                    max(1, int(lengths[env_index]) - int(gate_entry_steps[env_index]))
+                )
+                labels = _done_reason_labels(int(done_reasons[env_index]))
+                for label in labels:
+                    failure_reason_by_gate[target_gate][label] += 1
+                failure_gate_by_direction[int(grammar_ids[env_index])][
+                    target_gate
+                ] += 1
             active[newly_done] = False
 
         observations = next_observations.copy()
@@ -1960,6 +2244,24 @@ def _evaluate_curriculum_phase(
     phase = schedule.phase_at_index(phase_index)
     final_states = env.sim.get_state()
     final_reward_done = env.sim.get_reward_done()
+    for env_index in np.flatnonzero(~terminal_recorded):
+        gate_count = int(gate_counts[env_index])
+        current_gate = int(final_states[env_index]["current_gate"])
+        if bool(completed[env_index]):
+            gate_completion_counts[gate_count] += 1
+            continue
+        target_gate = _target_gate_number(current_gate, gate_count)
+        gate_failure_counts[target_gate] += 1
+        gate_failure_steps[target_gate].append(
+            max(1, int(lengths[env_index]) - int(gate_entry_steps[env_index]))
+        )
+        reason = int(final_reward_done[env_index]["done_reason"])
+        labels = _done_reason_labels(reason)
+        if labels == ["none"]:
+            labels = ["eval_timeout"]
+        for label in labels:
+            failure_reason_by_gate[target_gate][label] += 1
+        failure_gate_by_direction[int(grammar_ids[env_index])][target_gate] += 1
     gate_passed = np.asarray(
         [
             int(final_states[env_index]["current_gate"]) > 0
@@ -2024,8 +2326,43 @@ def _evaluate_curriculum_phase(
                 difficulty,
                 curriculum_stage,
                 *_axis_values,
-            ) in enumerate(_expand_reset_param(item) for item in reset_params)
+            ) in enumerate(expanded_reset_params)
         ]
+    direction_metrics = {}
+    for grammar_id in sorted(set(int(item) for item in grammar_ids.tolist())):
+        direction_mask = grammar_ids == grammar_id
+        direction_metrics[str(grammar_id)] = {
+            "episodes": int(np.count_nonzero(direction_mask)),
+            "completion_rate": float(np.mean(completed[direction_mask]))
+            if np.any(direction_mask)
+            else 0.0,
+            "mean_progress": float(np.mean(best_progress[direction_mask]))
+            if np.any(direction_mask)
+            else 0.0,
+        }
+    gate_metrics: dict[str, object] = {
+        "gate_count_distribution": {
+            str(gate_count): int(count)
+            for gate_count, count in sorted(Counter(gate_counts.tolist()).items())
+        },
+        "attempt_counts": _counter_to_gate_dict(gate_attempt_counts),
+        "success_counts": _counter_to_gate_dict(gate_success_counts),
+        "failure_counts": _counter_to_gate_dict(gate_failure_counts),
+        "completion_counts": _counter_to_gate_dict(gate_completion_counts),
+        "success_steps": _summarize_gate_steps(gate_success_steps),
+        "failure_steps": _summarize_gate_steps(gate_failure_steps),
+        "failure_reasons_by_gate": {
+            _gate_metric_key(gate_number): {
+                reason: int(count) for reason, count in sorted(reason_counts.items())
+            }
+            for gate_number, reason_counts in sorted(failure_reason_by_gate.items())
+        },
+        "failure_counts_by_direction": {
+            str(grammar_id): _counter_to_gate_dict(counter)
+            for grammar_id, counter in sorted(failure_gate_by_direction.items())
+        },
+        "direction_metrics": direction_metrics,
+    }
     return CurriculumEvalStats(
         phase_index=phase_index,
         phase=phase.name,
@@ -2035,6 +2372,7 @@ def _evaluate_curriculum_phase(
         mean_episode_return=float(np.mean(returns)),
         mean_episode_length=float(np.mean(lengths)),
         per_env=per_env,
+        gate_metrics=gate_metrics,
     )
 
 
@@ -3071,6 +3409,12 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                         "phase_updates": phase_updates,
                         "phase_mix": curriculum.training_phase_mix(),
                         "adaptive": curriculum.adaptive_curriculum_state(),
+                        "failure_replay_start_gates": dict(
+                            curriculum.failure_replay_start_gates
+                        ),
+                        "failure_replay_grammar_ids": dict(
+                            curriculum.failure_replay_grammar_ids
+                        ),
                         "randomization_preview": _randomization_preview(
                             reset_params, config
                         ),
@@ -3082,6 +3426,7 @@ def train_ppo(config: PPOConfig) -> PPOTrainResult:
                             "mean_progress": eval_stats.mean_progress,
                             "mean_episode_return": eval_stats.mean_episode_return,
                             "mean_episode_length": eval_stats.mean_episode_length,
+                            "gate_metrics": eval_stats.gate_metrics,
                         },
                         "phase_advanced": phase_advanced,
                         "next_phase": curriculum.current_phase().name,

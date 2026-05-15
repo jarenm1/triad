@@ -939,6 +939,63 @@ fn gate_approach_activation(gate: Gate, distance_to_gate: f32) -> f32 {
     return 1.0 - clamp(distance_to_gate / gate_scale, 0.0, 1.0);
 }
 
+fn safe_direction(vector: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
+    let vector_length = length(vector);
+    if (vector_length <= 1e-5) {
+        return normalize(fallback);
+    }
+    return vector / vector_length;
+}
+
+fn camera_alignment_reward_scale(reset: ResetParams) -> f32 {
+    if (reset.curriculum_stage == 0u) {
+        return 0.0;
+    }
+    if (reset.curriculum_stage == 1u) {
+        let base_grammar_id = reset_base_grammar_id(reset);
+        let circle_phase =
+            base_grammar_id == PRIMITIVE_CIRCLE_CW || base_grammar_id == PRIMITIVE_CIRCLE_CCW;
+        if (circle_phase && reset_gate_count_level(reset) >= 0.02) {
+            return 0.012;
+        }
+        return 0.0;
+    }
+    if (reset.curriculum_stage == 2u) {
+        return 0.020;
+    }
+    if (reset.curriculum_stage == 3u) {
+        return 0.035;
+    }
+    return 0.045;
+}
+
+fn camera_lookahead_alignment(
+    index: u32,
+    gate_count: u32,
+    current_gate_index: u32,
+    target_gate: Gate,
+    position: vec3<f32>,
+    attitude: vec3<f32>,
+    distance_to_gate: f32,
+) -> f32 {
+    let body_look = normalize(body_forward(attitude));
+    let current_direction = safe_direction(
+        target_gate.center.xyz - position,
+        target_gate.forward.xyz,
+    );
+    var next_direction = normalize(target_gate.forward.xyz);
+    var blend_to_next = 0.0;
+    if (current_gate_index + 1u < gate_count) {
+        let next_gate = gates.values[gate_slot(index, current_gate_index + 1u)];
+        next_direction = safe_direction(next_gate.center.xyz - position, next_gate.forward.xyz);
+        blend_to_next = 0.85 * (1.0 - clamp((distance_to_gate - 1.2) / 2.4, 0.0, 1.0));
+    }
+    let lookahead_direction =
+        safe_direction(mix(current_direction, next_direction, blend_to_next), current_direction);
+    let alignment = max(dot(body_look, lookahead_direction), 0.0);
+    return alignment * alignment;
+}
+
 fn segment_start_for_target_gate(
     index: u32,
     current_gate: u32,
@@ -2505,6 +2562,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             soft_failure_strength,
         );
     let effective_passed_gate = passed_gate || soft_failed_gate;
+    let pre_step_gate_index = state.current_gate;
     var collided_obstacle = false;
     var done_reason = DONE_REASON_NONE;
     var obstacle_index = 0u;
@@ -2644,8 +2702,24 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             * gate_velocity_alignment(prev_target_gate, state.velocity.xyz)
             * params.bootstrap_velocity_alignment_reward_scale
         + initial_plane_commit_reward;
+    let camera_alignment_reward =
+        select(
+            0.0,
+            camera_alignment_reward_scale(reset)
+                * camera_lookahead_alignment(
+                    index,
+                    gate_count,
+                    pre_step_gate_index,
+                    prev_target_gate,
+                    state.position.xyz,
+                    state.attitude.xyz,
+                    prev_gate_distance,
+                )
+                * (0.35 + 0.65 * approach_activation),
+            forward_progress > 0.0,
+        );
     let shaping_reward =
-        progress_reward + bootstrap_dense_reward * assist_strength;
+        progress_reward + bootstrap_dense_reward * assist_strength + camera_alignment_reward;
     let gate_age_seconds = f32(state.gate_age_steps) * params.dt_seconds;
     let hard_missed_gate = missed_gate && !soft_failed_gate;
     let collision_happened =

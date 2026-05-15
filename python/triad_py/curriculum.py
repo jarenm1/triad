@@ -366,13 +366,13 @@ def build_teacher_curriculum_schedule() -> CurriculumSchedule:
                 difficulty_max=0.082,
                 grammar_ids=(PRIMITIVE_STRAIGHT,),
                 axis_ranges=CurriculumAxisRanges(
-                    gate_count_level=(0.0, 0.025),
+                    gate_count_level=(0.0, 0.018),
                     gate_size_level=(0.05, 0.12),
                     spacing_level=(0.06, 0.16),
                     verticality_level=(0.0, 0.06),
                     spawn_noise_level=(0.04, 0.10),
                     dynamics_noise_level=(0.02, 0.08),
-                    path_curvature_level=(0.0, 0.12),
+                    path_curvature_level=(0.0, 0.02),
                 ),
             ),
             CurriculumPhase(

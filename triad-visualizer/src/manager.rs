@@ -23,9 +23,41 @@ use crate::render::{
 use crate::replay::{
     PolicyClient, ReplayController, ReplayPlayback, apply_replay_controller, terminal_pause_status,
 };
-use crate::ui::{UiSnapshot, UiState, curriculum_phase_profile};
+use crate::ui::{AxisRange, UiSnapshot, UiState, curriculum_phase_axes, curriculum_phase_profile};
 
 const PLAYING_READBACK_INTERVAL_FRAMES: u32 = 4;
+
+fn sample_axis(range: AxisRange, difficulty: f32, env_seed: u32, salt: u32) -> f32 {
+    let span = (range.max - range.min).max(0.0);
+    if span <= f32::EPSILON {
+        return range.min;
+    }
+    let target = range.min + difficulty.clamp(0.0, 1.0) * span;
+    let jitter = (hash_to_unit(env_seed ^ salt) * 2.0 - 1.0) * span * 0.2;
+    (target + jitter).clamp(range.min, range.max)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn curriculum_axis_summary_difficulty(
+    gate_count_level: f32,
+    gate_size_level: f32,
+    spacing_level: f32,
+    verticality_level: f32,
+    gate_pose_noise_level: f32,
+    spawn_noise_level: f32,
+    dynamics_noise_level: f32,
+    obstacle_density_level: f32,
+    path_curvature_level: f32,
+) -> f32 {
+    let geometry = gate_count_level
+        + gate_size_level
+        + spacing_level
+        + verticality_level
+        + path_curvature_level;
+    let randomization =
+        gate_pose_noise_level + spawn_noise_level + dynamics_noise_level + obstacle_density_level;
+    (geometry + 0.5 * randomization) / 7.0
+}
 
 pub(crate) struct VisualizerManager {
     sim: GpuSimulation,
@@ -228,24 +260,75 @@ impl VisualizerManager {
         curriculum_phase: usize,
     ) -> Vec<ResetParams> {
         let profile = curriculum_phase_profile(curriculum_phase);
-        let difficulty_span = (profile.difficulty_max - profile.difficulty_min).max(0.0);
-        let target_difficulty =
-            profile.difficulty_min + difficulty.clamp(0.0, 1.0) * difficulty_span;
-        let jitter_span = difficulty_span * 0.2;
+        let axis_profile = curriculum_phase_axes(curriculum_phase);
         (0..self.sim.env_count())
             .map(|env_index| {
                 let env_seed = hash_u32(base_seed ^ (env_index as u32).wrapping_mul(0x9e37_79b9));
                 let grammar_index = (env_seed as usize) % profile.grammar_ids.len();
                 let grammar_id = profile.grammar_ids[grammar_index];
-                let difficulty_jitter =
-                    (hash_to_unit(env_seed ^ 0x85eb_ca6b) * 2.0 - 1.0) * jitter_span;
-                let env_difficulty = (target_difficulty + difficulty_jitter)
-                    .clamp(profile.difficulty_min, profile.difficulty_max);
-                ResetParams::new(
+                let gate_count_level =
+                    sample_axis(axis_profile.gate_count_level, difficulty, env_seed, 0x101);
+                let gate_size_level =
+                    sample_axis(axis_profile.gate_size_level, difficulty, env_seed, 0x103);
+                let spacing_level =
+                    sample_axis(axis_profile.spacing_level, difficulty, env_seed, 0x107);
+                let verticality_level =
+                    sample_axis(axis_profile.verticality_level, difficulty, env_seed, 0x109);
+                let gate_pose_noise_level = sample_axis(
+                    axis_profile.gate_pose_noise_level,
+                    difficulty,
+                    env_seed,
+                    0x10d,
+                );
+                let spawn_noise_level =
+                    sample_axis(axis_profile.spawn_noise_level, difficulty, env_seed, 0x10f);
+                let dynamics_noise_level = sample_axis(
+                    axis_profile.dynamics_noise_level,
+                    difficulty,
+                    env_seed,
+                    0x115,
+                );
+                let obstacle_density_level = sample_axis(
+                    axis_profile.obstacle_density_level,
+                    difficulty,
+                    env_seed,
+                    0x119,
+                );
+                let path_curvature_level = sample_axis(
+                    axis_profile.path_curvature_level,
+                    difficulty,
+                    env_seed,
+                    0x11b,
+                );
+                let soft_failure_level =
+                    sample_axis(axis_profile.soft_failure_level, difficulty, env_seed, 0x11f);
+                let env_difficulty = curriculum_axis_summary_difficulty(
+                    gate_count_level,
+                    gate_size_level,
+                    spacing_level,
+                    verticality_level,
+                    gate_pose_noise_level,
+                    spawn_noise_level,
+                    dynamics_noise_level,
+                    obstacle_density_level,
+                    path_curvature_level,
+                );
+                ResetParams::from_axes(
                     env_seed,
                     grammar_id,
                     env_difficulty,
                     profile.curriculum_stage,
+                    gate_count_level,
+                    gate_size_level,
+                    spacing_level,
+                    verticality_level,
+                    gate_pose_noise_level,
+                    spawn_noise_level,
+                    dynamics_noise_level,
+                    obstacle_density_level,
+                    path_curvature_level,
+                    soft_failure_level,
+                    0,
                 )
             })
             .collect()

@@ -370,6 +370,30 @@ class PPOTrainingLogger:
                             float(adaptive[key]),
                             env_step,
                         )
+            eval_payload = curriculum.get("eval")
+            if isinstance(eval_payload, Mapping):
+                gate_metrics = eval_payload.get("gate_metrics")
+                if isinstance(gate_metrics, Mapping):
+                    failure_counts = gate_metrics.get("failure_counts")
+                    if isinstance(failure_counts, Mapping):
+                        for gate_name, count in failure_counts.items():
+                            writer.add_scalar(
+                                f"eval_gate_failures/{gate_name}",
+                                float(count),
+                                env_step,
+                            )
+                    failure_steps = gate_metrics.get("failure_steps")
+                    if isinstance(failure_steps, Mapping):
+                        for gate_name, step_stats in failure_steps.items():
+                            if (
+                                isinstance(step_stats, Mapping)
+                                and "mean" in step_stats
+                            ):
+                                writer.add_scalar(
+                                    f"eval_gate_failure_steps/{gate_name}",
+                                    float(step_stats["mean"]),
+                                    env_step,
+                                )
         writer.flush()
 
     def _format_update_line(self, payload: Mapping[str, object]) -> str:
@@ -404,11 +428,21 @@ class PPOTrainingLogger:
             curriculum.get("eval"), Mapping
         ):
             eval_payload = curriculum["eval"]
+            gate_text = ""
+            gate_metrics = eval_payload.get("gate_metrics")
+            if isinstance(gate_metrics, Mapping):
+                failure_counts = gate_metrics.get("failure_counts")
+                if isinstance(failure_counts, Mapping) and failure_counts:
+                    gate_name, gate_count = max(
+                        failure_counts.items(), key=lambda item: int(item[1])
+                    )
+                    gate_text = f" fail={gate_name}:{int(gate_count)}"
             eval_text = (
                 f" | eval prog={float(eval_payload['mean_progress']):.3f}"
                 f" comp={float(eval_payload['completion_rate']):.1%}"
                 f" pass={float(eval_payload.get('gate_pass_rate', 0.0)):.1%}"
                 f" ret={float(eval_payload['mean_episode_return']):.1f}"
+                f"{gate_text}"
             )
 
         return (

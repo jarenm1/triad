@@ -113,6 +113,58 @@ pub(crate) struct CurriculumPhaseProfile {
     pub(crate) difficulty_max: f32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct AxisRange {
+    pub(crate) min: f32,
+    pub(crate) max: f32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CurriculumAxisProfile {
+    pub(crate) gate_count_level: AxisRange,
+    pub(crate) gate_size_level: AxisRange,
+    pub(crate) spacing_level: AxisRange,
+    pub(crate) verticality_level: AxisRange,
+    pub(crate) gate_pose_noise_level: AxisRange,
+    pub(crate) spawn_noise_level: AxisRange,
+    pub(crate) dynamics_noise_level: AxisRange,
+    pub(crate) obstacle_density_level: AxisRange,
+    pub(crate) path_curvature_level: AxisRange,
+    pub(crate) soft_failure_level: AxisRange,
+}
+
+const fn axis(min: f32, max: f32) -> AxisRange {
+    AxisRange { min, max }
+}
+
+const fn axes(
+    gate_count_level: AxisRange,
+    gate_size_level: AxisRange,
+    spacing_level: AxisRange,
+    verticality_level: AxisRange,
+    gate_pose_noise_level: AxisRange,
+    spawn_noise_level: AxisRange,
+    dynamics_noise_level: AxisRange,
+    obstacle_density_level: AxisRange,
+    path_curvature_level: AxisRange,
+    soft_failure_level: AxisRange,
+) -> CurriculumAxisProfile {
+    CurriculumAxisProfile {
+        gate_count_level,
+        gate_size_level,
+        spacing_level,
+        verticality_level,
+        gate_pose_noise_level,
+        spawn_noise_level,
+        dynamics_noise_level,
+        obstacle_density_level,
+        path_curvature_level,
+        soft_failure_level,
+    }
+}
+
+const ZERO_AXIS: AxisRange = axis(0.0, 0.0);
+
 const PRIMITIVE_STRAIGHT: u32 = 0;
 const PRIMITIVE_CIRCLE_CW: u32 = 1;
 const PRIMITIVE_CIRCLE_CCW: u32 = 2;
@@ -230,6 +282,155 @@ pub(crate) fn curriculum_phase_profile(curriculum_phase: usize) -> CurriculumPha
     CURRICULUM_PHASES[curriculum_phase.min(CURRICULUM_PHASES.len().saturating_sub(1))]
 }
 
+pub(crate) fn curriculum_phase_axes(curriculum_phase: usize) -> CurriculumAxisProfile {
+    match curriculum_phase.min(CURRICULUM_PHASES.len().saturating_sub(1)) {
+        0 => axes(
+            axis(0.0, 0.012),
+            axis(0.0, 0.02),
+            axis(0.0, 0.03),
+            ZERO_AXIS,
+            ZERO_AXIS,
+            axis(0.0, 0.04),
+            ZERO_AXIS,
+            ZERO_AXIS,
+            ZERO_AXIS,
+            ZERO_AXIS,
+        ),
+        1 => axes(
+            axis(0.016, 0.03),
+            axis(0.02, 0.05),
+            axis(0.03, 0.08),
+            axis(0.0, 0.03),
+            ZERO_AXIS,
+            axis(0.02, 0.06),
+            ZERO_AXIS,
+            ZERO_AXIS,
+            axis(0.0, 0.05),
+            ZERO_AXIS,
+        ),
+        2 => axes(
+            axis(0.0, 0.018),
+            axis(0.05, 0.12),
+            axis(0.06, 0.16),
+            axis(0.0, 0.06),
+            ZERO_AXIS,
+            axis(0.04, 0.10),
+            axis(0.02, 0.08),
+            ZERO_AXIS,
+            axis(0.0, 0.02),
+            ZERO_AXIS,
+        ),
+        3 => axes(
+            axis(0.02, 0.038),
+            axis(0.0, 0.08),
+            axis(0.08, 0.18),
+            axis(0.0, 0.04),
+            ZERO_AXIS,
+            axis(0.03, 0.09),
+            axis(0.0, 0.04),
+            ZERO_AXIS,
+            axis(0.0, 0.02),
+            ZERO_AXIS,
+        ),
+        4 => axes(
+            axis(0.0, 0.018),
+            axis(0.0, 0.08),
+            axis(0.08, 0.18),
+            axis(0.0, 0.03),
+            ZERO_AXIS,
+            axis(0.02, 0.08),
+            axis(0.0, 0.04),
+            ZERO_AXIS,
+            axis(0.0, 0.12),
+            ZERO_AXIS,
+        ),
+        5 => axes(
+            axis(0.02, 0.038),
+            axis(0.04, 0.14),
+            axis(0.10, 0.24),
+            axis(0.0, 0.08),
+            ZERO_AXIS,
+            axis(0.04, 0.12),
+            axis(0.03, 0.10),
+            ZERO_AXIS,
+            axis(0.10, 0.28),
+            ZERO_AXIS,
+        ),
+        6 => axes(
+            axis(0.04, 0.075),
+            axis(0.10, 0.22),
+            axis(0.14, 0.30),
+            axis(0.03, 0.12),
+            ZERO_AXIS,
+            axis(0.06, 0.15),
+            axis(0.06, 0.14),
+            ZERO_AXIS,
+            axis(0.22, 0.42),
+            ZERO_AXIS,
+        ),
+        7 => axes(
+            axis(0.0, 0.08),
+            axis(0.12, 0.25),
+            axis(0.14, 0.30),
+            axis(0.05, 0.18),
+            ZERO_AXIS,
+            axis(0.08, 0.18),
+            axis(0.08, 0.18),
+            ZERO_AXIS,
+            axis(0.15, 0.28),
+            ZERO_AXIS,
+        ),
+        8 => axes(
+            axis(0.08, 0.18),
+            axis(0.18, 0.34),
+            axis(0.22, 0.42),
+            axis(0.10, 0.26),
+            ZERO_AXIS,
+            axis(0.12, 0.24),
+            axis(0.12, 0.26),
+            ZERO_AXIS,
+            axis(0.28, 0.55),
+            ZERO_AXIS,
+        ),
+        9 => axes(
+            axis(0.30, 0.55),
+            axis(0.28, 0.48),
+            axis(0.30, 0.55),
+            axis(0.18, 0.42),
+            ZERO_AXIS,
+            axis(0.18, 0.34),
+            axis(0.20, 0.42),
+            ZERO_AXIS,
+            axis(0.55, 0.78),
+            ZERO_AXIS,
+        ),
+        10 => axes(
+            axis(0.45, 0.75),
+            axis(0.38, 0.62),
+            axis(0.42, 0.70),
+            axis(0.30, 0.62),
+            axis(0.0, 0.06),
+            axis(0.25, 0.45),
+            axis(0.34, 0.60),
+            ZERO_AXIS,
+            axis(0.65, 0.92),
+            ZERO_AXIS,
+        ),
+        _ => axes(
+            axis(0.70, 1.0),
+            axis(0.55, 0.82),
+            axis(0.58, 0.90),
+            axis(0.45, 0.90),
+            axis(0.02, 0.10),
+            axis(0.35, 0.60),
+            axis(0.50, 0.85),
+            ZERO_AXIS,
+            axis(0.80, 1.0),
+            ZERO_AXIS,
+        ),
+    }
+}
+
 pub(crate) fn draw_visualizer_ui(ctx: &egui::Context, ui: &mut UiState) {
     egui::Window::new("Visualizer")
         .default_pos(egui::pos2(12.0, 84.0))
@@ -307,6 +508,14 @@ pub(crate) fn draw_visualizer_ui(ctx: &egui::Context, ui: &mut UiState) {
                 phase.difficulty_min,
                 phase.difficulty_max,
                 actual_difficulty
+            ));
+            let axes = curriculum_phase_axes(ui.curriculum_phase);
+            panel.label(format!(
+                "Axes: gates {:.3}..{:.3} | curve {:.3}..{:.3}",
+                axes.gate_count_level.min,
+                axes.gate_count_level.max,
+                axes.path_curvature_level.min,
+                axes.path_curvature_level.max
             ));
 
             panel.separator();
