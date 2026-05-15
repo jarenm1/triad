@@ -1,6 +1,6 @@
 use crate::constants::{
-    DONE_REASON_COMPLETE, DONE_REASON_EXCESSIVE_TILT, DONE_REASON_FLOOR_COLLISION,
-    DONE_REASON_GATE_COLLISION, DONE_REASON_OBSTACLE_COLLISION, DONE_REASON_OUT_OF_BOUNDS,
+    DONE_REASON_COMPLETE, DONE_REASON_FLOOR_COLLISION, DONE_REASON_GATE_COLLISION,
+    DONE_REASON_MISSED_GATE, DONE_REASON_OBSTACLE_COLLISION, DONE_REASON_OUT_OF_BOUNDS,
     DONE_REASON_STEP_LIMIT, VISUALIZER_ENV_COUNT,
 };
 use crate::replay::{ReplayPlayback, ReplaySnapshot, ReplayState};
@@ -28,6 +28,7 @@ pub(crate) struct UiState {
     pub(crate) gate_alignment: f32,
     pub(crate) mean_motor_thrust: f32,
     pub(crate) shaping_reward: f32,
+    pub(crate) out_of_bounds_penalty: f32,
     pub(crate) time_penalty: f32,
     pub(crate) sparse_objective_reward: f32,
     pub(crate) collision_penalty: f32,
@@ -56,6 +57,7 @@ impl Default for UiState {
             gate_alignment: 0.0,
             mean_motor_thrust: 0.0,
             shaping_reward: 0.0,
+            out_of_bounds_penalty: 0.0,
             time_penalty: 0.0,
             sparse_objective_reward: 0.0,
             collision_penalty: 0.0,
@@ -111,67 +113,322 @@ pub(crate) struct CurriculumPhaseProfile {
     pub(crate) difficulty_max: f32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct AxisRange {
+    pub(crate) min: f32,
+    pub(crate) max: f32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct CurriculumAxisProfile {
+    pub(crate) gate_count_level: AxisRange,
+    pub(crate) gate_size_level: AxisRange,
+    pub(crate) spacing_level: AxisRange,
+    pub(crate) verticality_level: AxisRange,
+    pub(crate) gate_pose_noise_level: AxisRange,
+    pub(crate) spawn_noise_level: AxisRange,
+    pub(crate) dynamics_noise_level: AxisRange,
+    pub(crate) obstacle_density_level: AxisRange,
+    pub(crate) path_curvature_level: AxisRange,
+    pub(crate) soft_failure_level: AxisRange,
+}
+
+const fn axis(min: f32, max: f32) -> AxisRange {
+    AxisRange { min, max }
+}
+
+const fn axes(
+    gate_count_level: AxisRange,
+    gate_size_level: AxisRange,
+    spacing_level: AxisRange,
+    verticality_level: AxisRange,
+    gate_pose_noise_level: AxisRange,
+    spawn_noise_level: AxisRange,
+    dynamics_noise_level: AxisRange,
+    obstacle_density_level: AxisRange,
+    path_curvature_level: AxisRange,
+    soft_failure_level: AxisRange,
+) -> CurriculumAxisProfile {
+    CurriculumAxisProfile {
+        gate_count_level,
+        gate_size_level,
+        spacing_level,
+        verticality_level,
+        gate_pose_noise_level,
+        spawn_noise_level,
+        dynamics_noise_level,
+        obstacle_density_level,
+        path_curvature_level,
+        soft_failure_level,
+    }
+}
+
+const ZERO_AXIS: AxisRange = axis(0.0, 0.0);
+
+const PRIMITIVE_STRAIGHT: u32 = 0;
+const PRIMITIVE_CIRCLE_CW: u32 = 1;
+const PRIMITIVE_CIRCLE_CCW: u32 = 2;
+const PRIMITIVE_ZIGZAG: u32 = 3;
+const PRIMITIVE_ELLIPSE: u32 = 4;
+const PRIMITIVE_MIXED: u32 = 5;
+
 pub(crate) const CURRICULUM_PHASES: &[CurriculumPhaseProfile] = &[
     CurriculumPhaseProfile {
-        name: "discover_gate",
+        name: "gate_approach",
         curriculum_stage: 0,
-        grammar_ids: &[0],
+        grammar_ids: &[PRIMITIVE_STRAIGHT],
         difficulty_min: 0.0,
-        difficulty_max: 0.005,
+        difficulty_max: 0.012,
     },
     CurriculumPhaseProfile {
-        name: "align_gate",
+        name: "gate_pass",
         curriculum_stage: 0,
-        grammar_ids: &[0],
-        difficulty_min: 0.005,
-        difficulty_max: 0.015,
+        grammar_ids: &[PRIMITIVE_STRAIGHT],
+        difficulty_min: 0.011,
+        difficulty_max: 0.039,
     },
     CurriculumPhaseProfile {
-        name: "pass_gate",
-        curriculum_stage: 0,
-        grammar_ids: &[0],
-        difficulty_min: 0.015,
-        difficulty_max: 0.03,
-    },
-    CurriculumPhaseProfile {
-        name: "exit_gate",
+        name: "straight_intro",
         curriculum_stage: 1,
-        grammar_ids: &[0],
-        difficulty_min: 0.0,
-        difficulty_max: 0.02,
+        grammar_ids: &[PRIMITIVE_STRAIGHT],
+        difficulty_min: 0.020,
+        difficulty_max: 0.082,
     },
     CurriculumPhaseProfile {
-        name: "chain_two",
+        name: "straight_chain",
         curriculum_stage: 1,
-        grammar_ids: &[0],
-        difficulty_min: 0.02,
-        difficulty_max: 0.04,
+        grammar_ids: &[PRIMITIVE_STRAIGHT],
+        difficulty_min: 0.038,
+        difficulty_max: 0.095,
     },
     CurriculumPhaseProfile {
-        name: "offset",
+        name: "circle_intro",
+        curriculum_stage: 1,
+        grammar_ids: &[PRIMITIVE_CIRCLE_CW, PRIMITIVE_CIRCLE_CCW],
+        difficulty_min: 0.032,
+        difficulty_max: 0.074,
+    },
+    CurriculumPhaseProfile {
+        name: "circle_mastery",
+        curriculum_stage: 1,
+        grammar_ids: &[PRIMITIVE_CIRCLE_CW, PRIMITIVE_CIRCLE_CCW],
+        difficulty_min: 0.063,
+        difficulty_max: 0.135,
+    },
+    CurriculumPhaseProfile {
+        name: "circle_chain",
+        curriculum_stage: 1,
+        grammar_ids: &[PRIMITIVE_CIRCLE_CW, PRIMITIVE_CIRCLE_CCW],
+        difficulty_min: 0.112,
+        difficulty_max: 0.211,
+    },
+    CurriculumPhaseProfile {
+        name: "arena_straights",
         curriculum_stage: 2,
-        grammar_ids: &[0, 1],
-        difficulty_min: 0.05,
-        difficulty_max: 0.22,
+        grammar_ids: &[PRIMITIVE_STRAIGHT],
+        difficulty_min: 0.077,
+        difficulty_max: 0.181,
     },
     CurriculumPhaseProfile {
-        name: "arena",
+        name: "arena_zigzag",
+        curriculum_stage: 2,
+        grammar_ids: &[PRIMITIVE_ZIGZAG],
+        difficulty_min: 0.140,
+        difficulty_max: 0.286,
+    },
+    CurriculumPhaseProfile {
+        name: "technical_turns",
         curriculum_stage: 3,
-        grammar_ids: &[0, 1, 2, 3],
-        difficulty_min: 0.3,
-        difficulty_max: 0.65,
+        grammar_ids: &[
+            PRIMITIVE_CIRCLE_CW,
+            PRIMITIVE_CIRCLE_CCW,
+            PRIMITIVE_ZIGZAG,
+            PRIMITIVE_ELLIPSE,
+        ],
+        difficulty_min: 0.257,
+        difficulty_max: 0.451,
     },
     CurriculumPhaseProfile {
-        name: "hard",
+        name: "primitive_mix",
+        curriculum_stage: 3,
+        grammar_ids: &[
+            PRIMITIVE_STRAIGHT,
+            PRIMITIVE_CIRCLE_CW,
+            PRIMITIVE_CIRCLE_CCW,
+            PRIMITIVE_ZIGZAG,
+            PRIMITIVE_ELLIPSE,
+            PRIMITIVE_MIXED,
+        ],
+        difficulty_min: 0.356,
+        difficulty_max: 0.595,
+    },
+    CurriculumPhaseProfile {
+        name: "hard_lap_mix",
         curriculum_stage: 4,
-        grammar_ids: &[0, 1, 2, 3],
-        difficulty_min: 0.6,
-        difficulty_max: 1.0,
+        grammar_ids: &[
+            PRIMITIVE_STRAIGHT,
+            PRIMITIVE_CIRCLE_CW,
+            PRIMITIVE_CIRCLE_CCW,
+            PRIMITIVE_ZIGZAG,
+            PRIMITIVE_ELLIPSE,
+            PRIMITIVE_MIXED,
+        ],
+        difficulty_min: 0.502,
+        difficulty_max: 0.771,
     },
 ];
 
 pub(crate) fn curriculum_phase_profile(curriculum_phase: usize) -> CurriculumPhaseProfile {
     CURRICULUM_PHASES[curriculum_phase.min(CURRICULUM_PHASES.len().saturating_sub(1))]
+}
+
+pub(crate) fn curriculum_phase_axes(curriculum_phase: usize) -> CurriculumAxisProfile {
+    match curriculum_phase.min(CURRICULUM_PHASES.len().saturating_sub(1)) {
+        0 => axes(
+            axis(0.0, 0.012),
+            axis(0.0, 0.02),
+            axis(0.0, 0.03),
+            ZERO_AXIS,
+            ZERO_AXIS,
+            axis(0.0, 0.04),
+            ZERO_AXIS,
+            ZERO_AXIS,
+            ZERO_AXIS,
+            ZERO_AXIS,
+        ),
+        1 => axes(
+            axis(0.016, 0.03),
+            axis(0.02, 0.05),
+            axis(0.03, 0.08),
+            axis(0.0, 0.03),
+            ZERO_AXIS,
+            axis(0.02, 0.06),
+            ZERO_AXIS,
+            ZERO_AXIS,
+            axis(0.0, 0.05),
+            ZERO_AXIS,
+        ),
+        2 => axes(
+            axis(0.0, 0.018),
+            axis(0.05, 0.12),
+            axis(0.06, 0.16),
+            axis(0.0, 0.06),
+            ZERO_AXIS,
+            axis(0.04, 0.10),
+            axis(0.02, 0.08),
+            ZERO_AXIS,
+            axis(0.0, 0.02),
+            ZERO_AXIS,
+        ),
+        3 => axes(
+            axis(0.02, 0.038),
+            axis(0.0, 0.08),
+            axis(0.08, 0.18),
+            axis(0.0, 0.04),
+            ZERO_AXIS,
+            axis(0.03, 0.09),
+            axis(0.0, 0.04),
+            ZERO_AXIS,
+            axis(0.0, 0.02),
+            ZERO_AXIS,
+        ),
+        4 => axes(
+            axis(0.0, 0.018),
+            axis(0.0, 0.08),
+            axis(0.08, 0.18),
+            axis(0.0, 0.03),
+            ZERO_AXIS,
+            axis(0.02, 0.08),
+            axis(0.0, 0.04),
+            ZERO_AXIS,
+            axis(0.0, 0.12),
+            ZERO_AXIS,
+        ),
+        5 => axes(
+            axis(0.02, 0.038),
+            axis(0.04, 0.14),
+            axis(0.10, 0.24),
+            axis(0.0, 0.08),
+            ZERO_AXIS,
+            axis(0.04, 0.12),
+            axis(0.03, 0.10),
+            ZERO_AXIS,
+            axis(0.10, 0.28),
+            ZERO_AXIS,
+        ),
+        6 => axes(
+            axis(0.04, 0.075),
+            axis(0.10, 0.22),
+            axis(0.14, 0.30),
+            axis(0.03, 0.12),
+            ZERO_AXIS,
+            axis(0.06, 0.15),
+            axis(0.06, 0.14),
+            ZERO_AXIS,
+            axis(0.22, 0.42),
+            ZERO_AXIS,
+        ),
+        7 => axes(
+            axis(0.0, 0.08),
+            axis(0.12, 0.25),
+            axis(0.14, 0.30),
+            axis(0.05, 0.18),
+            ZERO_AXIS,
+            axis(0.08, 0.18),
+            axis(0.08, 0.18),
+            ZERO_AXIS,
+            axis(0.15, 0.28),
+            ZERO_AXIS,
+        ),
+        8 => axes(
+            axis(0.08, 0.18),
+            axis(0.18, 0.34),
+            axis(0.22, 0.42),
+            axis(0.10, 0.26),
+            ZERO_AXIS,
+            axis(0.12, 0.24),
+            axis(0.12, 0.26),
+            ZERO_AXIS,
+            axis(0.28, 0.55),
+            ZERO_AXIS,
+        ),
+        9 => axes(
+            axis(0.30, 0.55),
+            axis(0.28, 0.48),
+            axis(0.30, 0.55),
+            axis(0.18, 0.42),
+            ZERO_AXIS,
+            axis(0.18, 0.34),
+            axis(0.20, 0.42),
+            ZERO_AXIS,
+            axis(0.55, 0.78),
+            ZERO_AXIS,
+        ),
+        10 => axes(
+            axis(0.45, 0.75),
+            axis(0.38, 0.62),
+            axis(0.42, 0.70),
+            axis(0.30, 0.62),
+            axis(0.0, 0.06),
+            axis(0.25, 0.45),
+            axis(0.34, 0.60),
+            ZERO_AXIS,
+            axis(0.65, 0.92),
+            ZERO_AXIS,
+        ),
+        _ => axes(
+            axis(0.70, 1.0),
+            axis(0.55, 0.82),
+            axis(0.58, 0.90),
+            axis(0.45, 0.90),
+            axis(0.02, 0.10),
+            axis(0.35, 0.60),
+            axis(0.50, 0.85),
+            ZERO_AXIS,
+            axis(0.80, 1.0),
+            ZERO_AXIS,
+        ),
+    }
 }
 
 pub(crate) fn draw_visualizer_ui(ctx: &egui::Context, ui: &mut UiState) {
@@ -252,6 +509,14 @@ pub(crate) fn draw_visualizer_ui(ctx: &egui::Context, ui: &mut UiState) {
                 phase.difficulty_max,
                 actual_difficulty
             ));
+            let axes = curriculum_phase_axes(ui.curriculum_phase);
+            panel.label(format!(
+                "Axes: gates {:.3}..{:.3} | curve {:.3}..{:.3}",
+                axes.gate_count_level.min,
+                axes.gate_count_level.max,
+                axes.path_curvature_level.min,
+                axes.path_curvature_level.max
+            ));
 
             panel.separator();
             panel.label(format!("Gate Count: {}", ui.gate_count));
@@ -278,6 +543,7 @@ pub(crate) fn draw_visualizer_ui(ctx: &egui::Context, ui: &mut UiState) {
                 "  sparse objective: +{:.3}",
                 ui.sparse_objective_reward
             ));
+            panel.label(format!("  out of bounds: -{:.3}", ui.out_of_bounds_penalty));
             panel.label(format!("  time: -{:.3}", ui.time_penalty));
             panel.label(format!("  collision: -{:.3}", ui.collision_penalty));
         });
@@ -307,8 +573,8 @@ pub(crate) fn format_done_reasons(done_reason_bits: u32) -> String {
     if done_reason_bits & DONE_REASON_STEP_LIMIT != 0 {
         labels.push("step_limit");
     }
-    if done_reason_bits & DONE_REASON_EXCESSIVE_TILT != 0 {
-        labels.push("excessive_tilt");
+    if done_reason_bits & DONE_REASON_MISSED_GATE != 0 {
+        labels.push("missed_gate");
     }
     labels.join(", ")
 }

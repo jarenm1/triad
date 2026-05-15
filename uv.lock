@@ -707,10 +707,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },
-]
-
-[package.optional-dependencies]
-training = [
     { name = "tensorboard" },
     { name = "torch" },
 ]
@@ -718,10 +714,9 @@ training = [
 [package.metadata]
 requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
-    { name = "tensorboard", marker = "extra == 'training'" },
-    { name = "torch", marker = "extra == 'training'", specifier = ">=2.4" },
+    { name = "tensorboard" },
+    { name = "torch", specifier = ">=2.4" },
 ]
-provides-extras = ["training"]
 
 [[package]]
 name = "triton"

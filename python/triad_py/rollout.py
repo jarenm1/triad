@@ -62,19 +62,18 @@ def point_to_gate_policy(
     np = _numpy_module()
 
     position = observations[:, 0:3]
-    velocity = observations[:, 3:6]
     attitude = observations[:, 6:9]
     target_gate_position = observations[:, 12:15]
     target_gate_forward = observations[:, 15:18]
+    body_velocity = observations[:, 22:25]
+    target_gate_body = observations[:, 25:28]
 
     target_delta = target_gate_position - position
     yaw = attitude[:, 2]
-    heading = np.stack((np.cos(yaw), np.sin(yaw)), axis=1)
-    right = np.stack((heading[:, 1], -heading[:, 0]), axis=1)
 
     horizontal_delta = target_delta[:, [0, 2]]
-    lateral_error = np.sum(horizontal_delta * right, axis=1)
-    altitude_error = target_delta[:, 1]
+    lateral_error = target_gate_body[:, 0]
+    altitude_error = target_gate_body[:, 1]
     horizontal_distance = np.linalg.norm(horizontal_delta, axis=1)
     safe_distance = np.maximum(horizontal_distance, 1.0e-6)
     approach_dir = horizontal_delta / safe_distance[:, None]
@@ -84,7 +83,7 @@ def point_to_gate_policy(
         1.0e-6,
     )
     gate_forward_unit = gate_forward_xz / gate_forward_norm
-    gate_align_weight = np.clip(1.0 - horizontal_distance / 6.0, 0.0, 1.0)
+    gate_align_weight = np.clip(1.0 - horizontal_distance / 3.5, 0.0, 1.0)
     desired_dir = (
         approach_dir * (1.0 - gate_align_weight)[:, None]
         + gate_forward_unit * gate_align_weight[:, None]
@@ -96,25 +95,31 @@ def point_to_gate_policy(
     desired_dir = desired_dir / desired_dir_norm
     desired_yaw = np.arctan2(desired_dir[:, 1], desired_dir[:, 0])
     yaw_error = (desired_yaw - yaw + np.pi) % (2.0 * np.pi) - np.pi
-    gate_right = np.stack((gate_forward_unit[:, 1], -gate_forward_unit[:, 0]), axis=1)
-    cross_track_error = np.abs(np.sum(horizontal_delta * gate_right, axis=1))
 
-    yaw_scale = 1.0 - np.clip((np.abs(yaw_error) - 0.16) / 0.32, 0.0, 1.0)
-    cross_track_scale = 1.0 - np.clip((cross_track_error - 0.08) / 0.32, 0.0, 1.0)
-    approach_scale = (yaw_scale * yaw_scale * cross_track_scale) / (
-        1.0 + 0.12 * np.abs(lateral_error) + 0.1 * np.abs(altitude_error)
-    )
+    yaw_scale = 1.0 - np.clip((np.abs(yaw_error) - 0.25) / 0.65, 0.0, 1.0)
+    lateral_scale = 1.0 - np.clip((np.abs(lateral_error) - 0.25) / 1.25, 0.0, 1.0)
+    approach_scale = np.maximum(0.35, yaw_scale * lateral_scale)
+    lateral_control = np.sign(lateral_error) * np.maximum(np.abs(lateral_error) - 0.12, 0.0)
+    altitude_control = np.sign(altitude_error) * np.maximum(np.abs(altitude_error) - 0.35, 0.0)
     forward_velocity_target = (
         np.clip(
-            (horizontal_distance - 0.6) * 1.2,
-            0.0,
-            2.6,
+            (horizontal_distance - 0.3) * 1.6,
+            0.35,
+            2.8,
         )
         * approach_scale
     )
-    lateral_velocity_target = np.clip(lateral_error * 1.2, -3.0, 3.0)
-    vertical_velocity_target = np.clip(altitude_error * 1.15, -2.0, 2.0)
-    yaw_rate_target = np.clip(yaw_error * 2.2, -3.5, 3.5)
+    lateral_velocity_target = np.clip(
+        lateral_control * 1.0 - body_velocity[:, 0] * 0.15,
+        -2.2,
+        2.2,
+    )
+    vertical_velocity_target = np.clip(
+        np.maximum(altitude_control * 0.7, -0.2) - body_velocity[:, 1] * 0.05,
+        -0.4,
+        1.1,
+    )
+    yaw_rate_target = np.clip(yaw_error * 2.0, -3.2, 3.2)
 
     actions[:, 0] = np.clip(0.5 + forward_velocity_target / 12.0, 0.0, 1.0)
     actions[:, 1] = np.clip(0.5 + lateral_velocity_target / 8.0, 0.0, 1.0)

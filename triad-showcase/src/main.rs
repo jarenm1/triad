@@ -9,7 +9,9 @@ use triad_gpu::{
     BindingType, BufferUsage, ColorLoadOp, DepthLoadOp, ExecutableFrameGraph, FrameGraphError,
     FrameTextureView, RenderPassBuilder, Renderer, ResourceRegistry, ShaderStage, wgpu,
 };
-use triad_window::{CameraPose, CameraUniforms, RendererManager, WindowConfig, egui, run_with_renderer_config};
+use triad_window::{
+    CameraPose, CameraUniforms, RendererManager, WindowConfig, egui, run_with_renderer_config,
+};
 #[cfg(target_arch = "wasm32")]
 use triad_window::{WebWindowConfig, run_with_renderer_config_web};
 
@@ -482,14 +484,15 @@ impl RendererManager for ShowcaseManager {
 
         let snapshot = self.snapshot_ui();
         let now = Instant::now();
-        let dt = (now - self.last_update).as_secs_f32().clamp(1.0 / 240.0, 0.1);
+        let dt = (now - self.last_update)
+            .as_secs_f32()
+            .clamp(1.0 / 240.0, 0.1);
         self.last_update = now;
 
         if snapshot.request_restart {
             self.time_seconds = 0.0;
         } else if snapshot.request_seek {
-            self.time_seconds =
-                snapshot.seek_fraction.clamp(0.0, 1.0) * self.clip.duration_seconds;
+            self.time_seconds = snapshot.seek_fraction.clamp(0.0, 1.0) * self.clip.duration_seconds;
         } else if snapshot.playing {
             self.time_seconds = (self.time_seconds + dt * snapshot.speed.max(0.05))
                 .rem_euclid(self.clip.duration_seconds.max(1.0e-6));
@@ -593,7 +596,10 @@ fn configure_showcase_controls(
                     "Time: {:.1}s / {:.1}s",
                     ui.time_seconds, ui.duration_seconds
                 ));
-                panel.label(format!("Target Gate: {} / {}", ui.current_gate, ui.gate_count));
+                panel.label(format!(
+                    "Target Gate: {} / {}",
+                    ui.current_gate, ui.gate_count
+                ));
                 panel.label("Flow: launch -> weave gates -> low sweep -> reset loop");
             });
     });
@@ -664,7 +670,11 @@ fn init_logging() {
 }
 
 fn visible_instance_capacity(gate_count: usize) -> usize {
-    1 + gate_count * 4 + 1 + DRONE_MODEL_INSTANCE_COUNT + TRAIL_INSTANCE_COUNT + DEBUG_VECTOR_INSTANCE_COUNT
+    1 + gate_count * 4
+        + 1
+        + DRONE_MODEL_INSTANCE_COUNT
+        + TRAIL_INSTANCE_COUNT
+        + DEBUG_VECTOR_INSTANCE_COUNT
 }
 
 fn build_showcase_clip() -> ShowcaseClip {
@@ -1068,8 +1078,8 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 }
 
 fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
-    let delta = (b - a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
-        - std::f32::consts::PI;
+    let delta =
+        (b - a + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
     a + delta * t
 }
 

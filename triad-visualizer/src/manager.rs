@@ -20,10 +20,44 @@ use crate::render::{
     obstacle_instance, required_gate_capacity, target_instance, trail_instances,
     visible_instance_capacity,
 };
-use crate::replay::{ReplayPlayback, apply_replay_controller, terminal_pause_status};
-use crate::ui::{UiSnapshot, UiState, curriculum_phase_profile};
+use crate::replay::{
+    PolicyClient, ReplayController, ReplayPlayback, apply_replay_controller, terminal_pause_status,
+};
+use crate::ui::{AxisRange, UiSnapshot, UiState, curriculum_phase_axes, curriculum_phase_profile};
 
 const PLAYING_READBACK_INTERVAL_FRAMES: u32 = 4;
+
+fn sample_axis(range: AxisRange, difficulty: f32, env_seed: u32, salt: u32) -> f32 {
+    let span = (range.max - range.min).max(0.0);
+    if span <= f32::EPSILON {
+        return range.min;
+    }
+    let target = range.min + difficulty.clamp(0.0, 1.0) * span;
+    let jitter = (hash_to_unit(env_seed ^ salt) * 2.0 - 1.0) * span * 0.2;
+    (target + jitter).clamp(range.min, range.max)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn curriculum_axis_summary_difficulty(
+    gate_count_level: f32,
+    gate_size_level: f32,
+    spacing_level: f32,
+    verticality_level: f32,
+    gate_pose_noise_level: f32,
+    spawn_noise_level: f32,
+    dynamics_noise_level: f32,
+    obstacle_density_level: f32,
+    path_curvature_level: f32,
+) -> f32 {
+    let geometry = gate_count_level
+        + gate_size_level
+        + spacing_level
+        + verticality_level
+        + path_curvature_level;
+    let randomization =
+        gate_pose_noise_level + spawn_noise_level + dynamics_noise_level + obstacle_density_level;
+    (geometry + 0.5 * randomization) / 7.0
+}
 
 pub(crate) struct VisualizerManager {
     sim: GpuSimulation,
@@ -48,6 +82,7 @@ pub(crate) struct VisualizerManager {
     applied_difficulty: f32,
     applied_curriculum_phase: usize,
     applied_curriculum_stage: u32,
+    policy_client: Option<PolicyClient>,
 }
 
 impl VisualizerManager {
@@ -63,6 +98,7 @@ impl VisualizerManager {
             registry,
             GpuSimulationConfig {
                 env_count: VISUALIZER_ENV_COUNT,
+                max_steps: 4096,
                 max_gates_per_env: required_gate_capacity(&course),
                 ..GpuSimulationConfig::default()
             },
@@ -180,6 +216,7 @@ impl VisualizerManager {
             applied_difficulty: 0.35,
             applied_curriculum_phase: 0,
             applied_curriculum_stage: 0,
+            policy_client: None,
         };
 
         let (seed_base, difficulty, curriculum_phase, curriculum_stage) = {
@@ -223,24 +260,75 @@ impl VisualizerManager {
         curriculum_phase: usize,
     ) -> Vec<ResetParams> {
         let profile = curriculum_phase_profile(curriculum_phase);
-        let difficulty_span = (profile.difficulty_max - profile.difficulty_min).max(0.0);
-        let target_difficulty =
-            profile.difficulty_min + difficulty.clamp(0.0, 1.0) * difficulty_span;
-        let jitter_span = difficulty_span * 0.2;
+        let axis_profile = curriculum_phase_axes(curriculum_phase);
         (0..self.sim.env_count())
             .map(|env_index| {
                 let env_seed = hash_u32(base_seed ^ (env_index as u32).wrapping_mul(0x9e37_79b9));
                 let grammar_index = (env_seed as usize) % profile.grammar_ids.len();
                 let grammar_id = profile.grammar_ids[grammar_index];
-                let difficulty_jitter =
-                    (hash_to_unit(env_seed ^ 0x85eb_ca6b) * 2.0 - 1.0) * jitter_span;
-                let env_difficulty = (target_difficulty + difficulty_jitter)
-                    .clamp(profile.difficulty_min, profile.difficulty_max);
-                ResetParams::new(
+                let gate_count_level =
+                    sample_axis(axis_profile.gate_count_level, difficulty, env_seed, 0x101);
+                let gate_size_level =
+                    sample_axis(axis_profile.gate_size_level, difficulty, env_seed, 0x103);
+                let spacing_level =
+                    sample_axis(axis_profile.spacing_level, difficulty, env_seed, 0x107);
+                let verticality_level =
+                    sample_axis(axis_profile.verticality_level, difficulty, env_seed, 0x109);
+                let gate_pose_noise_level = sample_axis(
+                    axis_profile.gate_pose_noise_level,
+                    difficulty,
+                    env_seed,
+                    0x10d,
+                );
+                let spawn_noise_level =
+                    sample_axis(axis_profile.spawn_noise_level, difficulty, env_seed, 0x10f);
+                let dynamics_noise_level = sample_axis(
+                    axis_profile.dynamics_noise_level,
+                    difficulty,
+                    env_seed,
+                    0x115,
+                );
+                let obstacle_density_level = sample_axis(
+                    axis_profile.obstacle_density_level,
+                    difficulty,
+                    env_seed,
+                    0x119,
+                );
+                let path_curvature_level = sample_axis(
+                    axis_profile.path_curvature_level,
+                    difficulty,
+                    env_seed,
+                    0x11b,
+                );
+                let soft_failure_level =
+                    sample_axis(axis_profile.soft_failure_level, difficulty, env_seed, 0x11f);
+                let env_difficulty = curriculum_axis_summary_difficulty(
+                    gate_count_level,
+                    gate_size_level,
+                    spacing_level,
+                    verticality_level,
+                    gate_pose_noise_level,
+                    spawn_noise_level,
+                    dynamics_noise_level,
+                    obstacle_density_level,
+                    path_curvature_level,
+                );
+                ResetParams::from_axes(
                     env_seed,
                     grammar_id,
                     env_difficulty,
                     profile.curriculum_stage,
+                    gate_count_level,
+                    gate_size_level,
+                    spacing_level,
+                    verticality_level,
+                    gate_pose_noise_level,
+                    spawn_noise_level,
+                    dynamics_noise_level,
+                    obstacle_density_level,
+                    path_curvature_level,
+                    soft_failure_level,
+                    0,
                 )
             })
             .collect()
@@ -317,13 +405,46 @@ impl VisualizerManager {
     fn apply_replay_actions(&mut self, snapshot: UiSnapshot) {
         let layouts = &self.cached_layouts;
         let gates = &self.cached_gates;
-        let status = apply_replay_controller(
-            snapshot.replay.controller,
-            &mut self.actions,
-            &self.cached_states,
-            |env_index, state| target_gate_for_env(layouts, gates, env_index, state),
-        );
-        self.set_replay_status(status);
+        match snapshot.replay.controller {
+            ReplayController::Heuristic => {
+                let status = apply_replay_controller(
+                    snapshot.replay.controller,
+                    &mut self.actions,
+                    &self.cached_states,
+                    |env_index, state| target_gate_for_env(layouts, gates, env_index, state),
+                );
+                self.set_replay_status(status);
+            }
+            ReplayController::Policy => {
+                if let Some(policy_client) = self.policy_client.as_mut() {
+                    match policy_client.infer(&self.cached_observations, &mut self.actions) {
+                        Ok(()) => self.set_replay_status("Replay active with PPO policy"),
+                        Err(error) => {
+                            self.actions.fill(Action::idle());
+                            self.policy_client = None;
+                            self.ui_state
+                                .lock()
+                                .expect("ui state poisoned")
+                                .replay
+                                .playback = ReplayPlayback::Paused;
+                            self.set_replay_status(format!(
+                                "Policy replay failed; playback paused and no fallback was applied: {error}"
+                            ));
+                        }
+                    }
+                } else {
+                    self.actions.fill(Action::idle());
+                    self.ui_state
+                        .lock()
+                        .expect("ui state poisoned")
+                        .replay
+                        .playback = ReplayPlayback::Paused;
+                    self.set_replay_status(
+                        "Policy replay requested but no model is loaded; playback paused and no fallback was applied",
+                    );
+                }
+            }
+        }
     }
 
     fn rebuild_instances(&mut self, selected_state: Option<EnvState>) {
@@ -431,6 +552,7 @@ impl VisualizerManager {
             ui.reward = reward_done.reward;
             ui.done_reason_bits = reward_done.done_reason;
             ui.shaping_reward = reward_done.shaping_reward;
+            ui.out_of_bounds_penalty = reward_done.out_of_bounds_penalty;
             ui.time_penalty = reward_done.time_penalty;
             ui.sparse_objective_reward = reward_done.sparse_objective_reward;
             ui.collision_penalty = reward_done.collision_penalty;
@@ -438,6 +560,7 @@ impl VisualizerManager {
             ui.reward = 0.0;
             ui.done_reason_bits = 0;
             ui.shaping_reward = 0.0;
+            ui.out_of_bounds_penalty = 0.0;
             ui.time_penalty = 0.0;
             ui.sparse_objective_reward = 0.0;
             ui.collision_penalty = 0.0;
@@ -506,12 +629,37 @@ impl RendererManager for VisualizerManager {
             if snapshot.replay.model_path.trim().is_empty() {
                 self.set_replay_status("Model load skipped: no model path selected");
             } else {
-                self.set_replay_status(format!("Model selected: {}", snapshot.replay.model_path));
+                let checkpoint_path = std::path::Path::new(snapshot.replay.model_path.trim());
+                match PolicyClient::spawn(checkpoint_path) {
+                    Ok(client) => {
+                        self.policy_client = Some(client);
+                        {
+                            let mut ui = self.ui_state.lock().expect("ui state poisoned");
+                            ui.replay.controller = ReplayController::Policy;
+                            ui.replay.status =
+                                format!("Loaded PPO policy: {}", checkpoint_path.display());
+                        }
+                    }
+                    Err(error) => {
+                        self.policy_client = None;
+                        {
+                            let mut ui = self.ui_state.lock().expect("ui state poisoned");
+                            ui.replay.playback = ReplayPlayback::Paused;
+                            ui.replay.status = format!(
+                                "Failed to load PPO policy {}. Replay remains unchanged and no fallback was applied: {}",
+                                checkpoint_path.display(),
+                                error
+                            );
+                        }
+                    }
+                }
             }
         }
         let replay_advancing = snapshot.replay.should_advance();
         let continuous_replay = snapshot.replay.playback == ReplayPlayback::Playing;
-        let throttle_readback = continuous_replay && !snapshot.replay.step_requested;
+        let policy_replay = snapshot.replay.controller == ReplayController::Policy;
+        let throttle_readback =
+            continuous_replay && !snapshot.replay.step_requested && !policy_replay;
         let readback_due = !throttle_readback
             || self.frame_index % u64::from(PLAYING_READBACK_INTERVAL_FRAMES) == 0;
         let generation_changed = (snapshot.difficulty - self.applied_difficulty).abs() > 1e-5
